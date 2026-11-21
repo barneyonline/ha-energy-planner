@@ -92,13 +92,15 @@ def comfort_breached(context: DecisionContext, mode: str, *, coasting: bool) -> 
             value < low or value > high
             or (coasting and ((mode == "heat" and value <= low) or (mode == "cool" and value >= high)))
         ))
-    for room in rooms.values():
+    from .zone_control import coast_isolated_rooms
+    isolated = coast_isolated_rooms(context, mode) if coasting else set()
+    for entity, room in rooms.items():
         value = finite(room.get("temperature"))
         low, high = bounds(context, room)
         if value is not None and low is not None and high is not None:
-            if mode == "cool" and value < low:
+            if mode == "cool" and value < low and entity not in isolated:
                 return True
-            if mode == "heat" and value > high:
+            if mode == "heat" and value > high and entity not in isolated:
                 return True
             if coasting and (value >= high if mode == "cool" else value <= low):
                 return True

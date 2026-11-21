@@ -105,6 +105,7 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         plan=plan,
         pause=pause,
         now=now,
+        export_ownership=coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {}),
     )
     required_control_areas = list(control_areas["required"])
     ready_control_areas = list(control_areas.get("ready", []))
@@ -249,6 +250,11 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
         await super().async_added_to_hass()
         if self.entity_description.key == "climate_control_active":
             self.async_on_remove(self.coordinator.store.async_add_ownership_listener(self._ownership_changed))
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place renames because our subscriptions follow the entity instance."""
+        super().async_entity_id_changed(old_entity_id)
 
     @callback
     def _ownership_changed(self) -> None:

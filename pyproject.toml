@@ -1,18 +1,21 @@
 [project]
 name = "ha-energy-planner"
-version = "1.4.10"
+version = "1.5.0"
 requires-python = ">=3.14"
 dependencies = []
 
 [tool.energy-planner.support]
-baseline = "2026.10.0"
+baseline = "2026.11.0"
 previous = []
 mypy = "1.19.1"
+ruff = "0.14.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# Home Assistant 2026.10's HTTP implementation emits these aiohttp warnings.
+# Print blocked-thread stacks before CI job timeouts terminate a stalled run.
+faulthandler_timeout = 60
+# Home Assistant 2026.11.0's HTTP implementation emits these aiohttp warnings.
 # Keep only these upstream exceptions; new warnings still fail validation.
 # See docs/validation-warnings.md for ownership and removal criteria.
 filterwarnings = [
@@ -22,7 +25,10 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
+branch = true
 source = ["custom_components/ha_energy_planner"]
+# Reports leave the Docker /work mount before Codecov processes them.
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true

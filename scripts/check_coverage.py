@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce complete statement coverage and report branch evidence separately."""
+"""Enforce complete statement and branch coverage without rounding."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ from pathlib import Path
 from typing import Any
 
 
-def check_coverage(report: dict[str, Any], branch_limits: dict[str, int] | None = None) -> tuple[int, list[str]]:
-    """Keep the exact 100% statement gate without conflating branch coverage."""
+def check_coverage(report: dict[str, Any]) -> tuple[int, list[str]]:
+    """Require every measured statement and branch to be exercised."""
     files = report.get("files", {})
     if not files or not report.get("meta", {}).get("branch_coverage"):
         return 1, ["ERROR: nonempty branch-instrumented coverage evidence is required"]
     messages: list[str] = []
     statements = covered = branches = covered_branches = 0
-    branch_regression = False
     for name, evidence in sorted(files.items()):
         summary = evidence["summary"]
         statements += summary["num_statements"]
@@ -24,9 +23,8 @@ def check_coverage(report: dict[str, Any], branch_limits: dict[str, int] | None 
         branches += summary["num_branches"]
         covered_branches += summary["covered_branches"]
         missing_branches = summary["num_branches"] - summary["covered_branches"]
-        if branch_limits is not None and missing_branches > branch_limits.get(name, 0):
-            messages.append(f"ERROR: {name}: uncovered branches {missing_branches} exceed reviewed baseline")
-            branch_regression = True
+        if missing_branches:
+            messages.append(f"ERROR: {name}: uncovered branches {evidence['missing_branches']}")
         if summary["missing_lines"]:
             messages.append(f"ERROR: {name}: uncovered statements {evidence['missing_lines']}")
     if not statements:
@@ -36,22 +34,17 @@ def check_coverage(report: dict[str, Any], branch_limits: dict[str, int] | None 
         messages.append(f"Branch coverage: {covered_branches}/{branches} ({100 * covered_branches / branches:.2f}%)")
     else:
         messages.append("Branch coverage: no branches")
-    return int(covered != statements or branch_regression), messages
+    return int(covered != statements or covered_branches != branches), messages
 
 
 def main() -> int:
     """Check the JSON emitted by coverage.py."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
-    parser.add_argument(
-        "--branch-baseline", type=Path,
-        default=Path(__file__).resolve().parents[1] / "tests/branch-coverage-baseline.json",
-    )
     args = parser.parse_args()
     try:
         status, messages = check_coverage(
             json.loads(args.report.read_text(encoding="utf-8")),
-            json.loads(args.branch_baseline.read_text(encoding="utf-8")),
         )
     except (OSError, ValueError, KeyError, TypeError) as err:
         print(f"ERROR: invalid coverage evidence: {err}")

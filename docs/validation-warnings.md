@@ -2,9 +2,8 @@
 
 Validation keeps unexpected warnings visible. Pytest treats new warnings as
 errors. Its two exceptions match the exact category, message and module of the
-Home Assistant 2026.10 HTTP implementation's aiohttp warnings; they do not apply
-to Energy Planner code. Remove each exception when all supported Home Assistant
-images stop emitting it.
+Home Assistant 2026.11.0 HTTP implementation's aiohttp warnings. Remove each
+exception when all supported Home Assistant images stop emitting it.
 
 Smoke runs retain their synthetic Home Assistant console log and a classified
 warning report on success and failure. Local evidence is under
@@ -19,6 +18,21 @@ The record header determines its severity: quoted diagnostic text inside DEBUG
 or INFO messages does not become a warning. Standalone Python warning headers
 are retained, including the base `Warning` category and custom category names.
 
+## CI hang diagnostics
+
+Coverage and runtime-compatibility jobs have a 15-minute limit. Pytest prints
+blocked-thread stacks after 60 seconds in a test, so an unfinished job retains
+diagnostic evidence instead of waiting for GitHub's default six-hour limit.
+`Repository checks` waits for these jobs and fails if an applicable job fails or
+is cancelled; its pending state alone does not indicate a missing status name.
+
+HA 2026.11 entity-registry loading waits for config-entry initialization. Real
+registry tests initialize `ConfigEntries` before loading registries, as Core
+startup does, and bound empty entity-registry loads to ten seconds. Upgrade and
+repair tests also initialize Core's frame helper so compatibility notices use
+the correct test instance. The existing registry, options, upgrade and repair
+cases exercise this startup sequence on the supported minimum and stable images.
+
 ## Repository fixes
 
 - Artifact uploads use a Node 24 action. This replaces the Node 20 declaration
@@ -29,7 +43,32 @@ are retained, including the base `Warning` category and custom category names.
 - Codecov consumes the generated `coverage.xml` and `junit.xml` explicitly.
   Automatic collection plugins are disabled, so the host need not install
   coverage.py, gcov or Xcode. `codecov.yml` makes the existing default CI
-  requirement explicit; statement and branch gates remain local and unchanged.
+  requirement explicit and requires 100% project and patch coverage with zero
+  threshold. The local gate requires every statement and branch using raw counts.
+  Reporting checks out its trusted workflow revision with credential persistence
+  disabled. It fetches the validated producer SHA with process-scoped credentials
+  and loads only its Git index with `git read-tree` (without `-u`), so Codecov's
+  `git ls-files` sees the producer's exact added/deleted paths while the working
+  tree remains trusted. Producer source is never checked out or executed in the
+  credentialed workflow. Both uploads use the repository as `root_dir`; downloaded
+  reports stay in runner temporary storage. Collection plugins and file fixes
+  remain disabled, so the uploader does not need producer source contents.
+  The inline report validator uses Python isolated mode (`-I`) so a producer's
+  `pathlib.py` or other local module cannot run through standard-library imports.
+  Coverage.py stores relative paths, so XML sources resolve in both Docker's
+  `/work` tree and the reporting checkout. This follows the action's
+  [checkout prerequisite](https://github.com/codecov/codecov-action#usage) and
+  Codecov's [source-path matching guidance](https://docs.codecov.com/docs/fixing-paths).
+  `tests/test_ci_coverage_paths.py` measures and reports from different roots,
+  checks both upload contracts, verifies index updates preserve the trusted
+  working tree, and rejects producer-module execution during validation.
+  A successful upload only means the report was queued: verify the
+  commit's processing state and nonempty files in Codecov too.
+  The 6 November investigation found 20,638/20,638 covered statements in the
+  [main test artifact](https://github.com/barneyonline/ha-energy-planner/actions/runs/42124067040),
+  while [Codecov's commit API](https://api.codecov.io/api/v2/github/barneyonline/repos/ha-energy-planner/commits/31b50efed20f573c9077a0edffa5e6169743b55a/)
+  reported `state: error` and zero files. The previous reporting job had no checkout
+  and pointed its tracked-file network at the temporary reports directory.
 - The smoke weather provider is a real weather entity with deterministic hourly
   forecasts, rather than a sensor passed to `weather.get_forecasts`. Dedicated
   tests retain legacy-attribute fallback coverage. The thermostat fixture starts
@@ -43,7 +82,7 @@ verification.
 
 | Audited messages | Handling and removal criterion |
 | --- | --- |
-| Home Assistant HTTP inheritance deprecation and aiohttp `NotAppKeyWarning` | Exact test-only exceptions in `pyproject.toml`. Retain repair/upgrade tests and remove exceptions after the supported images adopt the upstream fix. [Owning implementation](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/http/server.py). |
+| Home Assistant HTTP inheritance deprecation and aiohttp `NotAppKeyWarning` | Exact test-only exceptions in `pyproject.toml`. Retain repair/upgrade tests and remove exceptions after the supported images adopt the upstream fix. [Owning implementation](https://github.com/home-assistant/core/blob/2026.11.0/homeassistant/components/http/server.py). |
 | Rich `return` in a `finally` block | Classify the exact dependency warning in smoke evidence. Follow the Home Assistant image's Rich update; do not pin or monkey-patch Rich in this integration. [Upstream report](https://github.com/Textualize/rich/issues/4161). |
 | Custom integration loader notices for Energy Planner and the smoke helper | Expected for custom integrations; preserve the notices in the console/report. The repository's Platinum claim does not imply Home Assistant review. |
 | Codecov GPG key lacks web-of-trust certification | Preserve verification. The audited upload reports a good signature and a matching checksum. Do not disable integrity checks or assign arbitrary trust just to hide the notice. |

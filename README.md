@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/barneyonline/ha-energy-planner/releases"><img src="https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&amp;sort=semver" alt="Latest release"></a>
   <a href="https://codecov.io/gh/barneyonline/ha-energy-planner"><img src="https://codecov.io/gh/barneyonline/ha-energy-planner/branch/main/graph/badge.svg" alt="Codecov coverage"></a>
-  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&amp;repository=ha-energy-planner&amp;category=integration"><img src="https://img.shields.io/badge/HACS-Open_repository-41BDF5.svg" alt="Open Energy Planner in HACS"></a>
+  <a href="https://my.home-assistant.io/redirect/marketplace_repository/?owner=barneyonline&amp;repository=ha-energy-planner&amp;category=integration"><img src="https://img.shields.io/badge/Marketplace-Open_repository-41BDF5.svg" alt="Open Energy Planner in Home Assistant Marketplace"></a>
 </p>
 
 <p align="center">Coordinate EV charging, climate comfort and Enphase controls with your home's energy plan.</p>
@@ -72,7 +72,7 @@ Choose which areas the planner manages, then review its state and next actions.
   <img src="docs/images/plan-calendar-light.jpg" alt="Plan calendar showing confirmed Export Limit history alongside upcoming EV charging and Export Limit windows" width="757">
 </picture>
 
-The calendar distinguishes upcoming plan windows from retained confirmed activity. See [Plan Calendar](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar).
+The calendar distinguishes upcoming plan windows from retained confirmed activity. State publication and range queries skip object construction for unrelated reconciled history while retaining complete confirmed history. See [publication performance evidence](docs/entity-publication.md) and [Plan Calendar](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar).
 
 </details>
 
@@ -80,15 +80,15 @@ The calendar distinguishes upcoming plan windows from retained confirmed activit
 
 ## Get started
 
-1. [Open Energy Planner in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration), add the repository if prompted, and download it.
-2. Restart Home Assistant, then add **Energy Planner** under **Settings → Devices & services → Add integration**.
+Requires **Home Assistant 2026.11.0 or newer** (Python **3.14+**).
+
+1. [Open Energy Planner in Marketplace](https://my.home-assistant.io/redirect/marketplace_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration). If it is missing from the catalog, go to **Settings → Marketplace → Add from link**, connect GitHub when prompted, and enter `barneyonline/ha-energy-planner`.
+2. Select **Install**. Complete the setup that opens, or add **Energy Planner** under **Settings → Devices & services → Add integration**. Restart Home Assistant first if prompted.
 3. Map your inputs in **Configure → Planner settings**. Keep **Automatic control** off while reviewing plans and the safety check.
 
-Enter your Home Assistant URL if prompted by the HACS link. [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
+Existing HACS installations migrate automatically when Home Assistant starts after the upgrade. [Marketplace migration guide](https://www.home-assistant.io/integrations/marketplace/#coming-from-hacs) · [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation)
 
-Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
-
-On Home Assistant **2026.11+**, migration Repairs belong to their config entry: disabling the entry hides them, and removing it deletes them. Startup refresh preserves ignored repairs that still need migration and removes stale notices, including records from older versions. Home Assistant 2026.10 retains explicit cleanup without the newer ownership and refresh APIs.
+Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
 
 **Automatic control** records your request to operate; **Armed** reports actual command authority.
 
@@ -109,12 +109,15 @@ The [planning and control guide](docs/planning-and-control.md) preserves the det
 - [Climate demand, thermal learning, independent zones and equipment compensation](docs/climate-decisions.md)
 - [HVAC restoration and recovery](docs/hvac-restoration-recovery.md)
 - [Export Limit timing and confirmed readback](docs/export-limit-timing.md)
+- [Amber tariff boundaries, forecast coverage and retry diagnostics](docs/tariff-coverage.md)
 - [Load forecasting, tariffs, solar and battery reserves](https://github.com/barneyonline/ha-energy-planner/wiki/Energy-Planning)
 - [Calendar timing, planned windows and confirmed history](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar)
 
 Configured through the Home Assistant UI. No separate vendor credentials or third-party Python dependencies are required. AI explanations are advisory; selected planner context goes to your configured provider only when requested.
 
 </details>
+
+Development validation covers the minimum and current stable Home Assistant runtimes; see the [CI hang diagnostics](docs/validation-warnings.md#ci-hang-diagnostics).
 
 [Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
 

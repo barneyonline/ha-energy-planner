@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from homeassistant.core import Context
+from homeassistant.helpers import entity_registry
 
 from custom_components.ha_energy_planner import hvac_adapter as hvac_adapter_module
 from custom_components.ha_energy_planner.const import (
@@ -18,6 +19,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    HVAC_PENDING_AUTOMATION_OFF,
 )
 from custom_components.ha_energy_planner.coordinator import (
     _is_planner_owned_control_feedback,
@@ -188,6 +192,1484 @@ def test_hvac_action_arms_scheduler_classifier_guard_before_actuators() -> None:
         ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 20}),
     ]
+
+
+@pytest.mark.parametrize(
+    ("dry_during", "restore_automation", "suppression_only", "action_requests_sync"),
+    [
+        ("timer", True, False, False),
+        ("input_boolean", True, False, False),
+        ("automation", True, False, False),
+        ("automation", False, False, False),
+        ("automation", True, True, False),
+        ("timer", True, False, True),
+    ],
+)
+def test_takeover_rechecks_dry_during_scheduler_preparation(
+    monkeypatch: pytest.MonkeyPatch, dry_during: str, restore_automation: bool, suppression_only: bool,
+    action_requests_sync: bool,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        "automation.climate": "on",
+        "input_boolean.scheduler_change": "off",
+        "timer.scheduler_guard": "idle",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head,
+        CONF_CLIMATE_ZONES: [zone],
+        CONF_CLIMATE_AUTOMATIONS: ["automation.climate"],
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+    })
+    if not action_requests_sync:
+        adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    if not restore_automation:
+        hass.services.fail_services.add(("automation", "turn_on"))
+    original_call = hass.services.async_call
+    trigger_service = {"timer": "start", "input_boolean": "turn_on", "automation": "turn_off"}[dry_during]
+
+    async def call_with_dry_feedback(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> None:
+        await original_call(domain, service, data, **kwargs)
+        if (domain, service) == (dry_during, trigger_service):
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    monkeypatch.setattr(hass.services, "async_call", call_with_dry_feedback)
+    desired = {"suppress_automations": True} if suppression_only else {"hvac_mode": "off"}
+    if action_requests_sync:
+        desired["configured_zones_only"] = True
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+
+    expected_reason = HVAC_DRY_ZONE_TARGETS_ABSENT if restore_automation else "hvac_acquisition_rollback_failed"
+    assert result.reason == expected_reason
+    assert not result.applied
+    assert result.command_sent is (dry_during == "automation")
+    assert result.rollback_succeeded is restore_automation
+    assert hass.states.get(head).state == "dry"
+    assert hass.states.get("automation.climate").state == ("on" if restore_automation else "off")
+    assert result.saved_automation_states == ({} if restore_automation else {"automation.climate": "on"})
+    expected_calls = [("timer", "start"), ("input_boolean", "turn_on")]
+    if dry_during == "automation":
+        expected_calls.extend([("automation", "turn_off"), ("automation", "turn_on")])
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == expected_calls
+
+
+@pytest.mark.parametrize("manual_override,failure", [
+    (False, None), (True, None), (False, "retirement"), (True, "retirement"),
+    (False, "preparation"), (False, "preparation_then_dry"), (True, "recovers_during_retirement"),
+    (False, "retirement_without_dry"),
+])
+def test_dry_feedback_after_head_write_blocks_the_pending_zone_target(
+    monkeypatch: pytest.MonkeyPatch, manual_override: bool, failure: str | None,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    automation = "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    observations: list[bool] = []
+    adapter.set_dry_takeover_observation_callback(observations.append)
+    dry_started = False
+    save_failed = False
+    retirement_failed = False
+    if manual_override:
+        adapter.set_manual_override_check(lambda: dry_started)
+        adapter.set_zone_manual_override_check(lambda: {zone} if dry_started else set())
+
+    async def persist_confirmation(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        nonlocal dry_started, save_failed, retirement_failed
+        if record is not None and record["entity_id"] == zone and not dry_started:
+            assert hass.states.get(head).attributes["temperature"] == 20
+            if failure in {"preparation_then_dry", "retirement_without_dry"} and not save_failed:
+                save_failed = True
+                raise OSError("confirmation preparation failed")
+            dry_started = True
+            hass.states.values[head] = FakeState("dry", {"temperature": 20})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            if failure == "preparation":
+                save_failed = True
+                raise OSError("confirmation preparation failed")
+        if record is None and dry_started and failure == "retirement" and not save_failed:
+            save_failed = True
+            raise OSError("confirmation retirement failed")
+        if record is None and save_failed and failure == "retirement_without_dry" and not retirement_failed:
+            retirement_failed = True
+            raise OSError("confirmation retirement failed")
+        if record is None and save_failed and failure == "preparation_then_dry" and not dry_started:
+            dry_started = True
+            hass.states.values[head] = FakeState("dry", {"temperature": 20})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        if record is None and dry_started and failure == "recovers_during_retirement":
+            hass.states.values[head] = FakeState("cool", {"temperature": 20})
+            hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 22})
+        return record
+
+    dispatch = hass.services.async_call
+
+    async def apply_service(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> None:
+        if service == "set_hvac_mode" and data["entity_id"] == head and data["hvac_mode"] == "cool":
+            # Restoring the mode exposes its remembered zone target again.
+            hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 22})
+        await dispatch(domain, service, data, **kwargs)
+
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter.set_confirmation_persistence_callback(persist_confirmation, None)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": True,
+    })))
+
+    dry_expected = failure != "retirement_without_dry"
+    assert dry_started is dry_expected
+    assert ("climate", "set_temperature", {"entity_id": zone, "temperature": 20}) not in hass.services.calls
+    assert (True in observations) is dry_expected
+    assert not result.applied
+    assert result.capability_issues == ((HVAC_DRY_ZONE_TARGETS_ABSENT,) if dry_expected else ())
+    assert result.command_sent is True
+    assert result.rollback_succeeded is True
+    assert save_failed is (failure not in {None, "recovers_during_retirement"})
+    assert retirement_failed is (failure == "retirement_without_dry")
+    assert result.reason == {
+        "retirement": "hvac_confirmation_retirement_failed", "preparation": "hvac_control_service_failed",
+        "preparation_then_dry": "hvac_control_service_failed",
+        "retirement_without_dry": "hvac_control_service_failed",
+    }.get(failure, "manual_hvac_override_detected" if manual_override else HVAC_DRY_ZONE_TARGETS_ABSENT)
+    if manual_override:
+        mode = "cool" if failure == "recovers_during_retirement" else "dry"
+        assert hass.states.get(head).state == hass.states.get(zone).state == mode
+    else:
+        assert hass.states.get(head).attributes["temperature"] == 21
+        assert hass.states.get(zone).attributes["temperature"] == 22
+    assert hass.states.get(automation).state == "on"
+
+
+@pytest.mark.parametrize("stage", [
+    "service_failure", "missing_readback", "after_final_readback", "transient_readback", "pending_readback",
+])
+def test_dry_during_final_confirmation_preserves_outcome_and_restores(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    head, first_zone, last_zone = "climate.daikin", "climate.first", "climate.last"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        first_zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
+        last_zone: FakeState("cool", {"zone_id": 1, "temperature": 22}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, first_zone, last_zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [first_zone, last_zone]})
+    observations: list[bool] = []
+    adapter.set_dry_takeover_observation_callback(observations.append)
+
+    def publish_dry() -> None:
+        hass.states.values[head] = FakeState("dry", {"temperature": 20})
+        hass.states.values[first_zone] = FakeState("dry", {"zone_id": 0, "temperature": "malformed"})
+        hass.states.values[last_zone] = FakeState("dry", {"zone_id": 1})
+
+    dispatch = hass.services.async_call
+    read_state = adapter._state
+    recovery_queued = False
+    command_sequence: list[str] = []
+
+    def recover_cool() -> None:
+        for entity_id in (head, first_zone, last_zone):
+            hass.states.values[entity_id] = FakeState("cool", {"temperature": 20})
+
+    def sample_state(entity_id: str | None) -> FakeState | None:
+        nonlocal recovery_queued
+        observed = read_state(entity_id)
+        if entity_id == last_zone and observed is not None and observed.state == "dry" and not recovery_queued:
+            recovery_queued = True
+            asyncio.get_running_loop().call_soon(recover_cool)
+        return observed
+
+    async def apply_service(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> None:
+        if stage == "pending_readback" and service == "set_temperature" and data["temperature"] != 20:
+            command_sequence.append("restore")
+        await dispatch(domain, service, data, **kwargs)
+        if (stage != "after_final_readback" and service == "set_temperature"
+                and data["entity_id"] == last_zone and data["temperature"] == 20):
+            publish_dry()
+            if stage == "service_failure":
+                raise OSError("service failed after dispatch")
+        if service == "set_hvac_mode" and data["entity_id"] == head and data["hvac_mode"] == "cool":
+            hass.states.values[first_zone] = FakeState("cool", {"zone_id": 0, "temperature": 20})
+            hass.states.values[last_zone] = FakeState("cool", {"zone_id": 1, "temperature": 20})
+
+    confirm = adapter._async_confirm_complete_hvac_state
+
+    async def confirm_with_late_feedback(entity_id: str, desired: dict[str, Any]) -> bool:
+        confirmed = await confirm(entity_id, desired)
+        assert confirmed
+        publish_dry()
+        return confirmed
+
+    async def publish_pending_readback(entity_id: str) -> None:
+        assert entity_id == last_zone
+        command_sequence.append("acknowledge takeover")
+        recover_cool()
+
+    if stage == "after_final_readback":
+        monkeypatch.setattr(adapter, "_async_confirm_complete_hvac_state", confirm_with_late_feedback)
+    if stage == "transient_readback":
+        monkeypatch.setattr(adapter, "_state", sample_state)
+    if stage == "pending_readback":
+        monkeypatch.setattr(adapter, "_async_refresh_climate", publish_pending_readback)
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    lease_seconds = int(stage in {"transient_readback", "pending_readback"})
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", lease_seconds)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": True,
+    })))
+
+    assert not result.applied
+    assert result.capability_issues == ("climate_zone_target_unavailable", HVAC_DRY_ZONE_TARGETS_ABSENT)
+    assert True in observations
+    if stage in {"transient_readback", "pending_readback"}:
+        assert False in observations[observations.index(True) + 1:]
+    assert result.command_sent is True
+    assert result.rollback_succeeded is True
+    assert recovery_queued is (stage == "transient_readback")
+    assert result.reason == {
+        "service_failure": "hvac_control_service_failed",
+        "missing_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
+        "after_final_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
+        "transient_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
+        "pending_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
+    }[stage]
+    if stage == "pending_readback":
+        assert command_sequence == ["acknowledge takeover", "restore", "restore", "restore"]
+    assert hass.states.get(head).attributes["temperature"] == 21
+    assert hass.states.get(first_zone).attributes["temperature"] == 22
+    assert hass.states.get(last_zone).attributes["temperature"] == 22
+
+
+@pytest.mark.parametrize("second_switch,dry_stage", [
+    (False, "service"), (True, "service"), (True, "poll"), (True, "before_next_switch"),
+    (True, "service_timeout"), (True, "dry_after_service_timeout"),
+])
+def test_dry_after_first_zone_switch_blocks_followup_actuators(
+    monkeypatch: pytest.MonkeyPatch, second_switch: bool, dry_stage: str,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    first, second = "switch.first", "switch.second"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
+        first: "off",
+        second: "off",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    switches = [first, second] if second_switch else [first]
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [*switches, zone]})
+    dispatch = hass.services.async_call
+    commands: list[dict[str, Any]] = []
+    adapter.set_command_callback(commands.append)
+    read_state = adapter._state
+    recovery_queued = False
+    ack_pending = False
+    switch_io: list[str] = []
+    confirm_state = adapter._async_confirm_state
+
+    def publish_dry() -> None:
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def confirm_and_publish_dry(entity_id: str, expected: str) -> bool:
+        confirmed = await confirm_state(entity_id, expected)
+        if entity_id == first and expected == "on":
+            publish_dry()
+        return confirmed
+
+    def acknowledge_switch() -> None:
+        nonlocal ack_pending
+        ack_pending = False
+        switch_io.append("acknowledge takeover")
+        hass.states.values[first] = "on"
+        hass.states.values[head] = FakeState("cool", {"temperature": 21})
+        hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 22})
+
+    def sample_state(entity_id: str | None) -> FakeState | None:
+        nonlocal recovery_queued
+        observed = read_state(entity_id)
+        if entity_id == first and ack_pending and not recovery_queued:
+            if dry_stage == "dry_after_service_timeout":
+                publish_dry()
+            recovery_queued = True
+            asyncio.get_running_loop().call_soon(acknowledge_switch)
+        return observed
+
+    async def apply_service(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> None:
+        nonlocal ack_pending
+        await dispatch(domain, service, data, **kwargs)
+        if service == "turn_on" and data["entity_id"] == first and dry_stage != "before_next_switch":
+            if dry_stage != "dry_after_service_timeout":
+                publish_dry()
+            if dry_stage in {"poll", "service_timeout", "dry_after_service_timeout"}:
+                hass.states.values[first] = "off"
+                ack_pending = True
+            if dry_stage in {"service_timeout", "dry_after_service_timeout"}:
+                raise TimeoutError("zone service timed out after acceptance")
+        elif service == "turn_off" and data["entity_id"] == first:
+            switch_io.append("restore")
+        elif service == "set_hvac_mode" and data["entity_id"] == head:
+            # Any mode write during rollback is distinct from takeover.
+            hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 22})
+
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    delayed = dry_stage in {"poll", "service_timeout", "dry_after_service_timeout"}
+    if delayed:
+        monkeypatch.setattr(adapter, "_state", sample_state)
+    if dry_stage == "before_next_switch":
+        monkeypatch.setattr(adapter, "_async_confirm_state", confirm_and_publish_dry)
+    confirmation_seconds = int(delayed)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", confirmation_seconds)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": True,
+    })))
+
+    assert not any(row["stage"] == "issued" and row["entity_id"] == head and not row["restoration"] for row in commands)
+    assert ("switch", "turn_on", {"entity_id": second}) not in hass.services.calls
+    assert not result.applied
+    if delayed:
+        assert switch_io == ["acknowledge takeover", "restore"]
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT,)
+    assert result.command_sent is True
+    assert result.rollback_succeeded is True
+    assert hass.states.get(first).state == "off"
+    assert hass.states.get(head).attributes["temperature"] == 21
+
+
+@pytest.mark.parametrize(
+    "failure", [
+        "readback_timeout", "target_unavailable", "late_service_ack", "stop_actions_timeout",
+        "late_ack_with_override", "dry_during_recovery_save", "service_error_readback_timeout",
+    ],
+)
+def test_automation_failure_records_dry_and_distinguishes_dispatch(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    initial_power = "off" if failure == "stop_actions_timeout" else "on"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: FakeState(initial_power, {"current": int(initial_power == "off")}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    original_dispatch = hvac_adapter_module.async_call_device_service
+    sent = failure != "target_unavailable"
+    delayed = failure in {"late_service_ack", "late_ack_with_override", "dry_during_recovery_save"}
+    overridden = False
+    pending_off = False
+    ack_queued = False
+    recoveries: list[dict[str, str]] = []
+    state = adapter._state
+
+    def publish_dry() -> None:
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        recoveries.append(automations)
+        if failure == "dry_during_recovery_save":
+            assert hass.states.get(head).state == "cool"
+            publish_dry()
+
+    def acknowledge_off() -> None:
+        nonlocal pending_off
+        assert recoveries == [{automation: "on"}]
+        pending_off = False
+        hass.states.values[automation] = FakeState("off", {"current": 0})
+
+    def sample_state(entity_id: str | None) -> FakeState | None:
+        nonlocal ack_queued
+        observed = state(entity_id)
+        if entity_id == automation and pending_off and not ack_queued:
+            ack_queued = True
+            asyncio.get_running_loop().call_soon(acknowledge_off)
+        return observed
+
+    async def change_during_suppression(hass, domain, service, data, **kwargs):
+        nonlocal pending_off, overridden
+        if (domain, service) == ("automation", "turn_off") and not sent:
+            hass.states.values[automation] = FakeState("unavailable", {})
+        try:
+            await original_dispatch(hass, domain, service, data, **kwargs)
+        finally:
+            if (domain, service) == ("automation", "turn_off"):
+                if sent:
+                    hass.states.values[automation] = FakeState(initial_power, {"current": 0})
+                if failure != "dry_during_recovery_save":
+                    publish_dry()
+        if (delayed or failure == "stop_actions_timeout") and (domain, service) == ("automation", "turn_off"):
+            pending_off = delayed
+            overridden = failure == "late_ack_with_override"
+            raise TimeoutError("automation suppression timed out after acceptance")
+        if failure == "service_error_readback_timeout" and (domain, service) == ("automation", "turn_off"):
+            raise RuntimeError("suppression response failed before feedback")
+
+    monkeypatch.setattr(hvac_adapter_module, "async_call_device_service", change_during_suppression)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", int(delayed))
+    if delayed:
+        adapter.set_pre_dispatch_recovery_callback(save_recovery)
+        monkeypatch.setattr(adapter, "_state", sample_state)
+    adapter.set_manual_override_check(lambda: overridden)
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert result.reason == "hvac_automation_service_failed"
+    assert result.rollback_succeeded is True
+    assert result.saved_automation_states == {}
+    assert result.command_sent is sent
+    assert HVAC_DRY_ZONE_TARGETS_ABSENT in result.capability_issues
+    assert not result.capability_refused
+    assert hass.states.get(head).state == "dry"
+    expected = [("automation", "turn_off")] if sent else []
+    if delayed or failure in {"readback_timeout", "service_error_readback_timeout"}:
+        expected.append(("automation", "turn_on"))
+        assert not pending_off and hass.states.get(automation).state == "on"
+    if failure == "stop_actions_timeout":
+        assert hass.states.get(automation).state == "off"
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == expected
+
+
+def test_cancelled_suppression_before_dispatch_retains_no_automation_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    recovery = []
+
+    async def cancel_before_dispatch(hass, domain, service, data, **kwargs):
+        assert (domain, service) == ("automation", "turn_off")
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        raise asyncio.CancelledError
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        recovery.append((automations, unsent, prior_confirmation))
+
+    monkeypatch.setattr(hvac_adapter_module, "async_call_device_service", cancel_before_dispatch)
+    adapter.set_pre_dispatch_recovery_callback(save_recovery)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert recovery == [({}, None, None)]
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize("cancel_during", ["dispatch", "readback"])
+def test_cancelled_dry_suppression_settles_before_automation_recovery(
+    monkeypatch: pytest.MonkeyPatch, cancel_during: str,
+) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation]}
+    adapter = DaikinHVACAdapter(hass, entry_data)
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dispatch, read_state = hass.services.async_call, hass.states.get
+    confirm = adapter._async_confirm_state
+    recovery: dict[str, str] = {}
+    acknowledgement_queued = False
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        assert (unsent, prior_confirmation) == (None, None)
+        recovery.update(automations)
+
+    async def apply_service(domain, service, data, **kwargs):
+        await dispatch(domain, service, data, **kwargs)
+        if (domain, service) == ("automation", "turn_off"):
+            hass.states.values[automation] = "on"
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            if cancel_during == "dispatch":
+                raise asyncio.CancelledError
+
+    async def cancel_before_readback(entity_id, expected_state, **kwargs):
+        if not recovery:
+            raise asyncio.CancelledError
+        return await confirm(entity_id, expected_state, **kwargs)
+
+    def acknowledge_off() -> None:
+        hass.states.values[automation] = "off"
+
+    def sample_state(entity_id: str) -> FakeState | None:
+        nonlocal acknowledgement_queued
+        if entity_id == automation and recovery and not acknowledgement_queued:
+            acknowledgement_queued = True
+            asyncio.get_running_loop().call_soon(acknowledge_off)
+        return read_state(entity_id)
+
+    async def execute_then_restore():
+        with pytest.raises(asyncio.CancelledError):
+            await adapter.async_execute(_action({"suppress_automations": True}))
+        assert recovery == {automation: "on"}
+        reloaded = DaikinHVACAdapter(hass, entry_data)
+        restored = await reloaded.async_restore(saved_automation_states=recovery)
+        await asyncio.sleep(0)
+        return restored
+
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    monkeypatch.setattr(hass.states, "get", sample_state)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 1)
+    if cancel_during == "readback":
+        monkeypatch.setattr(adapter, "_async_confirm_state", cancel_before_readback)
+    adapter.set_pre_dispatch_recovery_callback(save_recovery)
+    result = asyncio.run(execute_then_restore())
+
+    assert result.applied
+    assert not result.saved_automation_states
+    assert hass.states.get(automation).state == "on"
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == [
+        ("automation", "turn_off"), ("automation", "turn_on"),
+    ]
+
+
+@pytest.mark.parametrize("domain", ["automation", "switch"])
+def test_manual_dry_override_waits_for_accepted_helper_write(
+    monkeypatch: pytest.MonkeyPatch, domain: str,
+) -> None:
+    head, zone, helper = "climate.daikin", "climate.zone", f"{domain}.hvac"
+    baseline, requested = ("on", "off") if domain == "automation" else ("off", "on")
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        helper: baseline,
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head,
+        CONF_CLIMATE_ZONES: [zone, helper] if domain == "switch" else [zone],
+        CONF_CLIMATE_AUTOMATIONS: [helper] if domain == "automation" else [],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dispatch = hass.services.async_call
+    sample = adapter._state
+    overridden = False
+    acknowledgement_queued = False
+    events: list[str] = []
+
+    def acknowledge() -> None:
+        events.append("acknowledge")
+        hass.states.values[helper] = requested
+
+    def read_state(entity_id: str | None) -> FakeState | None:
+        nonlocal acknowledgement_queued
+        observed = sample(entity_id)
+        if entity_id == helper and overridden and not acknowledgement_queued:
+            acknowledgement_queued = True
+            asyncio.get_running_loop().call_soon(acknowledge)
+        return observed
+
+    async def apply_service(service_domain, service, data, **kwargs):
+        nonlocal overridden
+        await dispatch(service_domain, service, data, **kwargs)
+        if service == f"turn_{requested}":
+            hass.states.values[helper] = baseline
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            overridden = True
+        else:
+            events.append("restore")
+
+    async def execute():
+        desired = {"suppress_automations": True} if domain == "automation" else {
+            "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True,
+        }
+        result = await adapter.async_execute(_action(desired))
+        await asyncio.sleep(0)
+        return result
+
+    adapter.set_manual_override_check(lambda: overridden)
+    monkeypatch.setattr(adapter, "_state", read_state)
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 1)
+    result = asyncio.run(execute())
+
+    assert events == ["acknowledge", "restore"]
+    assert hass.states.get(helper).state == baseline
+    expected_reason = HVAC_DRY_ZONE_TARGETS_ABSENT if domain == "automation" else "manual_hvac_override_detected"
+    assert result.reason == expected_reason
+    assert result.rollback_succeeded
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT,)
+    assert all(service_domain == domain for service_domain, _, _ in hass.services.calls)
+
+
+def test_dry_during_supersession_save_settles_failed_climate_write_before_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head, zone, other = "climate.daikin", "climate.zone", "climate.other"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        other: FakeState("cool", {"zone_id": 1, "temperature": 21}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone, other), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, other]})
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dispatch = hass.services.async_call
+    wait_for_climate = adapter._async_wait_for_climate
+    superseded: set[str] = set()
+    events: list[str] = []
+
+    async def save_override(main: bool, zones: set[str]) -> None:
+        assert not main and zones == {other}
+        events.append("persist supersession")
+        await asyncio.sleep(0)
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def execute():
+        def acknowledge() -> None:
+            events.append("acknowledge")
+            hass.states.values[head] = FakeState(hass.states.get(head).state, {"temperature": 20})
+
+        async def settle_readback(entity_id, matches):
+            if entity_id == head and matches(FakeState("dry", {"temperature": 20})) and "acknowledge" not in events:
+                asyncio.get_running_loop().call_soon(acknowledge)
+            return await wait_for_climate(entity_id, matches)
+
+        async def apply_service(domain, service, data, **kwargs):
+            if data["entity_id"] == head:
+                if service == "set_temperature" and data.get("temperature") == 20:
+                    superseded.add(other)
+                    raise RuntimeError("service failed after accepting the target")
+                if service == "set_hvac_mode":
+                    events.append("restore head")
+                    hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
+            await dispatch(domain, service, data, **kwargs)
+
+        monkeypatch.setattr(hass.services, "async_call", apply_service)
+        monkeypatch.setattr(adapter, "_async_wait_for_climate", settle_readback)
+        result = await adapter.async_execute(_action({
+            "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True,
+        }))
+        if "acknowledge" not in events:
+            acknowledge()
+        return result
+
+    adapter.set_zone_manual_override_check(lambda: superseded)
+    adapter.set_manual_supersession_persistence_callback(save_override)
+    result = asyncio.run(execute())
+
+    assert events == ["persist supersession", "acknowledge", "restore head"]
+    assert result.reason == "hvac_control_service_failed"
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT,)
+    assert result.rollback_succeeded
+    assert hass.states.get(head).attributes["temperature"] == 21
+
+
+@pytest.mark.parametrize("restoration_fails", [False, True])
+def test_dry_first_seen_during_post_dispatch_automation_restoration(
+    monkeypatch: pytest.MonkeyPatch, restoration_fails: bool,
+) -> None:
+    head, zone, other, automation = "climate.daikin", "climate.zone", "climate.other", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        other: FakeState("cool", {"zone_id": 1, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone, other), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, other], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dry_observations = []
+    adapter.set_dry_takeover_observation_callback(dry_observations.append)
+    dispatch = hass.services.async_call
+
+    async def apply_service(domain, service, data, **kwargs):
+        if data["entity_id"] == head and service == "set_temperature" and data.get("temperature") == 20:
+            raise RuntimeError("thermostat command failed")
+        if (domain, service) == ("automation", "turn_on"):
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            hass.states.values[other] = FakeState("dry", {"zone_id": 1, "temperature": "NaN"})
+            if restoration_fails:
+                raise RuntimeError("automation restoration failed")
+        await dispatch(domain, service, data, **kwargs)
+
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    action = _action({"hvac_mode": "cool", "target_temperature": 20, "enable_zones": True})
+    result = asyncio.run(adapter.async_execute(action))
+
+    assert result.reason == ("hvac_acquisition_rollback_failed" if restoration_fails else "hvac_control_service_failed")
+    assert result.rollback_succeeded is not restoration_fails
+    assert set(result.capability_issues) == {HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable"}
+    assert dry_observations[-1] is True
+
+
+def test_pre_dispatch_manual_override_records_dry_during_automation_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dispatch = hass.services.async_call
+    overridden = False
+
+    async def apply_service(domain, service, data, **kwargs):
+        nonlocal overridden
+        await dispatch(domain, service, data, **kwargs)
+        if (domain, service) == ("automation", "turn_off"):
+            overridden = True
+        if (domain, service) == ("automation", "turn_on"):
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    adapter.set_manual_override_check(lambda: overridden)
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert result.reason == "manual_hvac_override_detected"
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT,)
+    assert result.rollback_succeeded and result.command_sent
+    assert hass.states.get(automation).state == "on"
+    assert [domain for domain, _, _ in hass.services.calls] == ["automation", "automation"]
+
+
+def test_post_dispatch_recovery_records_missing_target_after_dry_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: "on",
+    })
+    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), native)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    observations: list[bool] = []
+    adapter.set_dry_takeover_observation_callback(observations.append)
+    dispatch = hass.services.async_call
+
+    async def apply_service(domain, service, data, **kwargs):
+        await dispatch(domain, service, data, **kwargs)
+        if service == "set_temperature" and data["entity_id"] == head and data["temperature"] == 20:
+            hass.states.values[head] = FakeState("dry", {"temperature": 20})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            raise RuntimeError("thermostat command failed after dispatch")
+        if service == "set_hvac_mode" and data["entity_id"] == head:
+            hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
+        if (domain, service) == ("automation", "turn_on"):
+            assert hass.states.get(head).state == "cool"
+            hass.states.values[zone] = FakeState("cool", {"zone_id": 0})
+
+    monkeypatch.setattr(hass.services, "async_call", apply_service)
+    action = _action({"hvac_mode": "cool", "target_temperature": 20, "enable_zones": True})
+    result = asyncio.run(adapter.async_execute(action))
+
+    assert result.reason == "hvac_control_service_failed"
+    assert result.rollback_succeeded
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable")
+    assert True in observations and observations[-1] is False
+
+
+@pytest.mark.parametrize("suppression_fails", [False, True])
+@pytest.mark.parametrize("dry_ends_during_recovery", [False, True])
+def test_dry_refusal_rechecks_other_zones_after_automation_recovery(
+    monkeypatch: pytest.MonkeyPatch, suppression_fails: bool, dry_ends_during_recovery: bool,
+) -> None:
+    head, zone, other_zone, automation = "climate.daikin", "climate.zone", "climate.other", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        other_zone: FakeState("cool", {"zone_id": 1, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone, other_zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, other_zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dry_observations: list[bool] = []
+    adapter.set_dry_takeover_observation_callback(dry_observations.append)
+    original = hass.services.async_call
+
+    async def dispatch(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if (domain, service) == ("automation", "turn_off"):
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+            if suppression_fails:
+                raise OSError("suppression handler failed")
+        if (domain, service) == ("automation", "turn_on"):
+            mode = "cool" if dry_ends_during_recovery else "dry"
+            if dry_ends_during_recovery:
+                hass.states.values[head] = FakeState("cool", {"temperature": 21})
+                hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
+            hass.states.values[other_zone] = FakeState(mode, {"zone_id": 1, "temperature": "NaN"})
+
+    monkeypatch.setattr(hass.services, "async_call", dispatch)
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert set(result.capability_issues) == {HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable"}
+    assert result.rollback_succeeded is True
+    assert result.command_sent is True
+    assert True in dry_observations
+    assert dry_observations[-1] is not dry_ends_during_recovery
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == [
+        ("automation", "turn_off"), ("automation", "turn_on"),
+    ]
+
+
+@pytest.mark.parametrize("actuator", ["climate", "switch"])
+@pytest.mark.parametrize("enter_dry", [False, True])
+def test_first_actuator_local_refusal_retires_untouched_hvac_baselines(
+    monkeypatch: pytest.MonkeyPatch, actuator: str, enter_dry: bool,
+) -> None:
+    head, zone, switch = "climate.daikin", "climate.bedroom", "switch.zone"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        switch: "off" if actuator == "switch" else "on",
+        "input_boolean.scheduler_change": "off",
+        "timer.scheduler_guard": "idle",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, switch],
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    original_preflight = hvac_adapter_module.async_call_device_service
+    recovery = []
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        assert prior_confirmation is None
+        recovery.append((automations, unsent))
+
+    def set_dry():
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def preflight(hass, domain, service, data, **kwargs):
+        # Inject the loss at the last local preflight, after adapter discovery.
+        if domain == actuator:
+            hass.states.values[data["entity_id"]] = "unavailable"
+        try:
+            await original_preflight(hass, domain, service, data, **kwargs)
+        except hvac_adapter_module.DeviceTargetUnavailable:
+            if enter_dry:
+                asyncio.get_running_loop().call_soon(set_dry)
+            raise
+
+    monkeypatch.setattr(hvac_adapter_module, "async_call_device_service", preflight)
+    adapter.set_pre_dispatch_recovery_callback(save_recovery)
+    action = _action({"hvac_mode": "cool", "target_temperature": 20, "enable_zones": True})
+    result = asyncio.run(adapter.async_execute(action))
+
+    assert result.reason == ("hvac_control_service_failed" if actuator == "climate" else "hvac_zone_service_failed")
+    assert result.rollback_succeeded is True
+    assert result.command_sent is False
+    expected_issues = []
+    if actuator == "switch":
+        expected_issues.append("climate_zone_unavailable")
+    elif not enter_dry:
+        expected_issues.append("daikin_climate_unavailable")
+    if enter_dry:
+        expected_issues.append(HVAC_DRY_ZONE_TARGETS_ABSENT)
+    assert result.capability_issues == tuple(expected_issues)
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == [
+        ("timer", "start"), ("input_boolean", "turn_on"),
+    ]
+    (automations, unsent), = recovery
+    assert automations == {}
+    if actuator == "climate":
+        assert unsent["entity_id"] == head
+        assert adapter._recovery_confirmation is None
+    else:
+        assert unsent is None
+
+
+@pytest.mark.parametrize("boundary", ["supersession", "supersession_error", "reconciliation"])
+def test_manual_zone_override_does_not_restore_an_untouched_head_in_dry(
+    monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    head, zone, automation = "climate.daikin", "climate.bedroom", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: FakeState("on", {"current": 0}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    superseded: set[str] = set()
+    adapter.set_zone_manual_override_check(lambda: superseded)
+    original = hass.services.async_call
+
+    def enter_dry() -> None:
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def dispatch(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if (domain, service) == ("automation", "turn_off"):
+            superseded.add(zone)
+
+    async def persist_supersession(entity_ids: set[str]) -> None:
+        assert entity_ids == {zone}
+        if boundary != "reconciliation":
+            enter_dry()
+        if boundary == "supersession_error":
+            raise OSError("supersession write failed")
+
+    async def reconcile() -> None:
+        enter_dry()
+
+    pending_recovery = []
+
+    async def persist_dry_recovery(automations, unsent, prior_confirmation):
+        assert prior_confirmation is None
+        pending_recovery.append((automations, unsent))
+
+    monkeypatch.setattr(hass.services, "async_call", dispatch)
+    if boundary == "reconciliation":
+        monkeypatch.setattr(adapter, "_async_reconcile_recovery", reconcile)
+    adapter.set_zone_manual_override_persistence_callback(persist_supersession)
+    adapter.set_pre_dispatch_recovery_callback(persist_dry_recovery)
+    action = _action({"hvac_mode": "cool", "target_temperature": 20, "enable_zones": True})
+
+    if boundary == "supersession_error":
+        with pytest.raises(OSError, match="supersession write failed"):
+            asyncio.run(adapter.async_execute(action))
+        assert [(domain, service) for domain, service, _ in hass.services.calls] == [("automation", "turn_off")]
+    else:
+        result = asyncio.run(adapter.async_execute(action))
+        assert result.reason == HVAC_DRY_ZONE_TARGETS_ABSENT
+        assert result.command_sent is True
+        assert result.rollback_succeeded is True
+        assert [(domain, service) for domain, service, _ in hass.services.calls] == [
+            ("automation", "turn_off"), ("automation", "turn_on"),
+        ]
+    assert pending_recovery == [({automation: "on"}, None)]
+    assert hass.states.get(head).state == "dry"
+
+
+@pytest.mark.parametrize(("retirement_fails", "intent_cancelled", "recovery_save_fails"), [
+    (False, False, False), (True, False, False), (True, True, False), (True, True, True),
+])
+def test_dry_entered_while_retiring_an_unsent_confirmation_blocks_hvac_rollback(
+    monkeypatch: pytest.MonkeyPatch, retirement_fails: bool, intent_cancelled: bool, recovery_save_fails: bool,
+) -> None:
+    head, zone, automation = "climate.daikin", "climate.bedroom", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: FakeState("on", {"current": 0}),
+    })
+    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), native)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    saved_recovery = []
+    cancellation = asyncio.CancelledError()
+    retirement_error = OSError("could not retire the command intent")
+    save_error = OSError("could not save narrowed recovery")
+
+    async def save_confirmation(record):
+        if record is not None:
+            if intent_cancelled:
+                raise cancellation
+            raise OSError("could not save the command intent")
+        await asyncio.sleep(0)
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        if retirement_fails:
+            raise retirement_error
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        assert prior_confirmation is None
+        saved_recovery.append((automations, unsent))
+        if recovery_save_fails:
+            raise save_error
+
+    adapter.set_confirmation_persistence_callback(save_confirmation)
+    adapter.set_pre_dispatch_recovery_callback(save_recovery)
+    action = _action({"hvac_mode": "cool", "target_temperature": 22})
+    expected_calls = [("automation", "turn_off")]
+    if intent_cancelled:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            asyncio.run(adapter.async_execute(action))
+        assert caught.value is cancellation
+        assert caught.value.__cause__ is (save_error if recovery_save_fails else retirement_error)
+    else:
+        result = asyncio.run(adapter.async_execute(action))
+        assert result.reason == HVAC_DRY_ZONE_TARGETS_ABSENT
+        assert result.rollback_succeeded is True
+        expected_calls.append(("automation", "turn_on"))
+
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == expected_calls
+    (automations, unsent), = saved_recovery
+    assert automations == {automation: "on"}
+    assert unsent["entity_id"] == head
+    assert hass.states.get(head).state == "dry"
+
+
+def test_fatal_interruption_retires_the_unsent_confirmation() -> None:
+    head = "climate.daikin"
+    hass = FakeHass({head: FakeState("cool", {"temperature": 21})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head})
+    interruption = BaseException("stop")
+    saved = []
+
+    async def persist(record):
+        saved.append(record)
+        if record is not None:
+            raise interruption
+
+    adapter.set_confirmation_persistence_callback(persist)
+    with pytest.raises(BaseException) as caught:
+        asyncio.run(adapter._async_command(hass, "climate", "set_temperature", {"entity_id": head, "temperature": 22}))
+
+    assert caught.value is interruption
+    pending, retired = saved
+    assert pending["entity_id"] == head
+    assert retired is None
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_cancelled_cool_intent_survives_failed_cleanup(restore_fails: bool) -> None:
+    head = "climate.daikin"
+    hass = FakeHass({head: FakeState("cool", {"temperature": 21})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head})
+    interruption = asyncio.CancelledError()
+    retirement_error = OSError("could not retire the Cool command intent")
+    restore_error = OSError("could not restore after cancellation")
+    saved = []
+
+    async def persist(record):
+        saved.append(record)
+        if record is not None:
+            raise interruption
+        raise retirement_error
+
+    async def restore(**_kwargs):
+        raise restore_error
+
+    adapter.set_confirmation_persistence_callback(persist)
+    if restore_fails:
+        adapter.async_restore = restore
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool", "target_temperature": 22})))
+
+    assert caught.value is interruption
+    assert caught.value.__cause__ is (restore_error if restore_fails else retirement_error)
+    pending, retired = saved
+    assert pending["entity_id"] == head
+    assert retired is None
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize(("baseline", "verified", "recovery_save_fails"), [
+    ("off", True, False), ("cool", True, False), ("off", False, False), ("cool", True, True),
+])
+def test_cancelled_takeover_recovers_only_dispatched_work_in_verified_dry(
+    monkeypatch: pytest.MonkeyPatch, baseline: str, verified: bool, recovery_save_fails: bool,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({
+        head: FakeState(baseline, {"temperature": 21}),
+        zone: FakeState(baseline, {"zone_id": 0, "temperature": 21}),
+        "input_boolean.scheduler_change": "off",
+        "timer.scheduler_guard": "idle",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone) if verified else (head,), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head,
+        CONF_CLIMATE_ZONES: [zone],
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dry_observations: list[bool] = []
+    adapter.set_dry_takeover_observation_callback(dry_observations.append)
+    original = hass.services.async_call
+    guard_calls = 0
+    save_error = OSError("could not save narrowed recovery")
+
+    async def fail_save(automations, unsent, prior_confirmation):
+        assert (automations, unsent, prior_confirmation) == ({}, None, None)
+        raise save_error
+
+    if recovery_save_fails:
+        adapter.set_pre_dispatch_recovery_callback(fail_save)
+
+    async def dispatch(domain, service, data, **kwargs):
+        nonlocal guard_calls
+        if (domain, service) == ("timer", "start"):
+            guard_calls += 1
+            if guard_calls == 1:
+                hass.states.values[head] = FakeState("dry", {"temperature": 21})
+                hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+                raise asyncio.CancelledError
+            raise TimeoutError
+        await original(domain, service, data, **kwargs)
+
+    monkeypatch.setattr(hass.services, "async_call", dispatch)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool", "target_temperature": 20})))
+    assert caught.value.__cause__ is (save_error if recovery_save_fails else None)
+
+    if verified:
+        assert hass.states.get(head).state == "dry"
+        assert guard_calls == 1
+        assert hass.services.calls == []
+        assert dry_observations == [True]
+    else:
+        assert hass.services.calls == [("climate", "turn_off", {"entity_id": head})]
+        assert hass.states.get(head).state == "off"
+        assert dry_observations == [False]
+
+
+@pytest.mark.parametrize("transition", ["before_readback", "during_retirement", "failed_retirement"])
+def test_dry_during_confirmation_of_matching_setpoints_cannot_trigger_rollback(
+    monkeypatch: pytest.MonkeyPatch, transition: str,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    states = {
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+    }
+    if transition == "during_retirement":
+        states = {head: FakeState("off", {"temperature": 21}), zone: FakeState("off", {"zone_id": 0})}
+    hass = FakeHass(states)
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]})
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    original_wait = adapter._async_wait_for_climate
+    entered_dry = False
+
+    def enter_dry() -> None:
+        nonlocal entered_dry
+        entered_dry = True
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def wait_for_feedback(entity_id, matches):
+        if not entered_dry:
+            enter_dry()
+        return await original_wait(entity_id, matches)
+
+    async def retire_confirmation(record):
+        assert record is None
+        await asyncio.sleep(0)
+        enter_dry()
+        if transition == "failed_retirement":
+            raise OSError("confirmation retirement failed after Dry feedback")
+
+    if transition != "before_readback":
+        adapter.set_confirmation_persistence_callback(retire_confirmation, {"entity_id": head})
+        desired = {"hvac_mode": "off" if transition == "during_retirement" else "cool"}
+    else:
+        monkeypatch.setattr(adapter, "_async_wait_for_climate", wait_for_feedback)
+        desired = {"hvac_mode": "cool", "target_temperature": 21, "enable_zones": True, "configured_zones_only": True}
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+
+    assert result.reason == HVAC_DRY_ZONE_TARGETS_ABSENT
+    assert result.capability_refused
+    assert not result.command_sent
+    assert hass.states.get(head).state == "dry"
+    assert not hass.services.calls
+
+
+@pytest.mark.parametrize(("boundary", "expected_reason"), [
+    ("initial", "climate_scheduler_guard_failed"),
+    ("zone", "hvac_zone_service_failed"),
+    ("head", "hvac_state_confirmation_failed"),
+])
+@pytest.mark.parametrize("action_requests_sync", [False, True])
+def test_failed_guard_retires_untouched_baseline_when_dry_follows(
+    monkeypatch: pytest.MonkeyPatch, boundary: str, expected_reason: str, action_requests_sync: bool,
+) -> None:
+    head, zone, switch, automation = "climate.daikin", "climate.zone", "switch.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        switch: "off" if boundary == "zone" else "on",
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, switch], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    if not action_requests_sync:
+        adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    guard_calls = 0
+    recovery = []
+
+    def enter_dry():
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    async def arm_guard(**_kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == (1 if boundary == "initial" else 3):
+            asyncio.get_running_loop().call_soon(enter_dry)
+            return False
+        return True
+
+    async def save_recovery(automations, unsent, prior_confirmation):
+        assert prior_confirmation is None
+        await asyncio.sleep(0)
+        assert hass.states.get(head).state == "dry"
+        recovery.append((automations, unsent and unsent["entity_id"]))
+
+    monkeypatch.setattr(adapter, "_async_arm_scheduler_guard", arm_guard)
+    adapter.set_pre_dispatch_recovery_callback(save_recovery)
+    action = _action({
+        "hvac_mode": "cool", "target_temperature": 19, "enable_zones": True,
+        "configured_zones_only": action_requests_sync,
+    })
+    result = asyncio.run(adapter.async_execute(action))
+
+    assert result.reason == expected_reason
+    assert result.capability_issues == (HVAC_DRY_ZONE_TARGETS_ABSENT,)
+    assert result.rollback_succeeded is True
+    assert result.saved_main_state == result.saved_zone_states == {}
+    assert recovery == [({} if boundary == "initial" else {automation: "on"}, head if boundary == "head" else None)]
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == (
+        [] if boundary == "initial" else [("automation", "turn_off"), ("automation", "turn_on")]
+    )
+
+
+def test_failed_guard_rechecks_dry_after_saving_manual_zone_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: "on",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_CLIMATE_AUTOMATIONS: [automation],
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+
+    async def fail_guard():
+        adapter.set_zone_manual_override_check(lambda: {zone})
+        return False
+
+    async def persist_override(zones):
+        assert zones == {zone}
+        await asyncio.sleep(0)
+        hass.states.values[head] = FakeState("dry", {"temperature": 21})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    monkeypatch.setattr(adapter, "_async_arm_scheduler_guard", fail_guard)
+    adapter.set_zone_manual_override_persistence_callback(persist_override)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": True,
+    })))
+
+    assert result.reason == HVAC_DRY_ZONE_TARGETS_ABSENT
+    assert result.rollback_succeeded is True
+    assert result.saved_automation_states == result.saved_zone_states == result.saved_main_state == {}
+    assert not hass.services.calls
+
+
+def test_dry_from_successful_guard_blocks_suppression_when_last_run_has_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head, zone, automation = "climate.daikin", "climate.zone", "automation.climate"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+        automation: FakeState("off", {"current": 1}),
+        "input_boolean.scheduler_change": "off",
+        "timer.scheduler_guard": "idle",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head,
+        CONF_CLIMATE_ZONES: [zone],
+        CONF_CLIMATE_AUTOMATIONS: [automation],
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+    })
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    original_dispatch = hass.services.async_call
+
+    async def dispatch(domain, service, data, **kwargs):
+        await original_dispatch(domain, service, data, **kwargs)
+        if (domain, service) == ("timer", "start"):
+            hass.states.values[automation] = FakeState("off", {"current": 0})
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+
+    monkeypatch.setattr(hass.services, "async_call", dispatch)
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert result.reason == HVAC_DRY_ZONE_TARGETS_ABSENT
+    assert result.capability_refused
+    assert not result.applied
+    assert not result.command_sent
+    assert [(domain, service) for domain, service, _ in hass.services.calls] == [
+        ("timer", "start"), ("input_boolean", "turn_on"),
+    ]
+
+
+@pytest.mark.parametrize("automation_activity", [
+    "unknown", "running", "ends_during_guard", "ends_before_dispatch", "mixed",
+])
+@pytest.mark.parametrize("suppression_only", [False, True])
+def test_takeover_result_counts_dispatched_automation_suppression(
+    monkeypatch: pytest.MonkeyPatch, automation_activity: str, suppression_only: bool,
+) -> None:
+    head, automation, other = "climate.daikin", "automation.climate", "automation.other"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        automation: FakeState("off", {} if automation_activity == "unknown" else {"current": 1}),
+    })
+    automations = [automation]
+    if automation_activity == "mixed":
+        hass.states.values[other] = FakeState("off", {})
+        automations.append(other)
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_AUTOMATIONS: automations})
+    guard_calls = 0
+
+    async def arm_guard():
+        nonlocal guard_calls
+        guard_calls += 1
+        if automation_activity in {"ends_during_guard", "mixed"} or (
+            automation_activity == "ends_before_dispatch" and guard_calls == 2
+        ):
+            hass.states.values[automation] = FakeState("off", {"current": 0})
+        return True
+
+    monkeypatch.setattr(adapter, "_async_arm_scheduler_guard", arm_guard)
+    desired = {"suppress_automations": True} if suppression_only else {"hvac_mode": "cool"}
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+
+    assert result.applied is True
+    assert result.command_sent is (automation_activity == "running")
+    expected_reason = "hvac_automations_suppressed" if suppression_only else "hvac_action_applied"
+    assert result.reason == (expected_reason if automation_activity == "running" else "already_in_desired_hvac_state")
+    if automation_activity == "ends_during_guard":
+        assert not hass.services.calls
+    else:
+        dispatched = other if automation_activity == "mixed" else automation
+        assert hass.services.calls == [("automation", "turn_off", {"entity_id": dispatched, "stop_actions": True})]
+
+
+def test_dry_intent_retirement_failure_leaves_head_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 21}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]})
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    retirement_failed = False
+
+    async def persist(record):
+        nonlocal retirement_failed
+        if record is not None and not retirement_failed:
+            hass.states.values[head] = FakeState("dry", {"temperature": 21})
+            hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        if record is None and not retirement_failed:
+            retirement_failed = True
+            raise OSError("confirmation retirement was not made durable")
+
+    adapter.set_confirmation_persistence_callback(persist)
+    with pytest.raises(OSError, match="retirement was not made durable"):
+        asyncio.run(adapter.async_execute(_action({"hvac_mode": "off"})))
+
+    assert hass.states.get(head).state == "dry"
+    assert hass.services.calls == []
 
 
 def test_hvac_action_fails_closed_when_scheduler_guard_is_incomplete() -> None:
@@ -1844,11 +3326,12 @@ def test_hvac_subordinate_loops_stop_when_confirmation_publishes_manual_change(
     monkeypatch.setattr(zone_adapter, "_async_confirm_state", confirm_zone)
     zone_adapter.set_zone_manual_override_check(lambda: {"switch.zone_one"} if zone_manual else set())
 
-    zones_enabled, changed_zones = asyncio.run(
+    zones_enabled, changed_zones, blocked = asyncio.run(
         zone_adapter._async_enable_zones({"switch.zone_one": "off", "switch.zone_two": "off"})
     )
 
     assert zones_enabled is False
+    assert blocked is None
     assert changed_zones == {"switch.zone_one": "off"}
     assert zone_hass.services.calls == [
         ("switch", "turn_on", {"entity_id": "switch.zone_one"}),
@@ -1875,12 +3358,14 @@ def test_hvac_subordinate_loops_stop_when_confirmation_publishes_manual_change(
     )
     automation_adapter.set_manual_override_check(lambda: main_manual)
 
-    disabled, changed_automations = asyncio.run(
+    suppression = asyncio.run(
         automation_adapter._async_disable_automations({"automation.one": "on", "automation.two": "on"})
     )
 
-    assert disabled is False
-    assert changed_automations == {"automation.one": "on"}
+    assert suppression.confirmed is False
+    assert suppression.restoration_states == {"automation.one": "on"}
+    assert suppression.dispatched
+    assert suppression.suppressed_active_automation
     assert automation_hass.services.calls == [
         (
             "automation",
@@ -2913,13 +4398,16 @@ def test_hvac_target_change_rejects_unrestorable_main_target_when_zone_sync_disa
     assert hass.services.calls == []
 
 
-def test_hvac_zone_sync_rejects_unrestorable_subordinate_target() -> None:
+@pytest.mark.parametrize("target_attributes", [
+    {"current_temperature": 20}, {"target_temp_low": 26, "target_temp_high": 18},
+])
+def test_hvac_zone_sync_rejects_unrestorable_subordinate_target(target_attributes: dict[str, int]) -> None:
     hass = FakeHass(
         {
             "climate.daikin": FakeState("heat", {"temperature": 20}),
             "climate.zone_temperature": FakeState(
                 "heat",
-                {"current_temperature": 20},
+                target_attributes,
             ),
         }
     )
@@ -3454,9 +4942,16 @@ def test_zone_restore_waits_without_commands_then_restores_original_target(attri
     assert hass.states.get("climate.zone").attributes["temperature"] == 20.0
 
 
-def test_blocked_zone_does_not_prevent_other_zone_and_automation_restoration() -> None:
+@pytest.mark.parametrize("blocked_state", [
+    FakeState("off", {"temperature": None}),
+    FakeState("heat", {"temperature": 24, "max_temp": 10**400}),
+], ids=["off", "oversized_bound"])
+def test_blocked_zone_does_not_prevent_other_zone_and_automation_restoration(
+    monkeypatch: pytest.MonkeyPatch, blocked_state: FakeState,
+) -> None:
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
     hass = FakeHass({
-        "climate.blocked": FakeState("off", {"temperature": None}),
+        "climate.blocked": blocked_state,
         "climate.ready": FakeState("heat", {"temperature": 24}),
         "automation.climate": "off",
     })
@@ -3850,7 +5345,7 @@ def test_acquisition_interruption_restores_original_main_baseline(monkeypatch, f
     if owned_baseline:
         adapter.set_abort_main_state({"hvac_mode": "off", "target_temperature": 19})
 
-    async def interrupted(action):
+    async def interrupted(action, saved_automation_states):
         hass.states.values["climate.daikin"] = FakeState("heat", {"temperature": 24})
         raise failure("private exception details")
 
@@ -3865,8 +5360,8 @@ def test_acquisition_interruption_restores_original_main_baseline(monkeypatch, f
     assert "private exception" not in repr(audit)
 
 
-@pytest.mark.parametrize("automation_state", ["on", "off"])
-def test_deferred_zone_recovery_restores_only_unfinished_automation(automation_state):
+@pytest.mark.parametrize(("automation_state", "pending_off"), [("on", False), ("off", False), ("on", True)])
+def test_deferred_zone_recovery_restores_only_unfinished_automation(automation_state, pending_off):
     """A hidden zone target never justifies repeating main power or scheduler work."""
     hass = FakeHass(
         {
@@ -3876,6 +5371,8 @@ def test_deferred_zone_recovery_restores_only_unfinished_automation(automation_s
         }
     )
     adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    if pending_off:
+        adapter.set_zone_control_context({}, {HVAC_PENDING_AUTOMATION_OFF: "automation.schedule"})
     audit = []
     adapter.set_command_callback(audit.append)
     main = {"hvac_mode": "off", "target_temperature": 19, "zone_recovery_attempted": True, "recovery_version": 1}
@@ -3884,8 +5381,8 @@ def test_deferred_zone_recovery_restores_only_unfinished_automation(automation_s
     )
     assert not result.applied and result.saved_zone_states
     assert result.saved_main_state == main and result.saved_automation_states == {}
-    assert all(domain == "automation" for domain, service, data in hass.services.calls)
-    assert len(hass.services.calls) == int(automation_state == "off")
+    expected = [("automation", "turn_on", {"entity_id": "automation.schedule"})]
+    assert hass.services.calls == (expected if automation_state == "off" or pending_off else [])
     assert audit[0]["stage"] == "zone_bounds_pending"
     assert audit[0]["failure_category"] == "ZoneTargetOrBoundsUnavailable"
     assert audit[0]["observed"]["hvac_mode"] == "off"
@@ -4045,7 +5542,7 @@ def test_interrupted_command_shutdown_is_independent_of_failed_guard(monkeypatch
     )
     adapter.set_manual_override_check(lambda: manual)
 
-    async def interrupted(action):
+    async def interrupted(action, saved_automation_states):
         hass.states.values["climate.main"] = FakeState("heat", {"temperature": 24})
         raise failure("sanitized failure")
 

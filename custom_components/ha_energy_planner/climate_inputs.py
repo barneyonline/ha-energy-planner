@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from math import isfinite
 from typing import Any
 
 from .const import (
@@ -32,17 +32,23 @@ from .const import (
     CONF_WEATHER,
 )
 from .forecasts import tariff_source_intervals
+from .planner_values import finite_float
 
 
 def finite(value: Any) -> float | None:
-    """Reject booleans, NaN and infinity at numerical boundaries."""
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if isfinite(number) else None
+    """Return a finite numerical input, rejecting booleans."""
+    return None if isinstance(value, bool) else finite_float(value)
+
+
+def temperature_targets_match(observed: Any, expected: Any) -> bool:
+    """Compare two finite thermostat readings within the readback tolerance."""
+    observed_number, expected_number = finite_float(observed), finite_float(expected)
+    return observed_number is not None and expected_number is not None and abs(observed_number - expected_number) < 0.05
+
+
+def climate_storage_value(value: Any) -> Any:
+    """Drop integers outside the range supported by Home Assistant's JSON store."""
+    return None if type(value) is int and not -(2**63) <= value < 2**64 else value
 
 
 def instant(value: Any) -> datetime | None:
@@ -193,15 +199,19 @@ def power_provenance(hass: Any, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_climate_inputs(
-    hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime, load_details: dict[str, Any]
+    hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime,
+    load_details: dict[str, Any],
+    *, tariff_intervals: list[dict[str, Any]] | None = None, read_state: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Read only mapped sensors; missing optional evidence stays explicitly absent."""
-    from .zone_control import read_topology
+    from .zone_control import read_topology, topology
     sources: dict[str, Any] = {}
     freshness = timedelta(minutes=float(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)))
 
+    get_state = hass.states.get if read_state is None else read_state
+
     def state(entity: Any) -> Any:
-        return hass.states.get(entity) if isinstance(entity, str) and entity else None
+        return get_state(entity) if isinstance(entity, str) and entity else None
 
     def number(entity: Any, kind: str) -> float | None:
         item = state(entity)
@@ -304,8 +314,10 @@ def read_climate_inputs(
         "identity": climate_identity(data, options),
         "head_entity": data.get(CONF_DAIKIN_CLIMATE),
         **power_provenance(hass, data),
-        "tariff_intervals": tariff_source_intervals(tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5))),
-        "target": finite(attrs.get("temperature")),
+        "tariff_intervals": tariff_intervals if tariff_intervals is not None else tariff_source_intervals(
+            tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), slot_starts=[now, end],
+        ),
+        "target": finite(climate_storage_value(attrs.get("temperature"))),
         "temperature_step": finite(attrs.get("target_temp_step")) or 0.5,
         "minimum_temperature": finite(attrs.get("min_temp")),
         "maximum_temperature": finite(attrs.get("max_temp")),
@@ -317,6 +329,10 @@ def read_climate_inputs(
         "irradiance_forecast": forecast,
         "zones": zones,
         "zone_topology": read_topology(hass, data),
+        "zone_actuator_states": {
+            entity: current.state if (current := state(entity)) is not None else None
+            for entity in topology(data).get("pairs", {})
+        },
         "sources": sources,
         "cop_table": {
             mode: [{"temperature": float(row["temperature"]), "cop": float(row["cop"])} for row in rows]

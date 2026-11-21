@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from asyncio import CancelledError
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -15,16 +17,27 @@ from homeassistant.core import Context, HomeAssistant, State
 from homeassistant.helpers.entity_component import async_update_entity
 from homeassistant.util import dt as dt_util
 
-from .adapter_helpers import async_call_device_service, available_state, zone_temperature_sync_deferred
-from .climate_inputs import finite
+from .adapter_helpers import (
+    DeviceTargetUnavailable,
+    async_call_device_service,
+    available_state,
+    climate_target_snapshot,
+    has_finite_temperature_target,
+    preserve_cancellation,
+    zone_temperature_sync_deferred,
+)
+from .climate_inputs import climate_storage_value, finite, temperature_targets_match
 from .const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    HVAC_PENDING_AUTOMATION_OFF,
 )
 from .daikin_memory import MEMORY_KEY, OFF_START_OPTION, memory_matches, read_activation, read_memory, source_matches
+from .discovery import CapabilityDiscovery, synchronized_zone_targets_required
 from .hvac_cycle import mode_feedback_matches, mode_intent
 from .models import ActionKind, PlanAction
 
@@ -44,8 +57,51 @@ class _HVACStateConfirmationError(RuntimeError):
     """Raised when command ordering cannot be confirmed safely."""
 
 
+class _HVACFollowupWriteBlocked(_HVACStateConfirmationError):
+    """Stop a synchronized takeover after an HVAC actuator has been dispatched."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _HVACManualOverrideError(RuntimeError):
     """Raised when a user supersedes an in-flight HVAC command."""
+
+
+class _HVACTakeoverBlocked(RuntimeError):
+    """Stop acquisition before the first head or zone write."""
+
+    def __init__(
+        self, issues: list[str], *, failed_suppression_pre_state: dict[str, Any] | None = None,
+        pre_dispatch_reason: str | None = None,
+        automation_off_pending: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.issues = tuple(issues)
+        self.failed_suppression_pre_state = failed_suppression_pre_state
+        self.pre_dispatch_reason = pre_dispatch_reason
+        self.suspended_automations: dict[str, str] = {}
+        self.automation_dispatched = False
+        self.automation_off_pending = automation_off_pending
+        self.unsent_command: dict[str, Any] | None = None
+        self.prior_confirmation: dict[str, Any] | None = None
+
+    def record_automation_work(self, suspended: dict[str, str], *, dispatched: bool) -> None:
+        """Record the automation writes that preceded the block."""
+        self.suspended_automations = suspended
+        self.automation_dispatched = dispatched
+
+
+@dataclass(slots=True)
+class _AutomationSuppression:
+    """Track confirmed suppression, dispatch and required restoration separately."""
+
+    confirmed: bool = False
+    restoration_states: dict[str, str] = field(default_factory=dict)
+    dispatched: bool = False
+    suppressed_active_automation: bool = False
+    automation_off_pending: str | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +117,9 @@ class HVACCommandResult:
     saved_zone_states: dict[str, Any] = field(default_factory=dict)
     saved_main_state: dict[str, Any] = field(default_factory=dict)
     command_sent: bool = False
+    confirmed_zone_intent: dict[str, Any] | None = None
+    capability_issues: tuple[str, ...] = ()
+    capability_refused: bool = False
 
 
 class DaikinHVACAdapter:
@@ -92,21 +151,47 @@ class DaikinHVACAdapter:
         self._abort_main_state: dict[str, Any] = {}
         self._command_started: dict[str, float] = {}
         self._climate_override_policy: dict[str, tuple[bool, bool]] = {}
-        self._async_persist_confirmation: Callable[[dict[str, Any] | None], Awaitable[None]] | None = None
+        self._async_persist_confirmation: (
+            Callable[[dict[str, Any] | None], Awaitable[dict[str, Any] | None]] | None
+        ) = None
         self._recovery_confirmation: dict[str, Any] | None = None
         self._zone_desired: dict[str, Any] = {}
         self._restoring_memory: dict[str, Any] | None = None
         self._restoring_owned_zone_entities: set[str] = set()
         self._off_start_activation: dict[str, Any] | None = None
+        self._off_start_recall_dispatched = False
         self._restoring_off_start = False
         self._off_start_memory: dict[str, Any] | None = None
         self._zone_options: dict[str, Any] = {}
         self._zone_baseline: dict[str, Any] = {}
+        self._awaiting_hvac_actuator = False
+        self._pending_automation_off: str | None = None
+        self._checking_takeover_readback = False
+        self._late_takeover_issues: tuple[str, ...] = ()
+        self._on_dry_takeover_observation: Callable[[bool], None] = lambda _blocked: None
+        self._async_save_pre_dispatch_recovery: (
+            Callable[[dict[str, str], dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]] | None
+        ) = None
 
     def set_zone_control_context(self, options: dict[str, Any], control: dict[str, Any]) -> None:
         """Keep original zone targets available while a planner-paused alias is null."""
         self._zone_options = options
         self._zone_baseline = control
+
+    @property
+    def pending_automation_off(self) -> str | None:
+        """Expose uncertainty so automation-only recovery can survive reload."""
+        return self._pending_automation_off
+
+    def set_dry_takeover_observation_callback(self, callback: Callable[[bool], None]) -> None:
+        """Report whether live evidence blocks takeover in Dry."""
+        self._on_dry_takeover_observation = callback
+
+    def set_pre_dispatch_recovery_callback(
+        self, callback: Callable[[dict[str, str], dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]],
+    ) -> None:
+        """Retain only outstanding automation recovery before Dry-mode compensation."""
+        self._async_save_pre_dispatch_recovery = callback
 
     async def async_prepare_off_start(self, action: PlanAction) -> None:
         """Read mode memories before the executor flushes any acquisition intent."""
@@ -137,7 +222,21 @@ class DaikinHVACAdapter:
             self._deferred_zone_entities = None
 
     def _zone_control_rejection(self) -> str | None:
+        from .weather_control import intent_rejection
         from .zone_control import live_rejection
+        lease = self._zone_desired.get("weather_continuation")
+        if lease:
+            if lease.get("entity_id") != self.entry_data.get("weather_entity"):
+                return "hvac_weather_source_changed"
+            expiry = dt_util.parse_datetime(str(lease.get("expires_at", "")))
+            if expiry is None or dt_util.utcnow() >= expiry:
+                return "hvac_weather_grace_expired"
+            safe = self._zone_baseline.get("weather_safe_intent", {})
+            head = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+            reason = intent_rejection(self._zone_desired, safe, dt_util.utcnow(),
+                                      head.state if head is not None else None)
+            if reason is not None:
+                return reason
         rejection = live_rejection(self.hass, self.entry_data, self._zone_options, self._zone_desired,
                                    self._zone_baseline, dt_util.utcnow())
         if rejection is None and self._zone_desired.get("equipment_compensation"):
@@ -249,7 +348,7 @@ class DaikinHVACAdapter:
             raise _HVACStateConfirmationError("equipment target is outside live bounds or step")
 
     def set_confirmation_persistence_callback(
-        self, callback: Callable[[dict[str, Any] | None], Awaitable[None]],
+        self, callback: Callable[[dict[str, Any] | None], Awaitable[dict[str, Any] | None]],
         recovery: dict[str, Any] | None = None,
     ) -> None:
         """Retain an uncertain command and its original deadline across reloads."""
@@ -263,7 +362,7 @@ class DaikinHVACAdapter:
 
     async def _async_save_confirmation(self, record: dict[str, Any] | None) -> None:
         if self._async_persist_confirmation is not None:
-            await self._async_persist_confirmation(record)
+            record = await self._async_persist_confirmation(record) or record
         self._recovery_confirmation = record
 
     def set_cycle_callback(
@@ -278,12 +377,100 @@ class DaikinHVACAdapter:
         """Record the exact issued service and its bounded feedback expectation."""
         self._command_callback = callback
 
+    def observe_takeover_capability(
+        self, desired_state: dict[str, Any] | None = None, *, allow_recalled_dry: bool = False,
+    ) -> list[str]:
+        """Capture live rollback and Dry evidence before any asynchronous cleanup."""
+        discovery = CapabilityDiscovery(
+            self.hass, self.entry_data, self._zone_options,
+            hvac_desired_state=self._zone_desired if desired_state is None else desired_state,
+        )
+        issues = discovery.synchronized_takeover_issues()
+        if allow_recalled_dry and issues == [HVAC_DRY_ZONE_TARGETS_ABSENT]:
+            # The current write can finish its verified recall. This allowance
+            # does not end a Dry block already observed by the planner.
+            return []
+        self._on_dry_takeover_observation(HVAC_DRY_ZONE_TARGETS_ABSENT in issues)
+        return issues
+
+    def _synchronized_takeover(self) -> bool:
+        return synchronized_zone_targets_required(self.hass, self.entry_data, self._zone_options, self._zone_desired)
+
+    def _live_dry_issues(self) -> tuple[str, ...]:
+        """Capture Dry and any faults observed while settling an interrupted takeover."""
+        dry_observed = HVAC_DRY_ZONE_TARGETS_ABSENT in self._late_takeover_issues
+        if not dry_observed and self._state_value(self.entry_data.get(CONF_DAIKIN_CLIMATE)) != "dry":
+            if self._off_start_activation and self._off_start_activation["hvac_mode"] == "dry":
+                self._on_dry_takeover_observation(False)
+            return ()
+        issues = self.observe_takeover_capability()
+        return tuple(issues) if dry_observed or HVAC_DRY_ZONE_TARGETS_ABSENT in issues else ()
+
+    def _check_pending_takeover_capability(self, respect_manual_override: bool = True) -> None:
+        """Protect the head and zones until the first takeover actuator write."""
+        if self._awaiting_hvac_actuator and respect_manual_override and not self._restoring_main_state:
+            if issues := self.observe_takeover_capability():
+                raise _HVACTakeoverBlocked(issues)
+
+    def _allow_off_start_recall(self, head: State | None) -> bool:
+        """Retire recall eligibility as soon as active feedback contradicts it."""
+        activation = self._off_start_activation
+        if activation is None or head is None or head.state == "off":
+            return False
+        recalled_dry = head.state == activation["hvac_mode"] == "dry" and temperature_targets_match(
+            head.attributes.get("temperature"), activation["target_temperature"],
+        )
+        self._off_start_recall_dispatched = recalled_dry
+        return recalled_dry
+
+    def _observe_followup_takeover(self, service: str | None = None) -> tuple[str, ...]:
+        """Read current Dry capability and retain observations for the takeover outcome."""
+        if self._awaiting_hvac_actuator:
+            return ()
+        allow_recalled_dry = False
+        if self._off_start_recall_dispatched:
+            allow_recalled_dry = self._allow_off_start_recall(
+                self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE)),
+            ) and service != "set_temperature"
+        issues = (
+            tuple(self.observe_takeover_capability(allow_recalled_dry=True)) if allow_recalled_dry
+            else self._live_dry_issues()
+        )
+        if issues:
+            self._late_takeover_issues = tuple(dict.fromkeys((*self._late_takeover_issues, *issues)))
+        return issues
+
+    def _check_followup_takeover(self, service: str | None = None) -> None:
+        if issues := self._observe_followup_takeover(service):
+            raise _HVACFollowupWriteBlocked(",".join(issues))
+
+    @contextmanager
+    def _check_takeover_readbacks(self) -> Iterator[None]:
+        """Apply takeover admission checks while waiting for acquisition feedback."""
+        self._checking_takeover_readback = True
+        try:
+            yield
+        finally:
+            self._checking_takeover_readback = False
+
     async def _async_command(
         self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any],
-        *, emergency_off: bool = False, respect_manual_override: bool = True, **kwargs: Any
-    ) -> None:
-        """Issue a contextual command without retaining vendor response bodies."""
+        *, emergency_off: bool = False, respect_manual_override: bool = True,
+        scheduler_guard: bool = False, takeover_write: bool = False, **kwargs: Any
+    ) -> State | None:
+        """Issue a contextual command and return the state captured before command preparation."""
         entity_id = str(data.get(ATTR_ENTITY_ID))
+        first_actuator = (
+            self._awaiting_hvac_actuator and respect_manual_override and not self._restoring_main_state
+            and not scheduler_guard and domain != "automation"
+        )
+        synchronized_first_actuator = first_actuator and self._synchronized_takeover()
+        actuator_failure_reason = "hvac_control_service_failed" if domain == "climate" else "hvac_zone_service_failed"
+        if not scheduler_guard and self._awaiting_hvac_actuator and respect_manual_override:
+            self._raise_if_manual_override_requested()
+            self._check_pending_takeover_capability()
+        if takeover_write:
+            self._check_followup_takeover(service)
         if respect_manual_override and self._zone_control_rejection() is not None:
             raise _HVACStateConfirmationError("zone intent no longer matches fresh room evidence")
         pairs = self._independent_pairs()
@@ -301,6 +488,9 @@ class DaikinHVACAdapter:
             domain == "automation" or entity_id in self._zone_entities()
         ) and entity_id != self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER):
             if not await self._async_arm_scheduler_guard():
+                self._check_pending_takeover_capability(respect_manual_override)
+                if synchronized_first_actuator:
+                    raise _HVACTakeoverBlocked([], pre_dispatch_reason=actuator_failure_reason)
                 raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
             # Renewing a guard yields too: acquisition must stop for any user
             # change, while restoration can finish siblings but never this zone.
@@ -323,15 +513,15 @@ class DaikinHVACAdapter:
             "requested": {key: value for key, value in data.items() if key != ATTR_ENTITY_ID},
             "observed": _climate_state_snapshot(observed) if domain == "climate" and observed is not None else {},
             "target_bounds": {
-                key: observed.attributes.get(key) for key in ("min_temp", "max_temp")
+                key: climate_storage_value(observed.attributes.get(key)) for key in ("min_temp", "max_temp")
             } if observed is not None else {},
         }
         record["coupled_zones"] = {
             entity: {
                 "mode": item.state,
-                **_climate_target_snapshot(item),
-                "min_temp": item.attributes.get("min_temp"),
-                "max_temp": item.attributes.get("max_temp"),
+                **climate_target_snapshot(item),
+                "min_temp": climate_storage_value(item.attributes.get("min_temp")),
+                "max_temp": climate_storage_value(item.attributes.get("max_temp")),
             }
             for entity in self._zone_climate_entities()
             if (item := self._state(entity)) is not None
@@ -343,32 +533,30 @@ class DaikinHVACAdapter:
             # disabled aliases. Scope null feedback to this exact issued mode.
             record["off_start_dry_zones"] = self._zone_climate_entities()
         record["main_mode"] = main.state if main is not None else None
-        record["main_target"] = main.attributes.get("temperature") if main is not None else None
-        if (self._off_start_activation is not None and entity_id in pairs and service == SERVICE_TURN_ON
-                and main is not None and main.state == "off"):
-            record["off_start_head_activation"] = {
-                **self._off_start_activation,
-                "zone_climates": [climate for actuator, climate in pairs.items()
-                                  if actuator == entity_id or self._state_value(actuator) == "on"],
-            }
+        record["main_target"] = climate_storage_value(main.attributes.get("temperature")) if main is not None else None
         entity_id = str(data.get(ATTR_ENTITY_ID))
+        tracks_confirmation = domain == "climate" or entity_id in pairs
+        unconfirmed_before = self._unconfirmed_main_mode
+        prior_confirmation = self._recovery_confirmation
+        if not tracks_confirmation and not scheduler_guard:
+            self._check_pending_takeover_capability(respect_manual_override)
+            if takeover_write:
+                self._check_followup_takeover(service)
         self._last_commands[entity_id] = record
         self._command_started[entity_id] = asyncio.get_running_loop().time()
-        if domain == "climate" or entity_id in pairs:
+        if tracks_confirmation:
             now = dt_util.utcnow()
             record.update(
                 issued_at=now.isoformat(),
                 deadline=(now + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS)).isoformat(),
             )
-            # Flush before dispatch: a lost service response is still an issued
-            # intent, and startup must not immediately replay or race it.
-            await self._async_save_confirmation(record)
-            # A listener may supersede the intent while its disk flush yields.
-            # Apply the same acquisition/restoration policy immediately before
-            # dispatch, rather than overwriting the user's new target first.
-            await asyncio.sleep(0)
-            unconfirmed_before = self._unconfirmed_main_mode
             try:
+                # Flush before dispatch so startup can reconcile a potentially
+                # issued command. State listeners can run during the flush.
+                await self._async_save_confirmation(record)
+                await asyncio.sleep(0)
+                self._raise_if_climate_override_requested(entity_id)
+                self._check_pending_takeover_capability(respect_manual_override)
                 if (self._async_cycle_callback is not None
                         and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
                     self._unconfirmed_main_mode = True
@@ -377,12 +565,18 @@ class DaikinHVACAdapter:
                 self._raise_if_climate_override_requested(entity_id)
                 # Existing exception cleanup must still shut down a head whose
                 # original baseline was off when classifier helpers are broken.
-                if not await self._async_arm_scheduler_guard(
+                guard_ready = await self._async_arm_scheduler_guard(
                     deadline=now + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS),
-                ) and not (emergency_off and service == SERVICE_TURN_OFF):
-                    raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
+                )
                 # Guard services can yield to explicit user actions too.
                 self._raise_if_climate_override_requested(entity_id)
+                self._check_pending_takeover_capability(respect_manual_override)
+                if takeover_write:
+                    self._check_followup_takeover(service)
+                if not guard_ready and not (emergency_off and service == SERVICE_TURN_OFF):
+                    if synchronized_first_actuator:
+                        raise _HVACTakeoverBlocked([], pre_dispatch_reason="hvac_state_confirmation_failed")
+                    raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
                 if respect_manual_override and self._zone_control_rejection() is not None:
                     raise _HVACStateConfirmationError("zone evidence changed during intent persistence")
                 self._assert_memory_identity()
@@ -395,24 +589,82 @@ class DaikinHVACAdapter:
                         and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
                     # Read-only: recheck after all persistence and guard awaits.
                     await self._async_cycle_callback({**record, "stage": "dispatch"})
-            except BaseException:  # Cancellation before dispatch is an unsent intent too.
+                self._check_pending_takeover_capability(respect_manual_override)
+                if takeover_write:
+                    self._check_followup_takeover(service)
+            except BaseException as error:  # Cancellation before dispatch is an unsent intent too.
                 self._unconfirmed_main_mode = unconfirmed_before
-                # This intent never reached the service bus. Retire superseded
-                # baselines first so a crash cannot replay a stale user target,
-                # then remove the unsent intent rather than reconciling it as
-                # though its apparent state were authoritative device feedback.
-                await self._async_persist_requested_manual_supersessions()
-                if (self._async_cycle_callback is not None
-                        and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
-                    await self._async_cycle_callback({**record, "stage": "not_dispatched"})
-                await self._async_save_confirmation(None)
-                self._last_commands.pop(entity_id, None)
-                self._command_started.pop(entity_id, None)
+                if isinstance(error, _HVACTakeoverBlocked):
+                    error.unsent_command = record
+                    error.prior_confirmation = prior_confirmation
+                elif isinstance(error, (Exception, CancelledError)):
+                    try:
+                        self._check_pending_takeover_capability(respect_manual_override)
+                        if (first_actuator and prior_confirmation is not None and isinstance(error, Exception)
+                                and not isinstance(error, (_HVACManualOverrideError, _HVACStateConfirmationError))):
+                            # Cached settings can still match the baseline while an earlier
+                            # accepted write is pending. Recover only dispatched automation work.
+                            raise _HVACTakeoverBlocked([], pre_dispatch_reason=actuator_failure_reason)
+                        observe_late = takeover_write and isinstance(error, Exception)
+                        if observe_late:
+                            self._observe_followup_takeover(service)
+                        retirement_error: Exception | None = None
+                        try:
+                            with preserve_cancellation(error):
+                                await self._async_retire_unsent_command(record, prior_confirmation)
+                        except Exception as cleanup_error:
+                            retirement_error = cleanup_error
+                        finally:
+                            # Retirement can yield while persisting supersession,
+                            # cycle intent, or command confirmation.
+                            self._check_pending_takeover_capability(respect_manual_override)
+                            if observe_late:
+                                self._observe_followup_takeover(service)
+                        if retirement_error is not None:
+                            if observe_late and self._late_takeover_issues:
+                                raise _HVACFollowupWriteBlocked(
+                                    "hvac_confirmation_retirement_failed",
+                                ) from retirement_error
+                            raise retirement_error
+                        if observe_late and self._late_takeover_issues and not isinstance(
+                            error, (_HVACStateConfirmationError, _HVACManualOverrideError),
+                        ):
+                            raise _HVACFollowupWriteBlocked(actuator_failure_reason) from error
+                    except _HVACTakeoverBlocked as blocked:
+                        # Save the narrower ownership before generic rollback.
+                        # Retirement failures must not hide a request to cancel this task.
+                        blocked.unsent_command = record
+                        blocked.prior_confirmation = prior_confirmation
+                        cause = error if isinstance(error, CancelledError) else blocked.__context__
+                        raise blocked from cause
+                else:
+                    await self._async_retire_unsent_command(record, prior_confirmation)
                 raise
-        if self._command_callback is not None:
-            self._command_callback({**record, "stage": "issued"})
+
+        def on_dispatch() -> None:
+            if first_actuator:
+                # Only an actuator write that reaches Home Assistant can
+                # recall remembered Dry during an Off start.
+                self._awaiting_hvac_actuator = False
+            activation = self._off_start_activation
+            if (activation is not None and service == SERVICE_TURN_ON
+                    and self._state_value(activation["entity_id"]) == "off"):
+                # An external wake can change the head during intent persistence.
+                # Only dispatch from live Off can prove a subsequent mode recall.
+                if entity_id in pairs:
+                    record["off_start_head_activation"] = {
+                        **activation,
+                        "zone_climates": [climate for actuator, climate in pairs.items()
+                                          if actuator == entity_id or self._state_value(actuator) == "on"],
+                    }
+                if takeover_write and (entity_id in pairs or entity_id == activation["entity_id"]):
+                    self._off_start_recall_dispatched = True
+            if self._command_callback is not None:
+                self._command_callback({**record, "stage": "issued"})
+            record["dispatched"] = True
+
         try:
-            await async_call_device_service(hass, domain, service, data, **kwargs)
+            await async_call_device_service(hass, domain, service, data, on_dispatch=on_dispatch, **kwargs)
         except TimeoutError:
             if domain != "climate" and entity_id not in pairs:
                 raise
@@ -421,9 +673,57 @@ class DaikinHVACAdapter:
             if self._command_callback is not None:
                 self._command_callback({**record, "stage": "readback_pending", "reason": "service_timeout"})
         except BaseException as error:
+            local_refusal = isinstance(error, DeviceTargetUnavailable)
             if self._command_callback is not None:
-                self._command_callback({**record, "stage": "service_failed", "failure_category": type(error).__name__})
+                self._command_callback({
+                    **record, "stage": "not_dispatched" if local_refusal else "service_failed",
+                    "failure_category": type(error).__name__,
+                })
+            if local_refusal and synchronized_first_actuator:
+                # Local preflight proves the first actuator was never written.
+                # Retire its intent without attempting HVAC compensation.
+                self._unconfirmed_main_mode = unconfirmed_before
+                rejection = _HVACTakeoverBlocked([], pre_dispatch_reason=actuator_failure_reason)
+                if tracks_confirmation:
+                    rejection.unsent_command = record
+                    rejection.prior_confirmation = prior_confirmation
+                raise rejection from error
             raise
+        return observed
+
+    async def _async_retire_unsent_command(
+        self, record: dict[str, Any], prior_confirmation: dict[str, Any] | None,
+    ) -> None:
+        """Remove the intent of a command that never reached Home Assistant."""
+        entity_id = str(record["entity_id"])
+        # A superseding user change must survive a restart before the unsent
+        # record ceases to guard the earlier baseline.
+        await self._async_persist_requested_manual_supersessions()
+        if (self._async_cycle_callback is not None
+                and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
+            await self._async_cycle_callback({**record, "stage": "not_dispatched"})
+        if prior_confirmation is not None and self._confirmation_superseded(prior_confirmation):
+            prior_confirmation = None
+        await self._async_save_confirmation(prior_confirmation)
+        if prior_confirmation is not None and self._confirmation_superseded(prior_confirmation):
+            await self._async_persist_requested_manual_supersessions()
+            await self._async_save_confirmation(None)
+        self._forget_unsent_command(record)
+
+    def _confirmation_superseded(self, record: dict[str, Any]) -> bool:
+        entity = record.get("entity_id")
+        return entity in self._manual_zone_override_entity_ids() or bool(
+            entity == self.entry_data.get(CONF_DAIKIN_CLIMATE)
+            and self._manual_override_requested is not None and self._manual_override_requested()
+        )
+
+    def _forget_unsent_command(self, record: dict[str, Any]) -> None:
+        """Discard in-memory timing after the durable intent is retired."""
+        entity_id = str(record["entity_id"])
+        if (self._recovery_confirmation or {}).get("context_id") == record["context_id"]:
+            self._recovery_confirmation = None
+        self._last_commands.pop(entity_id, None)
+        self._command_started.pop(entity_id, None)
 
     async def _record_confirmation(self, entity_id: str, confirmed: bool) -> None:
         """Publish authoritative readback or a sanitized timeout stage."""
@@ -672,9 +972,83 @@ class DaikinHVACAdapter:
     async def async_execute(self, action: PlanAction) -> HVACCommandResult:
         """Execute a supported HVAC action."""
         baseline = self._abort_main_state or self.main_takeover_snapshot()
+        automation_states = self._automation_states()
+        prior_automation_commands = {entity: self._last_commands.get(entity) for entity in automation_states}
+        self._off_start_recall_dispatched = False
+        self._late_takeover_issues = ()
+        self._pending_automation_off = None
+        self._awaiting_hvac_actuator = action.kind == ActionKind.SET_HVAC
         try:
-            return await self._async_execute(action)
+            return await self._async_execute(action, automation_states)
+        except _HVACTakeoverBlocked as blocked:
+            suppression_failed = blocked.failed_suppression_pre_state is not None
+            observed = blocked.failed_suppression_pre_state if suppression_failed else self._snapshot()
+            assert observed is not None
+            with preserve_cancellation(blocked.__cause__):
+                await self._async_persist_pre_dispatch_recovery(
+                    blocked.suspended_automations, blocked.unsent_command, blocked.prior_confirmation,
+                )
+            if isinstance(blocked.__cause__, CancelledError):
+                cancellation = blocked.__cause__
+                raise cancellation from cancellation.__cause__
+            observed_issues = dict.fromkeys(blocked.issues)
+
+            def observe_recovery() -> None:
+                observed_issues.update(dict.fromkeys(self.observe_takeover_capability()))
+
+            if blocked.automation_off_pending is not None:
+                # Even a failed suppression call can publish its Off state late.
+                observe_recovery()
+                if await self._async_confirm_state(blocked.automation_off_pending, "off", on_readback=observe_recovery):
+                    self._pending_automation_off = None
+            restored, unresolved = await self._async_enable_automation_entities(blocked.suspended_automations)
+            if blocked.pre_dispatch_reason is not None:
+                # A stopped acquisition can precede queued state feedback.
+                await asyncio.sleep(0)
+            observe_recovery()
+            issues = tuple(observed_issues)
+            if suppression_failed:
+                reason = "hvac_automation_service_failed" if restored else "hvac_automation_rollback_failed"
+            elif blocked.pre_dispatch_reason is not None:
+                reason = blocked.pre_dispatch_reason if restored else "hvac_acquisition_rollback_failed"
+            else:
+                reason = ",".join(issues) if restored else "hvac_acquisition_rollback_failed"
+            return HVACCommandResult(
+                False,
+                reason,
+                observed,
+                self._snapshot(),
+                unresolved,
+                restored,
+                command_sent=blocked.automation_dispatched,
+                capability_issues=issues,
+                capability_refused=(
+                    not suppression_failed and blocked.pre_dispatch_reason is None
+                    and (HVAC_DRY_ZONE_TARGETS_ABSENT in issues or (bool(issues) and not blocked.automation_dispatched))
+                ),
+            )
         except BaseException as error:
+            if (isinstance(error, (Exception, CancelledError)) and self._awaiting_hvac_actuator
+                    and HVAC_DRY_ZONE_TARGETS_ABSENT in self.observe_takeover_capability()):
+                # Only automation writes could have reached Home Assistant.
+                # Keep those eligible for recovery and retire the untouched HVAC baselines.
+                suspended = {
+                    entity: state for entity, state in automation_states.items()
+                    if state == "on" and self._command_dispatched_since(entity, prior_automation_commands[entity])
+                }
+                with preserve_cancellation(error):
+                    await self._async_persist_pre_dispatch_recovery(suspended, None)
+                    pending = self._pending_automation_off
+                    if pending is not None and pending in suspended:
+                        # A retry could otherwise accept the cached On state
+                        # before the dispatched suppression publishes Off.
+                        if await self._async_confirm_state(pending, "off"):
+                            self._pending_automation_off = None
+                        self.observe_takeover_capability()
+                raise
+            # Acquisition has ended. Existing rollback and emergency shutdown
+            # must keep their authority if the adapter observed a new mode.
+            self._awaiting_hvac_actuator = False
             if self._command_callback is not None:
                 self._command_callback(
                     {
@@ -688,28 +1062,45 @@ class DaikinHVACAdapter:
                 )
             # Durable zone/automation ownership remains for the supported retry
             # path. Cancellation must independently return the head's safe state.
-            try:
-                if not baseline.get(MEMORY_KEY):
-                    await self.async_restore(saved_main_state=baseline)
-            finally:
-                # Guard failure can return before restoration reaches the head.
-                # Emergency shutdown must still run for a known off baseline.
-                if (
-                    baseline.get("hvac_mode") == "off"
-                    and baseline.get("recovery_version", 1) == 1
-                    and not (self._manual_override_requested is not None and self._manual_override_requested())
-                ):
-                    await self._async_apply_hvac_state(
-                        str(self.entry_data.get(CONF_DAIKIN_CLIMATE)),
-                        {"hvac_mode": "off"},
-                        respect_zone_manual_override=False,
-                        emergency_off=True,
-                    )
+            with preserve_cancellation(error):
+                try:
+                    if not baseline.get(MEMORY_KEY):
+                        await self.async_restore(saved_main_state=baseline)
+                finally:
+                    # Guard failure can return before restoration reaches the head.
+                    # Emergency shutdown must still run for a known off baseline.
+                    if (
+                        baseline.get("hvac_mode") == "off"
+                        and baseline.get("recovery_version", 1) == 1
+                        and not (self._manual_override_requested is not None and self._manual_override_requested())
+                    ):
+                        await self._async_apply_hvac_state(
+                            str(self.entry_data.get(CONF_DAIKIN_CLIMATE)),
+                            {"hvac_mode": "off"},
+                            respect_zone_manual_override=False,
+                            emergency_off=True,
+                        )
             raise
         finally:
+            self._awaiting_hvac_actuator = False
             self._deferred_zone_entities = None
 
-    async def _async_execute(self, action: PlanAction) -> HVACCommandResult:
+    async def _async_persist_pre_dispatch_recovery(
+        self, automations: dict[str, str], unsent: dict[str, Any] | None,
+        prior_confirmation: dict[str, Any] | None = None,
+    ) -> None:
+        """Keep only work that may need recovery after a pre-dispatch Dry block."""
+        self._awaiting_hvac_actuator = False
+        if self._async_save_pre_dispatch_recovery is not None:
+            await self._async_save_pre_dispatch_recovery(automations, unsent, prior_confirmation)
+            if unsent is not None:
+                self._forget_unsent_command(unsent)
+        elif unsent is not None:
+            await self._async_retire_unsent_command(unsent, prior_confirmation)
+        else:
+            await self._async_persist_requested_manual_supersessions()
+
+    async def _async_execute(self, action: PlanAction, saved_automation_states: dict[str, str]) -> HVACCommandResult:
         """Keep the pre-persisted zone exclusions fixed through retries and rollback."""
         self._manual_supersession_persisted = False
         self._persisted_zone_supersessions.clear()
@@ -718,7 +1109,6 @@ class DaikinHVACAdapter:
         rejection = self._zone_control_rejection()
         if rejection:
             return HVACCommandResult(False, rejection, pre_state, pre_state, {}, True)
-        saved_automation_states = self._automation_states()
         automation_work = any(
             state == "on" or bool(getattr(self._state(entity_id), "attributes", {}).get("current", 0))
             for entity_id, state in saved_automation_states.items()
@@ -750,9 +1140,12 @@ class DaikinHVACAdapter:
         saved_main_state = self.main_takeover_snapshot()
         if not action.desired_state:
             return HVACCommandResult(False, "hvac_desired_state_empty", pre_state, self._snapshot(), {}, True)
-        if _temperature_desired_state(action.desired_state) and not _has_restorable_temperature_target(
-            saved_main_state
-        ):
+        synchronized_takeover = self._synchronized_takeover()
+        valid_main_target = (
+            has_finite_temperature_target(saved_main_state) if synchronized_takeover
+            else _has_temperature_target_fields(saved_main_state)
+        )
+        if _temperature_desired_state(action.desired_state) and not valid_main_target:
             # A main-target mutation cannot be transactional unless the target
             # it is about to replace can be restored after any later failure.
             return HVACCommandResult(
@@ -807,7 +1200,7 @@ class DaikinHVACAdapter:
             }
         ]
         if zone_target_work and any(
-            not _has_restorable_temperature_target(dict(saved_zone_states.get(entity_id, {})))
+            not has_finite_temperature_target(dict(saved_zone_states.get(entity_id, {})))
             for entity_id in requested_zones
         ):
             # Every subordinate target that will be replaced needs a usable
@@ -859,7 +1252,11 @@ class DaikinHVACAdapter:
         # A refresh with no service writes must not renew shared coverage. Each
         # actual write also checks again after any preceding confirmation wait.
         if guard_work and not await self._async_arm_scheduler_guard():
+            self._check_pending_takeover_capability()
             await self._async_persist_requested_manual_supersessions()
+            self._check_pending_takeover_capability()
+            if synchronized_takeover:
+                raise _HVACTakeoverBlocked([], pre_dispatch_reason="climate_scheduler_guard_failed")
             superseded_zones = self._manual_zone_override_entity_ids()
             return HVACCommandResult(
                 False,
@@ -883,52 +1280,34 @@ class DaikinHVACAdapter:
         )
         if manual_override_result is not None:
             return manual_override_result
-        if (
-            action.desired_state.get("suppress_automations")
-            and action.desired_state.get("hvac_mode") is None
-            and action.desired_state.get("target_temperature") is None
-            and not action.desired_state.get("enable_zones")
-        ):
-            disabled, changed_states = await self._async_disable_automations(saved_automation_states)
+        self._check_pending_takeover_capability()
+        suppression = await self._async_disable_automations(saved_automation_states)
+        changed_automations = suppression.restoration_states
+        automation_dispatched = suppression.dispatched
+        # A failed, dispatched suppression still needs automation-only recovery,
+        # including when a user supersedes the acquisition during its service call.
+        if self._pending_automation_off is None:
             manual_override_result = await self._async_manual_override_result_if_requested(
                 pre_state,
-                changed_states,
+                changed_automations,
                 {},
                 main_entity=climate_entity,
                 saved_main_state=saved_main_state,
+                automation_dispatched=automation_dispatched,
             )
             if manual_override_result is not None:
                 return manual_override_result
-            if not disabled:
-                rollback_succeeded, unresolved_states = await self._async_enable_automation_entities(changed_states)
-                return HVACCommandResult(
-                    False,
-                    ("hvac_automation_service_failed" if rollback_succeeded else "hvac_automation_rollback_failed"),
-                    pre_state,
-                    self._snapshot(),
-                    unresolved_states,
-                    rollback_succeeded,
+        if not suppression.confirmed:
+            issues = self.observe_takeover_capability()
+            if synchronized_takeover:
+                # No HVAC actuator was touched. Persist automation-only recovery
+                # before compensation, which can itself yield to a Dry transition.
+                blocked = _HVACTakeoverBlocked(
+                    issues, failed_suppression_pre_state=pre_state,
+                    automation_off_pending=suppression.automation_off_pending,
                 )
-            command_sent = automation_work
-            return HVACCommandResult(
-                True,
-                "hvac_automations_suppressed" if command_sent else "already_in_desired_hvac_state",
-                pre_state,
-                self._snapshot(),
-                changed_states,
-                command_sent=command_sent,
-            )
-        disabled, changed_automations = await self._async_disable_automations(saved_automation_states)
-        manual_override_result = await self._async_manual_override_result_if_requested(
-            pre_state,
-            changed_automations,
-            {},
-            main_entity=climate_entity,
-            saved_main_state=saved_main_state,
-        )
-        if manual_override_result is not None:
-            return manual_override_result
-        if not disabled:
+                blocked.record_automation_work(changed_automations, dispatched=automation_dispatched)
+                raise blocked
             rollback_succeeded, unresolved_states = await self._async_enable_automation_entities(changed_automations)
             return HVACCommandResult(
                 False,
@@ -939,13 +1318,34 @@ class DaikinHVACAdapter:
                 rollback_succeeded,
                 saved_zone_states,
             )
-        zones_enabled, changed_zones = await self._async_enable_zones(saved_zone_states)
+        automation_suppressed = suppression.suppressed_active_automation
+        if (
+            action.desired_state.get("suppress_automations")
+            and action.desired_state.get("hvac_mode") is None
+            and action.desired_state.get("target_temperature") is None
+            and not action.desired_state.get("enable_zones")
+        ):
+            return HVACCommandResult(
+                True,
+                "hvac_automations_suppressed" if automation_suppressed else "already_in_desired_hvac_state",
+                pre_state,
+                self._snapshot(),
+                changed_automations,
+                command_sent=automation_suppressed,
+            )
+        try:
+            with self._check_takeover_readbacks():
+                zones_enabled, changed_zones, late_block = await self._async_enable_zones(saved_zone_states)
+        except _HVACTakeoverBlocked as blocked:
+            blocked.record_automation_work(changed_automations, dispatched=automation_dispatched)
+            raise
         manual_override_result = await self._async_manual_override_result_if_requested(
             pre_state,
             changed_automations,
             changed_zones,
             main_entity=climate_entity,
             saved_main_state=saved_main_state,
+            automation_dispatched=automation_dispatched,
         )
         if manual_override_result is not None:
             return manual_override_result
@@ -954,48 +1354,48 @@ class DaikinHVACAdapter:
                 # Never continue demand while an intended cold-room closure is
                 # uncertain. Executor retains the original durable baseline and
                 # immediately uses the established restoration transaction.
-                return HVACCommandResult(False, "zone_subset_confirmation_failed", pre_state, self._snapshot(),
-                                         changed_automations, False, saved_zone_states, saved_main_state)
-            (
-                rollback_succeeded,
-                unresolved_states,
-                unresolved_zones,
-                unresolved_main_state,
-            ) = await self._async_rollback_takeover(
+                reason = late_block.reason if late_block is not None else "zone_subset_confirmation_failed"
+                self._observe_followup_takeover()
+                return HVACCommandResult(False, reason, pre_state, self._snapshot(),
+                                         changed_automations, False, saved_zone_states, saved_main_state,
+                                         command_sent=not self._awaiting_hvac_actuator,
+                                         capability_issues=self._late_takeover_issues)
+            failure_reason = late_block.reason if late_block is not None else "hvac_zone_service_failed"
+            return await self._async_rollback_takeover_result(
+                pre_state,
                 changed_automations,
                 changed_zones,
                 main_entity=climate_entity,
                 saved_main_state=saved_main_state,
-            )
-            return HVACCommandResult(
-                False,
-                "hvac_zone_service_failed" if rollback_succeeded else "hvac_acquisition_rollback_failed",
-                pre_state,
-                self._snapshot(),
-                unresolved_states,
-                rollback_succeeded,
-                unresolved_zones,
-                unresolved_main_state,
+                reason=failure_reason,
             )
         command_sent = bool(
-            automation_work or any(entity_id.split(".", 1)[0] != "climate" for entity_id in changed_zones)
+            automation_suppressed or any(entity_id.split(".", 1)[0] != "climate" for entity_id in changed_zones)
         )
 
         try:
-            command_sent = (
-                await self._async_apply_hvac_state(
+            with self._check_takeover_readbacks():
+                command_sent = (
+                    await self._async_apply_hvac_state(
+                        climate_entity,
+                        action.desired_state,
+                        takeover_main_state=saved_main_state,
+                        takeover_write=True,
+                    )
+                    or command_sent
+                )
+                self._raise_if_manual_override_requested()
+                state_confirmed = await self._async_confirm_complete_hvac_state(
                     climate_entity,
                     action.desired_state,
-                    takeover_main_state=saved_main_state,
                 )
-                or command_sent
-            )
+            self._check_pending_takeover_capability()
             self._raise_if_manual_override_requested()
-            state_confirmed = await self._async_confirm_complete_hvac_state(
-                climate_entity,
-                action.desired_state,
-            )
-            self._raise_if_manual_override_requested()
+            if state_confirmed:
+                self._check_followup_takeover()
+        except _HVACTakeoverBlocked as blocked:
+            blocked.record_automation_work(changed_automations, dispatched=automation_dispatched)
+            raise
         except _HVACManualOverrideError:
             return await self._async_manual_override_result(
                 pre_state,
@@ -1003,60 +1403,64 @@ class DaikinHVACAdapter:
                 changed_zones,
                 main_entity=climate_entity,
                 saved_main_state=saved_main_state,
+                automation_dispatched=automation_dispatched,
             )
-        except _HVACStateConfirmationError:
-            state_confirmed = False
-        except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-            if action.desired_state.get("zone_intent"):
-                return HVACCommandResult(False, "zone_subset_service_failed", pre_state, self._snapshot(),
-                                         changed_automations, False, saved_zone_states, saved_main_state)
-            (
-                rollback_succeeded,
-                unresolved_states,
-                unresolved_zones,
-                unresolved_main_state,
-            ) = await self._async_rollback_takeover(
-                changed_automations,
-                changed_zones,
-                main_entity=climate_entity,
-                saved_main_state=saved_main_state,
-            )
-            return HVACCommandResult(
-                False,
-                "hvac_control_service_failed" if rollback_succeeded else "hvac_acquisition_rollback_failed",
-                pre_state,
-                self._snapshot(),
-                unresolved_states,
-                rollback_succeeded,
-                unresolved_zones,
-                unresolved_main_state,
-            )
-        confirmation_reason = "hvac_state_confirmation_failed"
+        except Exception as error:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
+            try:
+                self._check_pending_takeover_capability()
+            except _HVACTakeoverBlocked as blocked:
+                blocked.record_automation_work(changed_automations, dispatched=automation_dispatched)
+                raise blocked from error
+            if isinstance(error, _HVACStateConfirmationError):
+                if isinstance(error, _HVACFollowupWriteBlocked):
+                    late_block = error
+                state_confirmed = False
+            else:
+                if action.desired_state.get("zone_intent"):
+                    self._observe_followup_takeover()
+                    return HVACCommandResult(False, "zone_subset_service_failed", pre_state, self._snapshot(),
+                                             changed_automations, False, saved_zone_states, saved_main_state,
+                                             command_sent=not self._awaiting_hvac_actuator,
+                                             capability_issues=self._late_takeover_issues)
+                return await self._async_rollback_takeover_result(
+                    pre_state,
+                    changed_automations,
+                    changed_zones,
+                    main_entity=climate_entity,
+                    saved_main_state=saved_main_state,
+                    reason="hvac_control_service_failed",
+                )
+        confirmation_reason = late_block.reason if late_block is not None else "hvac_state_confirmation_failed"
         if not state_confirmed:
             if action.desired_state.get("zone_intent"):
-                return HVACCommandResult(False, "zone_subset_confirmation_failed", pre_state, self._snapshot(),
-                                         changed_automations, False, saved_zone_states, saved_main_state)
-            (
-                rollback_succeeded,
-                unresolved_states,
-                unresolved_zones,
-                unresolved_main_state,
-            ) = await self._async_rollback_takeover(
+                reason = late_block.reason if late_block is not None else "zone_subset_confirmation_failed"
+                self._observe_followup_takeover()
+                return HVACCommandResult(False, reason, pre_state, self._snapshot(),
+                                         changed_automations, False, saved_zone_states, saved_main_state,
+                                         command_sent=not self._awaiting_hvac_actuator,
+                                         capability_issues=self._late_takeover_issues)
+            return await self._async_rollback_takeover_result(
+                pre_state,
                 changed_automations,
                 changed_zones,
                 main_entity=climate_entity,
                 saved_main_state=saved_main_state,
+                reason=confirmation_reason,
             )
-            return HVACCommandResult(
-                False,
-                confirmation_reason if rollback_succeeded else "hvac_acquisition_rollback_failed",
-                pre_state,
-                self._snapshot(),
-                unresolved_states,
-                rollback_succeeded,
-                unresolved_zones,
-                unresolved_main_state,
+        confirmed_zone_intent = None
+        if action.desired_state.get("zone_intent", {}).get("coast_isolation"):
+            from .zone_control import confirmed_coast_intent
+            # Confirmation awaits can deliver new room/switch feedback. Only
+            # execution-time observations may establish the next drift baseline.
+            confirmed_zone_intent = confirmed_coast_intent(
+                self.hass, self.entry_data, self._zone_options, action.desired_state,
+                self._zone_baseline, dt_util.utcnow(), require_head_off=True,
             )
+            if confirmed_zone_intent is None:
+                return HVACCommandResult(
+                    False, "zone_coast_protection_lost", pre_state, self._snapshot(), changed_automations,
+                    False, saved_zone_states, saved_main_state, command_sent=command_sent,
+                )
         reason = "already_in_desired_hvac_state" if not command_sent else "hvac_action_applied"
         return HVACCommandResult(
             True,
@@ -1066,6 +1470,7 @@ class DaikinHVACAdapter:
             changed_automations,
             saved_zone_states=saved_zone_states,
             command_sent=command_sent,
+            confirmed_zone_intent=confirmed_zone_intent,
         )
 
     async def async_restore(
@@ -1171,7 +1576,7 @@ class DaikinHVACAdapter:
                 if not (
                     entity.startswith("climate.")
                     and isinstance(target, dict)
-                    and _has_restorable_temperature_target(target)
+                    and _has_temperature_target_fields(target)
                     and (zone := self._state(entity)) is not None
                     and _already_in_desired_state(zone, target)
                 )
@@ -1205,7 +1610,9 @@ class DaikinHVACAdapter:
                 if not entity.startswith("climate.") and self._state(entity) is not None
                 and self._state_value(entity) != target
             }
-            states = {entity: desired for entity, desired in states.items() if self._state_value(entity) != desired}
+            states = {
+                entity: desired for entity, desired in states.items() if self._automation_needs_restore(entity, desired)
+            }
             deferred_automations = {
                 entity: desired for entity, desired in states.items() if self._state(entity) is None
             }
@@ -1230,9 +1637,10 @@ class DaikinHVACAdapter:
                 saved_zone_states=zones,
                 saved_main_state=main_state if zones else {},
             )
+        off_start_retry = main_state.get(MEMORY_KEY) and main_state.get("off_start_restore_attempted")
         if (
-            zones or main_state or any(
-                desired == "on" and self._state_value(entity) != "on" for entity, desired in states.items()
+            (not off_start_retry and (zones or main_state)) or any(
+                self._automation_needs_restore(entity, desired) for entity, desired in states.items()
             )
         ) and not await self._async_arm_scheduler_guard():
             await self._async_persist_requested_manual_supersessions()
@@ -1290,7 +1698,9 @@ class DaikinHVACAdapter:
         reason = "no_hvac_automation_state_saved"
         if not main_restored or not restored or not zones_restored:
             reason = "hvac_release_failed"
-            if unresolved_main_state.get(MEMORY_KEY) and unresolved_main_state.get("zone_recovery_blocker"):
+            if unresolved_main_state.get("zone_recovery_blocker") == "off_start_restore_waiting_for_feedback":
+                reason = "hvac_zone_restore_pending"
+            elif unresolved_main_state.get(MEMORY_KEY) and unresolved_main_state.get("zone_recovery_blocker"):
                 reason = "hvac_zone_restore_operator_required"
             elif self._zone_restore_needs_operator(unresolved_zones, unresolved_main_state):
                 unresolved_main_state["zone_recovery_blocker"] = "saved_zone_targets_incompatible_with_off_baseline"
@@ -1351,13 +1761,14 @@ class DaikinHVACAdapter:
                         "duration": max(1, ceil((required_end - now).total_seconds()) + 1),
                     },
                     blocking=True,
+                    scheduler_guard=True,
                 )
                 if not await self._async_confirm_state(timer_entity, "active"):
                     return False
             if self._state_value(guard_entity) != "on":
                 await self._async_command(
                     self.hass, "input_boolean", SERVICE_TURN_ON,
-                    {ATTR_ENTITY_ID: guard_entity}, blocking=True,
+                    {ATTR_ENTITY_ID: guard_entity}, blocking=True, scheduler_guard=True,
                 )
                 if not await self._async_confirm_state(guard_entity, "on"):
                     return False
@@ -1377,10 +1788,8 @@ class DaikinHVACAdapter:
     ) -> tuple[bool, dict[str, str]]:
         """Enable climate automations that were active before takeover."""
         unresolved: dict[str, str] = {}
-        entity_ids = [entity_id for entity_id, state in (saved_states or {}).items() if state == "on"]
-        for entity_id in entity_ids:
-            state = self._state(entity_id)
-            if state is not None and state.state == "on":
+        for entity_id, desired in (saved_states or {}).items():
+            if not self._automation_needs_restore(entity_id, desired):
                 continue
             try:
                 await self._async_command(
@@ -1397,7 +1806,18 @@ class DaikinHVACAdapter:
                 unresolved[entity_id] = "on"
         return not unresolved, unresolved
 
-    async def _async_enable_zones(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    def _automation_needs_restore(self, entity_id: str, desired: str) -> bool:
+        # Core disables the automation before awaiting script cancellation. A
+        # cached On can outlive that change, so re-enable an unsettled suppression
+        # explicitly. Later state publication reflects Core's current enable flag.
+        return desired == "on" and (
+            entity_id in (self._pending_automation_off, self._zone_baseline.get(HVAC_PENDING_AUTOMATION_OFF))
+            or self._state_value(entity_id) != "on"
+        )
+
+    async def _async_enable_zones(
+        self, states: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any], _HVACFollowupWriteBlocked | None]:
         """Enable configured zone entities and return those changed."""
         changed: dict[str, Any] = {}
         power = self._zone_desired.get("zone_power", {})
@@ -1420,41 +1840,49 @@ class DaikinHVACAdapter:
                     service_context.id if service_context is not None else None,
                 )
             try:
+                previous_command = self._last_commands.get(entity_id)
                 try:
                     service_data = {ATTR_ENTITY_ID: entity_id}
-                    if service_context is None:
-                        await self._async_command(
-                            self.hass,
-                            entity_id.split(".", 1)[0],
-                            SERVICE_TURN_ON if requested == "on" else SERVICE_TURN_OFF,
-                            service_data,
-                            blocking=True,
-                        )
-                    else:
-                        await self._async_command(
-                            self.hass,
-                            entity_id.split(".", 1)[0],
-                            SERVICE_TURN_ON if requested == "on" else SERVICE_TURN_OFF,
-                            service_data,
-                            blocking=True,
-                            context=service_context,
-                        )
+                    await self._async_command(
+                        self.hass,
+                        entity_id.split(".", 1)[0],
+                        SERVICE_TURN_ON if requested == "on" else SERVICE_TURN_OFF,
+                        service_data,
+                        blocking=True,
+                        takeover_write=True,
+                        context=service_context,
+                    )
+                except _HVACTakeoverBlocked:
+                    raise
+                except _HVACFollowupWriteBlocked as blocked:
+                    changed.pop(entity_id)
+                    return False, changed, blocked
                 except Exception:  # noqa: BLE001
-                    return False, changed
+                    if self._command_dispatched_since(entity_id, previous_command) and self._synchronized_takeover():
+                        # The service failure may precede acknowledgement of an accepted zone change.
+                        # Keep the service failure as the outcome, and wait before restoring its baseline.
+                        self._observe_followup_takeover()
+                        try:
+                            await self._async_confirm_state(entity_id, requested)
+                        except (_HVACFollowupWriteBlocked, _HVACManualOverrideError):
+                            pass
+                    return False, changed, None
                 try:
+                    # A head or sibling override can arrive before this zone's
+                    # write is visible. Settle it before checking that override.
+                    if not self._synchronized_takeover() or entity_id in self._manual_zone_override_entity_ids():
+                        self._raise_if_manual_override_requested()
+                    if not await self._async_confirm_state(entity_id, requested):
+                        return False, changed, None
                     self._raise_if_manual_override_requested()
+                except _HVACFollowupWriteBlocked as blocked:
+                    return False, changed, blocked
                 except _HVACManualOverrideError:
-                    return False, changed
-                if not await self._async_confirm_state(entity_id, requested):
-                    return False, changed
-                try:
-                    self._raise_if_manual_override_requested()
-                except _HVACManualOverrideError:
-                    return False, changed
+                    return False, changed, None
             finally:
                 if self._set_coupled_zone_feedback_expected is not None:
                     self._set_coupled_zone_feedback_expected(None, None, None)
-        return True, changed
+        return True, changed, None
 
     def _zone_restore_deferred(self, entity_id: str, target: Any) -> bool:
         """Wait for a zone to expose a target and bounds compatible with its baseline."""
@@ -1469,7 +1897,7 @@ class DaikinHVACAdapter:
             return True
         # Bounds constrain new commands, not confirmation of an already restored baseline.
         if (
-            _has_restorable_temperature_target(target)
+            _has_temperature_target_fields(target)
             and _mode_matches(observed, target.get("hvac_mode"))
             and _temperature_matches(observed, target.get("target_temperature"))
             and _temperature_range_matches(observed, target.get("target_temp_low"), target.get("target_temp_high"))
@@ -1486,7 +1914,7 @@ class DaikinHVACAdapter:
             low = float(attributes.get("min_temp", float("-inf")))
             high = float(attributes.get("max_temp", float("inf")))
             return all(isfinite(value) and low <= value <= high for value in values)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
 
     async def _async_restore_zone_states(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
@@ -1521,7 +1949,7 @@ class DaikinHVACAdapter:
                 continue
             confirmed = False
             if entity_id.split(".", 1)[0] == "climate":
-                if not isinstance(state, dict) or not _has_restorable_temperature_target(state):
+                if not isinstance(state, dict) or not _has_temperature_target_fields(state):
                     # Empty or malformed persisted target evidence cannot prove
                     # that a previously changed zone was restored.
                     unresolved[entity_id] = state
@@ -1593,6 +2021,35 @@ class DaikinHVACAdapter:
             return False
         return True
 
+    async def _async_rollback_takeover_result(
+        self,
+        pre_state: dict[str, Any],
+        changed_automations: dict[str, str],
+        changed_zones: dict[str, Any],
+        *,
+        main_entity: str,
+        saved_main_state: dict[str, Any],
+        reason: str,
+    ) -> HVACCommandResult:
+        """Restore a failed takeover and retain any late capability evidence."""
+        self._observe_followup_takeover()
+        command_sent = not self._awaiting_hvac_actuator
+        rollback_succeeded, unresolved_states, unresolved_zones, unresolved_main = await self._async_rollback_takeover(
+            changed_automations, changed_zones, main_entity=main_entity, saved_main_state=saved_main_state,
+        )
+        return HVACCommandResult(
+            False,
+            reason if rollback_succeeded else "hvac_acquisition_rollback_failed",
+            pre_state,
+            self._snapshot(),
+            unresolved_states,
+            rollback_succeeded,
+            unresolved_zones,
+            unresolved_main,
+            command_sent=command_sent,
+            capability_issues=self._late_takeover_issues,
+        )
+
     async def _async_rollback_takeover(
         self,
         saved_automation_states: dict[str, str],
@@ -1603,17 +2060,27 @@ class DaikinHVACAdapter:
         restore_main: bool = True,
     ) -> tuple[bool, dict[str, str], dict[str, Any], dict[str, Any]]:
         """Release every actuator acquired before a climate command failed."""
+        await self._async_persist_requested_manual_supersessions()
+        # Supersession persistence can deliver the first Dry feedback.
+        self._observe_followup_takeover()
+        pending = self._recovery_confirmation
+        if self._late_takeover_issues and pending is not None:
+            last_command = self._last_commands.get(pending["entity_id"], {})
+            if last_command.get("dispatched") is True and last_command.get("context_id") == pending["context_id"]:
+                # Settle an accepted write under its original lease before issuing compensation.
+                await self._async_reconcile_recovery()
+                self._observe_followup_takeover()
         if restore_main and self._set_pending_main_restore is not None:
             self._set_pending_main_restore(dict(saved_main_state))
         if self._set_pending_zone_restore is not None:
             self._set_pending_zone_restore(dict(changed_zones))
-        await self._async_persist_requested_manual_supersessions()
         main_restored, zones_restored, unresolved_zones = await self._async_restore_main_and_zones(
             main_entity, saved_main_state if restore_main else {}, changed_zones,
         )
         await self._async_persist_requested_manual_supersessions()
         automations_restored, unresolved_states = await self._async_enable_automation_entities(saved_automation_states)
         await self._async_persist_requested_manual_supersessions()
+        self._observe_followup_takeover()
         unresolved_main_state = {} if (main_restored and zones_restored) or not restore_main else saved_main_state
         if main_restored and unresolved_zones and unresolved_main_state:
             unresolved_main_state = {**unresolved_main_state, "zone_recovery_attempted": True, "recovery_version": 1}
@@ -1639,7 +2106,7 @@ class DaikinHVACAdapter:
                 if head is None or head.state != target["baseline_hvac_mode"]:
                     continue
             observed = self._state(climate)
-            if (actuator in zones and isinstance(target, dict) and _has_restorable_temperature_target(target)
+            if (actuator in zones and isinstance(target, dict) and _has_temperature_target_fields(target)
                     and observed is not None and not _already_in_desired_state(observed, target)
                     and self._zone_target_within_bounds(observed, target)):
                 result[actuator] = "on"
@@ -1658,22 +2125,38 @@ class DaikinHVACAdapter:
     ) -> tuple[bool, bool, dict[str, Any]]:
         """One bounded, durable mode-aware restoration; failed shutdown never probes."""
         memory = main_state[MEMORY_KEY]
-        from .daikin_memory import provider
+        from .daikin_memory import provider, source_identity
         from .zone_control import topology
-        source = provider(self.hass, self.entry_data)
+        source = provider(self.hass, self.entry_data, require_available=False)
         valid = (memory.get("version") == 1 and memory.get("head") == main_entity
-                 and source is not None and source_matches(self.hass, self.entry_data, memory)
+                 and source is not None
+                 and all(memory.get(key) == value for key, value in source_identity(source).items())
                  and topology(self.entry_data).get("pairs") == memory.get("pairs"))
         if not valid:
             main_state["zone_recovery_blocker"] = "off_start_provider_identity_changed"
             return False, False, dict(zones)
+        state = self._state_value(main_entity)
+        if state is None or provider(self.hass, self.entry_data) is None:
+            main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+            return False, False, dict(zones)
         if main_state.get("off_start_restore_attempted"):
-            observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
-            if memory_matches(observed, memory, zones):
-                return True, True, {}
-            # Retain every baseline. Incomplete restoration may only inspect or
-            # shut down; never alternate remembered modes on subsequent retries.
-            await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+            if state != "off" or self._unconfirmed_main_mode:
+                # A known Off baseline permits shutdown only. Keep the
+                # captured identity enforced across guard and Store awaits.
+                self._restoring_memory = memory
+                try:
+                    await self._async_restore_main_state_preserving_manual(
+                        main_entity, {"hvac_mode": "off"}, emergency_off=True,
+                    )
+                finally:
+                    self._restoring_memory = None
+            else:
+                observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
+                if observed is None:
+                    main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+                    return False, False, dict(zones)
+                if memory_matches(observed, memory, zones):
+                    return True, True, {}
             main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
             return False, False, dict(zones)
         main_state["off_start_restore_attempted"] = True
@@ -1769,7 +2252,10 @@ class DaikinHVACAdapter:
                 main_ok, pending = False, dict(zones)
         if pending or not main_ok:
             main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
-        return main_ok, not pending, self._retain_paired_zone_power(zones, pending)
+            # Partial acknowledgements preceded a mode change or a failed
+            # shutdown. Keep the full owned set for the next native readback.
+            return main_ok, False, dict(zones)
+        return True, True, {}
 
     async def _async_restore_main_and_zones(
         self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
@@ -1817,7 +2303,7 @@ class DaikinHVACAdapter:
                 observed.state in _ACTIVE_HVAC_MODES
                 or (
                     main_state.get(_ROLLBACK_ACTIVE_HVAC_MODE) in _ACTIVE_HVAC_MODES
-                    and _has_restorable_temperature_target(main_state)
+                    and _has_temperature_target_fields(main_state)
                 )
             )
             and any(entity.startswith("climate.") for entity in zones)
@@ -1893,18 +2379,27 @@ class DaikinHVACAdapter:
         *,
         main_entity: str,
         saved_main_state: dict[str, Any],
+        automation_dispatched: bool,
     ) -> HVACCommandResult:
         """Roll back while preserving every user-superseded climate entity."""
-        main_superseded = self._manual_override_requested is not None and self._manual_override_requested()
-        superseded_zones = self._manual_zone_override_entity_ids()
-        await self._async_persist_override_supersessions(
-            main_superseded,
-            superseded_zones,
-        )
-        # An unrelated zone override does not cancel a mode write already
-        # accepted by the head. Settle that intent before trusting a cached
-        # pre-command baseline or issuing its compensation.
-        await self._async_reconcile_recovery()
+        self._observe_followup_takeover("set_temperature")
+        try:
+            self._check_pending_takeover_capability()
+            main_superseded = self._manual_override_requested is not None and self._manual_override_requested()
+            superseded_zones = self._manual_zone_override_entity_ids()
+            await self._async_persist_override_supersessions(main_superseded, superseded_zones)
+            # Settle any accepted head command before compensating it, even
+            # if a manual change superseded only a zone.
+            await self._async_reconcile_recovery()
+            self._check_pending_takeover_capability()
+            self._observe_followup_takeover("set_temperature")
+            if self._awaiting_hvac_actuator and self._synchronized_takeover():
+                # The user superseded acquisition before a thermostat or zone
+                # was written. Only dispatched automation work can need rollback.
+                raise _HVACTakeoverBlocked([], pre_dispatch_reason="manual_hvac_override_detected")
+        except _HVACTakeoverBlocked as blocked:
+            blocked.record_automation_work(changed_automations, dispatched=automation_dispatched)
+            raise
         rollback_zones = {
             entity_id: state for entity_id, state in changed_zones.items() if entity_id not in superseded_zones
         }
@@ -1924,6 +2419,8 @@ class DaikinHVACAdapter:
             rollback_succeeded,
             unresolved_zones,
             unresolved_main,
+            command_sent=not self._awaiting_hvac_actuator,
+            capability_issues=self._late_takeover_issues,
         )
 
     async def _async_manual_override_result_if_requested(
@@ -1934,6 +2431,7 @@ class DaikinHVACAdapter:
         *,
         main_entity: str,
         saved_main_state: dict[str, Any],
+        automation_dispatched: bool = False,
     ) -> HVACCommandResult | None:
         """Return a subordinate-only rollback when a user superseded the command."""
         try:
@@ -1945,6 +2443,7 @@ class DaikinHVACAdapter:
                 changed_zones,
                 main_entity=main_entity,
                 saved_main_state=saved_main_state,
+                automation_dispatched=automation_dispatched,
             )
         return None
 
@@ -1952,10 +2451,12 @@ class DaikinHVACAdapter:
         self,
         entity_id: str,
         saved_state: dict[str, Any],
+        *,
+        emergency_off: bool = False,
     ) -> bool:
         """Restore main state unless a user supersedes the pending snapshot."""
         try:
-            return await self._async_restore_main_state(entity_id, saved_state)
+            return await self._async_restore_main_state(entity_id, saved_state, emergency_off=emergency_off)
         except _HVACManualOverrideError:
             await self._async_persist_requested_manual_supersessions()
             return True
@@ -1964,15 +2465,19 @@ class DaikinHVACAdapter:
         self,
         entity_id: str,
         saved_state: dict[str, Any],
+        *,
+        emergency_off: bool = False,
     ) -> bool:
         """Restore original state immediately, including acquisition rollback."""
         self._restoring_main_state = True
         try:
-            return await self._async_restore_main_state_impl(entity_id, saved_state)
+            return await self._async_restore_main_state_impl(entity_id, saved_state, emergency_off=emergency_off)
         finally:
             self._restoring_main_state = False
 
-    async def _async_restore_main_state_impl(self, entity_id: str, saved_state: dict[str, Any]) -> bool:
+    async def _async_restore_main_state_impl(
+        self, entity_id: str, saved_state: dict[str, Any], *, emergency_off: bool = False,
+    ) -> bool:
         """Restore and confirm the complete main state changed during takeover."""
         desired_state = _main_hvac_desired_state(saved_state)
         if not desired_state:
@@ -2016,6 +2521,7 @@ class DaikinHVACAdapter:
                     {"hvac_mode": "off"},
                     respect_zone_manual_override=False,
                     force=self._unconfirmed_main_mode,
+                    emergency_off=emergency_off,
                 )
             except _HVACManualOverrideError:
                 raise
@@ -2045,7 +2551,9 @@ class DaikinHVACAdapter:
         self._raise_if_manual_override_requested(include_zones=False)
         return main_state_restored
 
-    async def _async_confirm_state(self, entity_id: str, expected_state: str) -> bool:
+    async def _async_confirm_state(
+        self, entity_id: str, expected_state: str, *, on_readback: Callable[[], None] | None = None,
+    ) -> bool:
         """Wait briefly for Home Assistant to publish a requested actuator state."""
         if entity_id in self._independent_pairs():
             return await self._async_wait_for_climate(entity_id, lambda observed: observed.state == expected_state)
@@ -2055,15 +2563,22 @@ class DaikinHVACAdapter:
         await asyncio.sleep(0)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
+        check_takeover = self._checking_takeover_readback and entity_id in self._zone_entities()
+        blocked = False
         while True:
             observed = self._state(entity_id)
-            if observed is not None and observed.state == expected_state:
-                await self._record_confirmation(entity_id, True)
-                return True
+            if on_readback is not None:
+                on_readback()
+            if check_takeover and self._observe_followup_takeover():
+                blocked = True
+            confirmed = observed is not None and observed.state == expected_state
             remaining = deadline - loop.time()
-            if remaining <= 0:
-                await self._record_confirmation(entity_id, False)
-                return False
+            if confirmed or remaining <= 0:
+                await self._record_confirmation(entity_id, confirmed)
+                if blocked:
+                    # The zone write reached Home Assistant. Settle its feedback before rollback.
+                    raise _HVACFollowupWriteBlocked(",".join(self._late_takeover_issues))
+                return confirmed
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
     def _raise_if_climate_override_requested(self, entity_id: str) -> None:
@@ -2154,7 +2669,16 @@ class DaikinHVACAdapter:
         refresh: asyncio.Task[Any] | None = None
         try:
             while True:
+                if self._awaiting_hvac_actuator:
+                    self._raise_if_climate_override_requested(entity_id)
+                    respect_main, _ = self._climate_override_policy.get(entity_id, (True, True))
+                    self._check_pending_takeover_capability(respect_main)
                 observed = self._state(entity_id)
+                if self._checking_takeover_readback and not self._awaiting_hvac_actuator:
+                    self._raise_if_climate_override_requested(entity_id)
+                    if self._off_start_recall_dispatched and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE):
+                        self._allow_off_start_recall(observed)
+                    self._check_followup_takeover()
                 if observed is not None and matches(observed):
                     await self._record_confirmation(entity_id, True)
                     if (self._recovery_confirmation is not None
@@ -2238,6 +2762,7 @@ class DaikinHVACAdapter:
         *,
         force: bool = False,
         takeover_main_state: dict[str, Any] | None = None,
+        takeover_write: bool = False,
         emergency_off: bool = False,
         respect_manual_override: bool = True,
         respect_zone_manual_override: bool = True,
@@ -2273,6 +2798,7 @@ class DaikinHVACAdapter:
                         blocking=True,
                         context=service_context,
                         emergency_off=emergency_off,
+                        takeover_write=takeover_write,
                     )
                     if respect_manual_override:
                         self._raise_if_manual_override_requested(
@@ -2309,6 +2835,7 @@ class DaikinHVACAdapter:
                         {ATTR_ENTITY_ID: entity_id},
                         blocking=True,
                         context=service_context,
+                        takeover_write=takeover_write,
                     )
                     if respect_manual_override:
                         self._raise_if_manual_override_requested(
@@ -2321,6 +2848,8 @@ class DaikinHVACAdapter:
                             include_zones=respect_zone_manual_override,
                         )
                     observed = self._state(entity_id) or observed
+                    if takeover_write and self._off_start_recall_dispatched:
+                        self._allow_off_start_recall(observed)
                     if takeover_main_state is not None and observed.state in _ACTIVE_HVAC_MODES:
                         takeover_main_state.setdefault(_ROLLBACK_ACTIVE_HVAC_MODE, observed.state)
                         if self._async_persist_main_state is not None:
@@ -2362,6 +2891,7 @@ class DaikinHVACAdapter:
                         {ATTR_ENTITY_ID: entity_id, "hvac_mode": desired_mode},
                         blocking=True,
                         context=service_context,
+                        takeover_write=takeover_write,
                     )
                     if respect_manual_override:
                         self._raise_if_manual_override_requested(
@@ -2377,6 +2907,10 @@ class DaikinHVACAdapter:
                             include_zones=respect_zone_manual_override,
                         )
                 finally:
+                    # Unchanged Off-start recall is expected during mode
+                    # readback. End the allowance before temperature control.
+                    if takeover_write:
+                        self._off_start_recall_dispatched = False
                     if service_context is not None and self._set_coupled_zone_feedback_expected is not None:
                         self._set_coupled_zone_feedback_expected(None, None, None)
 
@@ -2400,6 +2934,7 @@ class DaikinHVACAdapter:
                 "set_temperature",
                 {ATTR_ENTITY_ID: entity_id, "temperature": desired_temperature},
                 blocking=True,
+                takeover_write=takeover_write,
             )
             if respect_manual_override:
                 self._raise_if_manual_override_requested(
@@ -2417,6 +2952,7 @@ class DaikinHVACAdapter:
                 "set_temperature",
                 {ATTR_ENTITY_ID: entity_id, "target_temp_low": target_low, "target_temp_high": target_high},
                 blocking=True,
+                takeover_write=takeover_write,
             )
             if respect_manual_override:
                 self._raise_if_manual_override_requested(
@@ -2443,6 +2979,7 @@ class DaikinHVACAdapter:
                         zone_entity,
                         {"target_temperature": target} if target is not None else zone_target,
                         force=force,
+                        takeover_write=takeover_write,
                         respect_manual_override=respect_manual_override,
                         respect_zone_manual_override=respect_zone_manual_override,
                     )
@@ -2450,9 +2987,9 @@ class DaikinHVACAdapter:
                 )
         return command_sent
 
-    async def _async_disable_automations(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
-        """Stop configured automations and return the states actually changed."""
-        changed_states: dict[str, str] = {}
+    async def _async_disable_automations(self, states: dict[str, str]) -> _AutomationSuppression:
+        """Suppress the configured automations and retain evidence for their recovery."""
+        result = _AutomationSuppression()
         for automation_id, state in states.items():
             observed = self._state(automation_id)
             if (
@@ -2466,30 +3003,62 @@ class DaikinHVACAdapter:
             if state == "on":
                 # Treat the boundary as uncertain: a service handler can apply
                 # the state change before propagating an exception.
-                changed_states[automation_id] = state
+                result.restoration_states[automation_id] = state
+            self._pending_automation_off = automation_id if state == "on" and self._synchronized_takeover() else None
+            previous_command = self._last_commands.get(automation_id)
             try:
                 # Home Assistant can report an automation as off while an
                 # action sequence started earlier is still running.
-                await self._async_command(
+                before_dispatch = await self._async_command(
                     self.hass,
                     "automation",
                     SERVICE_TURN_OFF,
                     {ATTR_ENTITY_ID: automation_id, "stop_actions": True},
                     blocking=True,
                 )
+            except _HVACTakeoverBlocked as blocked:
+                result.restoration_states.pop(automation_id, None)
+                blocked.record_automation_work(result.restoration_states, dispatched=result.dispatched)
+                raise
             except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-                return False, changed_states
+                # A failed handler can have accepted the command. A guard
+                # refusal or locally unavailable target never reached it.
+                attempted = self._command_dispatched_since(automation_id, previous_command)
+                if not attempted:
+                    result.restoration_states.pop(automation_id, None)
+                    self._pending_automation_off = None
+                elif automation_id in result.restoration_states:
+                    result.automation_off_pending = automation_id
+                result.dispatched |= attempted
+                return result
+            result.dispatched = True
+            result.suppressed_active_automation |= bool(
+                getattr(before_dispatch, "state", None) == "on"
+                or getattr(before_dispatch, "attributes", {}).get("current", 0)
+            )
             try:
+                # An override can arrive before the accepted suppression is
+                # visible. Read back Off before trying to restore the automation.
+                if not self._synchronized_takeover():
+                    self._raise_if_manual_override_requested()
+                if not await self._async_confirm_state(automation_id, "off"):
+                    return result
+                self._pending_automation_off = None
                 self._raise_if_manual_override_requested()
+                # Suppression may be the whole action, so it needs the same
+                # check after confirmation that precedes the next command.
+                self._check_pending_takeover_capability()
+            except _HVACTakeoverBlocked as blocked:
+                blocked.record_automation_work(result.restoration_states, dispatched=True)
+                raise
             except _HVACManualOverrideError:
-                return False, changed_states
-            if not await self._async_confirm_state(automation_id, "off"):
-                return False, changed_states
-            try:
-                self._raise_if_manual_override_requested()
-            except _HVACManualOverrideError:
-                return False, changed_states
-        return True, changed_states
+                return result
+        result.confirmed = True
+        return result
+
+    def _command_dispatched_since(self, entity_id: str, previous_command: dict[str, Any] | None) -> bool:
+        command = self._last_commands.get(entity_id)
+        return command is not None and command is not previous_command and command.get("dispatched") is True
 
     def _automation_states(self) -> dict[str, str]:
         states: dict[str, str] = {}
@@ -2521,7 +3090,7 @@ class DaikinHVACAdapter:
                 # Compensate this attempt against its pre-command head/zone
                 # settings. Ownership merging separately preserves the original
                 # lifecycle targets for final release.
-                states[entity_id] = (_climate_target_snapshot(state)
+                states[entity_id] = (climate_target_snapshot(state)
                                      or self._zone_baseline.get("zone_states", {}).get(entity_id, {}))
             else:
                 states[entity_id] = state.state
@@ -2571,7 +3140,7 @@ class DaikinHVACAdapter:
     def _state(self, entity_id: str | None) -> State | None:
         return available_state(self.hass, entity_id)
 
-    def _state_value(self, entity_id: str) -> str | None:
+    def _state_value(self, entity_id: str | None) -> str | None:
         state = self._state(entity_id)
         return None if state is None else state.state
 
@@ -2597,8 +3166,8 @@ def _temperature_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _has_restorable_temperature_target(saved_state: dict[str, Any]) -> bool:
-    """Return whether a snapshot can restore one complete target shape."""
+def _has_temperature_target_fields(saved_state: dict[str, Any]) -> bool:
+    """Detect the target shape in legacy and restoration snapshots."""
     return saved_state.get("target_temperature") is not None or (
         saved_state.get("target_temp_low") is not None and saved_state.get("target_temp_high") is not None
     )
@@ -2613,23 +3182,9 @@ def _main_hvac_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _climate_target_snapshot(state: State) -> dict[str, Any]:
-    """Capture the target fields needed to restore a subordinate thermostat."""
-    attributes = getattr(state, "attributes", {}) or {}
-    target_low = attributes.get("target_temp_low")
-    target_high = attributes.get("target_temp_high")
-    if target_low is not None and target_high is not None:
-        return {
-            "target_temp_low": target_low,
-            "target_temp_high": target_high,
-        }
-    temperature = attributes.get("temperature")
-    return {"target_temperature": temperature} if temperature is not None else {}
-
-
 def _climate_state_snapshot(state: State) -> dict[str, Any]:
     """Capture the main thermostat mode and target for transactional rollback."""
-    return {"hvac_mode": state.state, **_climate_target_snapshot(state)}
+    return {"hvac_mode": state.state, **climate_target_snapshot(state)}
 
 
 def _mode_matches(state: State, desired_mode: Any) -> bool:
@@ -2642,19 +3197,12 @@ def _temperature_matches(state: State, desired_temperature: Any) -> bool:
     if desired_temperature is None:
         return True
     attributes = getattr(state, "attributes", {}) or {}
-    return _float_equal(attributes.get("temperature"), desired_temperature)
+    return temperature_targets_match(attributes.get("temperature"), desired_temperature)
 
 
 def _temperature_range_matches(state: State, target_low: Any, target_high: Any) -> bool:
     """Return whether every requested range target is already observed."""
     attributes = getattr(state, "attributes", {}) or {}
-    return (target_low is None or _float_equal(attributes.get("target_temp_low"), target_low)) and (
-        target_high is None or _float_equal(attributes.get("target_temp_high"), target_high)
+    return (target_low is None or temperature_targets_match(attributes.get("target_temp_low"), target_low)) and (
+        target_high is None or temperature_targets_match(attributes.get("target_temp_high"), target_high)
     )
-
-
-def _float_equal(left: Any, right: Any) -> bool:
-    try:
-        return abs(float(left) - float(right)) < 0.05
-    except (TypeError, ValueError):
-        return False

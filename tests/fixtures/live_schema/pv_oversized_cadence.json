@@ -1,0 +1,17 @@
+{
+  "kind": "forecast_state",
+  "name": "synthetic_pv_oversized_cadence",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "power",
+  "value_keys": ["value"],
+  "state": "0",
+  "attributes": {
+    "interval_minutes": 1e15,
+    "forecast": [
+      {"valid_at": "2026-06-27T00:00:00+00:00", "value": 1.0}
+    ]
+  },
+  "expected": [1.0, null, null, null]
+}

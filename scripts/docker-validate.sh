@@ -39,10 +39,11 @@ run() {
 
 run scripts/validation-environment.sh
 run env PYTHONPYCACHEPREFIX="$PYCACHE_DIR" python3 -m compileall -q custom_components tests scripts
-run docker run --rm -v "$PWD:/work" -w /work ghcr.io/astral-sh/ruff:0.14.1 check custom_components tests scripts
+run docker run --rm -v "$PWD:/work" -w /work "ghcr.io/astral-sh/ruff:$(python3 scripts/support_policy.py ruff)" check custom_components tests scripts
 run scripts/docker-mypy.sh
 run bash -n scripts/docker-package-smoke.sh scripts/validation-environment.sh scripts/docker-compatibility.sh scripts/docker-ha-smoke.sh scripts/docker-mypy.sh scripts/docker-pytest-fast.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
 run sh -n scripts/install-test-dependencies.sh
+run bash -n scripts/ha-dev.sh
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run
 run scripts/export-real-validation-bundle.sh --dry-run

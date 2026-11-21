@@ -21,6 +21,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_PV_FORECAST,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
+    HVAC_DRY_RELEASE_DURING_OFF_START,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
 from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
@@ -3914,21 +3916,55 @@ def test_learning_message_does_not_hide_legacy_rejection_or_manual_override() ->
     )
 
 
+@pytest.mark.parametrize("provisional,mixed", [(True, False), (False, False), (True, True)])
+def test_planner_marks_only_dry_release_during_provisional_off_start(provisional: bool, mixed: bool) -> None:
+    context = _context()
+    context.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    if mixed:
+        context.input_issues.append("climate_zone_target_unavailable")
+    context.hvac_control = {"main_state": {"hvac_mode": "off"}}
+    context.dry_during_provisional_off_start = provisional
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+    actions = planner._actions(context, PlannerMode.ACTIVE_HEALTHY)
+    release = next(action for action in actions if action.kind == ActionKind.RELEASE_HVAC)
+    assert release.desired_state.get(HVAC_DRY_RELEASE_DURING_OFF_START, False) is (provisional and not mixed)
+
+
 @pytest.mark.parametrize("charging", [False, True])
-def test_outage_preserves_current_session_caps_power_and_attaches_hard_deadline(charging) -> None:
+@pytest.mark.parametrize(
+    "extra_issues",
+    [
+        (),
+        (HVAC_DRY_ZONE_TARGETS_ABSENT,),
+        (HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable", "climate_zone_unavailable"),
+        (HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable", "ev_power_feedback_unavailable"),
+    ],
+    ids=["load-only", "dry", "dry-with-zone-faults", "dry-with-ev-fault"],
+)
+def test_outage_preserves_current_session_caps_power_and_attaches_hard_deadline(
+    charging: bool, extra_issues: tuple[str, ...],
+) -> None:
     context = _context(InputHealth.DEGRADED)
     context.ev_charging = charging
     context.ev_connected = True
-    context.input_issues = ["household_load_model_fallback_active"]
+    context.input_issues = ["household_load_model_fallback_active", *extra_issues]
+    if HVAC_DRY_ZONE_TARGETS_ABSENT in extra_issues:
+        context.current_hvac_mode = "dry"
     context.ev_evidence = {"commanded_kw": 7.0, "load_fallback": {
         "fallback_applied": True, "fallback_remaining_seconds": 780,
     }}
     for slot in context.slots:
         slot.baseline_load_forecast_upper_kw = 2
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
-               "grid_import_limit_kw": 20, "ev_charge_rate_kw": 7}
+               "grid_import_limit_kw": 20, "ev_charge_rate_kw": 7,
+               "minimum_ev_confidence": 90, "minimum_tariff_confidence": 90, "minimum_solar_confidence": 90}
     plan = DryRunPlanner(options).create_plan(context)
-    action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
+    assert set(extra_issues).issubset(plan.input_issues)
+    action = next((a for a in plan.actions if a.asset == ActionAsset.EV), None)
+    if "ev_power_feedback_unavailable" in extra_issues:
+        assert action is None
+        return
+    assert action is not None
     assert action.desired_state["charging_required_now"] is True
     assert action.desired_state["projected_load_kw_now"] <= 7
     assert action.desired_state["optimization"]["cost_estimates_degraded"] is True

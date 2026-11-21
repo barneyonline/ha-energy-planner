@@ -8,6 +8,24 @@ STARTUP_WARMUP_SECONDS = 30 * 60
 HVAC_ZONE_SETTLE_SECONDS = 150
 HVAC_ZONE_SETTLE_MAX_SECONDS = 180
 HVAC_PRECONDITION_LEAD_LIMIT_MINUTES = 360
+HVAC_DRY_ZONE_TARGETS_ABSENT = "climate_zone_targets_absent_in_dry_mode"
+HVAC_DRY_TAKEOVER_SUMMARY = "HVAC takeover paused while Daikin is in Dry mode"
+HVAC_PENDING_AUTOMATION_OFF = "pending_automation_off"
+HVAC_DRY_RELEASE_DURING_OFF_START = "dry_release_during_off_start"
+HVAC_ROLLBACK_TARGET_FAULTS = frozenset({
+    "main_climate_target_unavailable",
+    "climate_zone_target_unavailable",
+})
+HVAC_CAPABILITY_ISSUES = HVAC_ROLLBACK_TARGET_FAULTS | {
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    "daikin_climate_not_configured",
+    "daikin_climate_unavailable",
+    "climate_automation_unavailable",
+    "climate_zone_unavailable",
+    "climate_manual_override_unavailable",
+    "climate_scheduler_guard_incomplete",
+    "climate_scheduler_guard_unavailable",
+}
 
 DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"

@@ -7,17 +7,17 @@ import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.core import HomeAssistant
 
-from .action_limits import budget_history, recent_attempts
-from .calendar_history import confirm_calendar_action, update_calendar_history
-from .climate_inputs import instant
+from .action_limits import budget_history, reanchor_export_attempts, recent_attempts
+from .calendar_history import confirm_calendar_action, normalize_calendar_history, update_calendar_history
+from .climate_inputs import climate_storage_value, instant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
-from .preconditioning import record_acquisition, record_outcome, record_plan
+from .preconditioning import outcome_capability_issues, record_acquisition, record_outcome, record_plan
 
 _LIST_FIELDS = {
     "ai_recommendations",
@@ -141,10 +141,12 @@ class PlannerStore:
 
     async def async_save_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Persist observed activity even when no new plan is computed."""
         self.record_calendar_events(events, now=now)
+        history = cast("dict[str, Any] | None", self.data.get("calendar_history"))
         await self._async_flush()
+        return history
 
     def record_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None, location: str | None = None,
@@ -226,7 +228,7 @@ class PlannerStore:
             if key == "outcome"
             else _climate_audit_controls(value)
             if isinstance(value, dict)
-            else value
+            else climate_storage_value(value)
             for key, value in event.items()
             if key in allowed and value is not None
         }
@@ -406,6 +408,10 @@ class PlannerStore:
         """Persist command rate-limit timestamps."""
         await self._async_set_if_changed("command_rate_limits", limits)
 
+    async def async_reanchor_export_attempts(self, now: datetime) -> None:
+        """Persist the bounded export allowance before reopening command timing."""
+        await self._async_set_if_changed("action_attempts", reanchor_export_attempts(budget_history(self.data), now))
+
     async def async_save_production(self, production: dict[str, Any]) -> None:
         """Persist production arming state."""
         await self._async_set_if_changed("production", production)
@@ -442,6 +448,10 @@ class PlannerStore:
 
     async def _async_flush(self, *, force: bool = False) -> None:
         """Serialize Store writes until every observed mutation is durable."""
+        if self._save_delay_depth and not force:
+            # A batched caller must not queue behind disk I/O for a flush that
+            # the outer scope already owns. Recheck after lock acquisition too.
+            return
         async with self._save_lock:
             while self._is_dirty:
                 if self._save_delay_depth and not force:
@@ -530,6 +540,8 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     for key in _DICT_FIELDS:
         if not isinstance(data.get(key), dict):
             data[key] = {}
+    if data.get("calendar_history"):
+        data["calendar_history"] = normalize_calendar_history(data["calendar_history"], datetime.now(UTC))
     if "ev_telemetry" in data and not isinstance(data["ev_telemetry"], dict):
         data["ev_telemetry"] = {"version": 1, "budget_uncertain": True}
     active_plan = data.get("active_plan")
@@ -604,7 +616,7 @@ def _climate_audit_controls(values: dict[str, Any]) -> dict[str, Any]:
         "climate_policy",
     }
     return {
-        field: setting
+        field: climate_storage_value(setting)
         for field, setting in list(values.items())[:100]
         if (field in controls or field.startswith(("climate.", "switch.", "input_boolean.", "automation.", "timer.")))
         and (setting is None or isinstance(setting, str | bool | int | float))
@@ -632,6 +644,8 @@ def _climate_audit_outcome(entry: dict[str, Any]) -> dict[str, Any]:
         outcome["desired_state"] = _climate_audit_controls(entry["desired_state"])
     if isinstance(entry.get("command_sent"), bool):
         outcome["command_sent"] = entry["command_sent"]
+    if issues := outcome_capability_issues(entry):
+        outcome["capability_issues"] = issues
     return outcome
 
 
@@ -677,6 +691,8 @@ def _audit_entry(outcome: ActionOutcome | dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(entry.get("command_sent"), bool):
         audit["command_sent"] = entry["command_sent"]
+    if issues := outcome_capability_issues(entry):
+        audit["capability_issues"] = issues
     if isinstance(entry.get("desired_state"), dict):
         audit["desired_state"] = _bounded_mapping(entry["desired_state"])
     if "occurrence_count" in entry:

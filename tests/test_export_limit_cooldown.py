@@ -7,13 +7,21 @@ import json
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from homeassistant.core import State
 from test_export_limit import DATA, ENTITY, NOW, OPTIONS, action, context, limit_state, price_state
 from test_export_limit import setup as export_setup
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
-from custom_components.ha_energy_planner.const import CONF_COMMAND_RATE_LIMIT_SECONDS, CONF_DRY_RUN
+from custom_components.ha_energy_planner import export_limit_policy
+from custom_components.ha_energy_planner.action_limits import action_budget, budget_history
+from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DRY_RUN,
+)
 from custom_components.ha_energy_planner.export_limit_cooldown import control_key, cooldown_status
 from custom_components.ha_energy_planner.export_limit_policy import EXPORT_ASSET, build_actions
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -244,6 +252,184 @@ def test_reads_noops_and_unavailable_identity_do_not_reserve_attempts(setup):
         s.registry.clear()
         assert await s.control.prepare_cooldown(s.clock["now"]) is None
         assert not s.calls
+    asyncio.run(run())
+
+
+def test_settled_refreshes_do_not_reconcile_or_save_unchanged_settings(setup, monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        save = AsyncMock(wraps=setup.store.async_save_command_rate_limits)
+        setup.store.async_save_command_rate_limits = save
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("settled"))
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        await owner._async_update_data()
+        for second in (300, 600, 900):
+            move(setup, second)
+            await owner._async_update_data()
+            assert owner._export_reconcile_task is None
+        owner._schedule_debounced_refresh.assert_called_once()
+        save.assert_awaited_once()
+        assert not setup.calls
+        # A backward readback or an edited ownership expectation requires a
+        # fresh reconciliation even when the gateway reports the same watts.
+        setup.states[ENTITY].attributes["last_successful_readback"] -= 1
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert owner._schedule_debounced_refresh.call_count == 2
+        save.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("skew_seconds", [480, 8 * 3600])
+def test_clock_repair_reopens_daily_allowance_after_remap_and_settled_refresh(setup, monkeypatch, skew_seconds):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        s = setup
+        # Control B has already been observed at the correct time.
+        saved_device = s.registry[ENTITY].device_id
+        await s.control.prepare_cooldown(NOW)
+        key_b = control_key(runtime.target_identity(s.hass, ENTITY))
+        record_b = deepcopy(s.store.data["command_rate_limits"][key_b])
+
+        # A dispatch on control A is recorded with the clock ahead.
+        dispatch = move(s, skew_seconds)
+        s.registry[ENTITY].device_id = "gateway-ahead"
+        s.states["sensor.export_price"] = price_state(start=dispatch.replace(minute=0))
+        s.states["sensor.export_price"].last_updated = dispatch
+        s.mode["value"] = "confirm"
+        assert (await s.control.execute(action(s), dispatch))[2]
+        original_audit = deepcopy(s.store.data["execution_audit"])
+
+        # Return to B and settle its feedback while the clock is still ahead.
+        s.registry[ENTITY].device_id = saved_device
+        readback = NOW if skew_seconds == 480 else dispatch
+        s.states[ENTITY] = limit_state(readback=readback.timestamp())
+        await s.control.save({})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=s.hass)
+        owner.store = s.store
+        s.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("remapped"))
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert owner._settled_export_reconciliation is not None
+
+        # Identical verified feedback can be published after correcting the clock.
+        # Repair must run even though B's saved cooldown is valid and unchanged.
+        corrected = move(s, 0)
+        await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        assert worker is not None
+        await worker
+        assert s.store.data["command_rate_limits"][key_b] == record_b
+        assert s.store.data["execution_audit"] == original_audit
+        ledger = budget_history(s.store.data)
+        assert ledger[0]["attempted_at"] == corrected.isoformat()
+        cap = {"max_daily_export_limit_actions": 1}
+        assert action_budget(ledger, cap, corrected + timedelta(hours=23), EXPORT_ASSET)["remaining"] == 0
+        assert action_budget(ledger, cap, corrected + timedelta(hours=24), EXPORT_ASSET)["remaining"] == 1
+        assert len(s.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_export_tariff_reuses_validation_but_rechecks_time_confidence_and_replacement(setup, monkeypatch):
+    s = setup
+    parse = Mock(wraps=export_limit_policy._parse_blocks)
+    monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
+    raw = price_state((-0.1, 0.2, 0.3))
+    raw.attributes["confidence"] = 0.8
+    s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+
+    def current(now, **options):
+        return runtime.current_tariff_blocks(s.hass, "sensor.export_price", options, now)
+
+    blocks, issue = current(NOW)
+    assert issue is None and blocks[0]["watts"] == 0
+    blocks[0]["watts"] = 800  # Consumers cannot modify the cached source.
+    assert current(NOW)[0][0]["watts"] == 0
+    assert current(NOW + timedelta(minutes=20))[0][0]["watts"] is None
+    assert current(NOW + timedelta(minutes=31))[1] == "export_tariff_stale"
+    assert current(NOW, minimum_tariff_confidence=90)[1] == "export_tariff_confidence_low"
+    parse.assert_called_once()
+    raw.attributes["forecasts"][0]["duration"] = 30
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 2
+    raw.attributes["forecasts"].pop()
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 3
+    raw = price_state((0.2, -0.1))
+    s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+    assert current(NOW)[0][0]["watts"] is None
+    assert parse.call_count == 4
+
+
+@pytest.mark.parametrize(("revised_price", "issue"), [(False, "export_tariff_invalid"), (0.0, None)])
+def test_export_tariff_cache_revalidates_a_nested_price_type_change(setup, monkeypatch, revised_price, issue):
+    entity_id = DATA[CONF_AMBER_EXPORT_PRICE]
+    raw = price_state((0, 0.2))
+    row = raw.attributes["forecasts"][0]
+    row["prediction"] = {"per_kwh": row.pop("per_kwh")}
+    state = State(entity_id, raw.state, raw.attributes, last_updated=NOW)
+    setup.states[entity_id] = state
+    parse = Mock(wraps=export_limit_policy._parse_blocks)
+    monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
+
+    def current():
+        return runtime.current_tariff_blocks(setup.hass, entity_id, OPTIONS, NOW)
+
+    original = current()
+    assert original[1] is None and original[0][0]["price"] == 0
+    assert current() == original
+    parse.assert_called_once()
+
+    row["prediction"]["per_kwh"] = revised_price
+    assert setup.states[entity_id] is state
+    blocks, reason = current()
+    assert reason == issue
+    assert blocks == (original[0] if issue is None else [])
+    assert parse.call_count == 2
+
+
+def test_export_remap_prunes_expired_records_and_preserves_owned_or_recent_timing(setup):
+    async def run():
+        s = setup
+        identity = runtime.target_identity(s.hass, ENTITY)
+        owned = {**identity, "device_id": "owned"}
+        old = NOW.timestamp() - 86400
+        record = {"version": 1, "checked_at": old, "attempted_at": old, "confirmed_at": None,
+                  "confirmation_request": None, "interval_seconds": 86400}
+        expired_key = control_key({**identity, "device_id": "old"})
+        owned_key = control_key(owned)
+        recent_key = control_key({**identity, "device_id": "recent"})
+        future_key = control_key({**identity, "device_id": "future"})
+        malformed_key = control_key({**identity, "device_id": "malformed"})
+        s.store.data["command_rate_limits"] = {
+            expired_key: record, owned_key: record,
+            recent_key: {**record, "checked_at": old + 1},
+            future_key: {**record, "attempted_at": NOW.timestamp() + 1},
+            malformed_key: {**record, "interval_seconds": "invalid"},
+            "daikin": NOW.isoformat(),
+        }
+        await s.control.save({"identity": owned, "pending": {"sent_at": old}})
+        await s.control.prepare_cooldown(NOW)
+        limits = s.store.data["command_rate_limits"]
+        assert expired_key not in limits
+        assert set(limits) == {owned_key, recent_key, future_key, malformed_key, "daikin", control_key(identity)}
+
     asyncio.run(run())
 
 

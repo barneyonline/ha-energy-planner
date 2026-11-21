@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import isfinite
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import entity_registry
 
-from .adapter_helpers import zone_temperature_sync_deferred
+from .adapter_helpers import (
+    available_state,
+    climate_target_snapshot,
+    climate_targets_absent,
+    has_finite_temperature_target,
+    zone_temperature_sync_deferred,
+)
+from .climate_inputs import climate_storage_value
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
@@ -29,9 +36,22 @@ from .const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     DEFAULT_OPTIONS,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
 from .ev_policy import power_capability
 from .models import ActionAsset
+from .planner_values import finite_float
+from .zone_control import read_topology, shares_registered_controller
+
+
+def synchronized_zone_targets_required(
+    hass: HomeAssistant, entry_data: dict[str, Any], options: dict[str, Any],
+    desired_state: dict[str, Any] | None = None,
+) -> bool:
+    """Recognize synchronization configured directly or through independent zones."""
+    return options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is True or (
+        desired_state is not None and desired_state.get("configured_zones_only") is True
+    ) or read_topology(hass, entry_data)["supported"] is True
 
 
 @dataclass(slots=True)
@@ -84,17 +104,21 @@ class CapabilityDiscovery:
         hass: HomeAssistant,
         entry_data: dict[str, Any],
         options: dict[str, Any] | None = None,
+        *, hvac_desired_state: dict[str, Any] | None = None,
     ) -> None:
         """Initialize discovery."""
         self.hass = hass
         self.entry_data = entry_data
         self.options = {**DEFAULT_OPTIONS, **(options or {})}
+        self._synchronize_zone_targets = synchronized_zone_targets_required(
+            hass, entry_data, self.options, hvac_desired_state,
+        )
 
-    def inspect(self) -> DiscoveryReport:
+    def inspect(self, *, hvac: CapabilityEvidence | None = None) -> DiscoveryReport:
         """Return current capability evidence."""
         return DiscoveryReport(
             ev=self._inspect_ev(),
-            hvac=self._inspect_hvac(),
+            hvac=hvac if hvac is not None else self._inspect_hvac(),
             enphase=self._inspect_enphase(),
             ai=self._inspect_ai(),
             enphase_export_limit=self._inspect_export_limit(),
@@ -150,6 +174,30 @@ class CapabilityDiscovery:
             }
         return CapabilityEvidence(not issues, issues, details)
 
+    def dry_takeover_issues(self) -> list[str]:
+        """Recheck a Dry takeover block and retain any concurrent HVAC faults."""
+        evidence = self.hvac_evidence_in_dry()
+        return evidence.issues if evidence is not None and HVAC_DRY_ZONE_TARGETS_ABSENT in evidence.issues else []
+
+    def synchronized_takeover_issues(self) -> list[str]:
+        """Revalidate configured inputs before the first synchronized takeover write."""
+        if not self._synchronize_zone_targets:
+            return []
+        evidence = self._inspect_hvac()
+        if HVAC_DRY_ZONE_TARGETS_ABSENT in evidence.issues:
+            return evidence.issues
+        issues = list(evidence.issues)
+        head = available_state(self.hass, self.entry_data.get(CONF_DAIKIN_CLIMATE))
+        # Native Off starts can capture the head target from mode memory.
+        if head is not None and head.state == "off" and "main_climate_target_unavailable" in issues:
+            issues.remove("main_climate_target_unavailable")
+        return issues
+
+    def hvac_evidence_in_dry(self) -> CapabilityEvidence | None:
+        """Inspect HVAC once when the head is in Dry, including genuine faults."""
+        head = available_state(self.hass, self.entry_data.get(CONF_DAIKIN_CLIMATE))
+        return self._inspect_hvac() if head is not None and head.state == "dry" else None
+
     def _inspect_hvac(self) -> CapabilityEvidence:
         issues: list[str] = []
         climate = self.entry_data.get(CONF_DAIKIN_CLIMATE)
@@ -165,25 +213,37 @@ class CapabilityDiscovery:
         unavailable_zones = [entity_id for entity_id in zones if _state_missing(self.hass, entity_id)]
         if unavailable_zones:
             issues.append("climate_zone_unavailable")
-        synchronize_targets = self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is True
+        synchronize_targets = self._synchronize_zone_targets
         main_target_unavailable: list[str] = []
         zone_targets_unavailable: list[str] = []
         zone_targets_deferred: list[str] = []
-        if climate and not _state_missing(self.hass, climate):
-            climate_state = self.hass.states.get(climate)
-            if not _has_finite_temperature_target(climate_state):
-                main_target_unavailable.append(str(climate))
-                issues.append("main_climate_target_unavailable")
+        zone_targets_absent_in_dry_mode: list[str] = []
+        climate_state = self.hass.states.get(climate) if climate and not _state_missing(self.hass, climate) else None
+        if climate_state is not None and not _has_main_temperature_target(climate_state, synchronize_targets):
+            main_target_unavailable.append(str(climate))
+            issues.append("main_climate_target_unavailable")
         if synchronize_targets:
             for entity_id in zones:
                 if not entity_id.startswith("climate.") or _state_missing(self.hass, entity_id):
                     continue
-                if zone_temperature_sync_deferred(self.hass.states.get(entity_id)):
+                zone_state = self.hass.states.get(entity_id)
+                if zone_temperature_sync_deferred(zone_state):
                     zone_targets_deferred.append(entity_id)
-                elif not _has_finite_temperature_target(self.hass.states.get(entity_id)):
+                elif (
+                    climate_state is not None
+                    and zone_state is not None
+                    and climate_state.state == zone_state.state == "dry"
+                    and climate_targets_absent(zone_state)
+                    and type(zone_state.attributes.get("zone_id")) is int
+                    and _same_daikin_controller(self.hass, str(climate), entity_id)
+                ):
+                    zone_targets_absent_in_dry_mode.append(entity_id)
+                elif not has_finite_temperature_target(climate_target_snapshot(zone_state)):
                     zone_targets_unavailable.append(entity_id)
             if zone_targets_unavailable:
                 issues.append("climate_zone_target_unavailable")
+            if zone_targets_absent_in_dry_mode:
+                issues.append(HVAC_DRY_ZONE_TARGETS_ABSENT)
         manual_override = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override and _state_missing(self.hass, manual_override):
             issues.append("climate_manual_override_unavailable")
@@ -208,6 +268,7 @@ class CapabilityDiscovery:
                 "main_target_unavailable": main_target_unavailable,
                 "zone_targets_unavailable": zone_targets_unavailable,
                 "zone_targets_deferred": zone_targets_deferred,
+                "zone_targets_absent_in_dry_mode": zone_targets_absent_in_dry_mode,
                 "manual_override_entity": manual_override,
                 "scheduler_guard_entity": scheduler_guard,
                 "scheduler_guard_timer_entity": scheduler_timer,
@@ -341,23 +402,28 @@ def _state_missing(hass: HomeAssistant, entity_id: str) -> bool:
     return bool(state.state in {"unknown", "unavailable"})
 
 
-def _has_finite_temperature_target(state: Any) -> bool:
-    """Return whether a climate state contains a complete finite rollback target."""
-    attributes = getattr(state, "attributes", {}) or {}
-    temperature = _finite_float(attributes.get("temperature"))
-    if temperature is not None:
-        return True
-    return _finite_float(attributes.get("target_temp_low")) is not None and _finite_float(
-        attributes.get("target_temp_high")
-    ) is not None
+def _same_daikin_controller(hass: HomeAssistant, head_entity_id: str, zone_entity_id: str) -> bool:
+    """Verify native Daikin registry ownership before classifying a Dry zone."""
+    if head_entity_id == zone_entity_id:
+        return False
+    registry = entity_registry.async_get(hass)
+    head = registry.async_get(head_entity_id)
+    return (
+        head is not None
+        and head.platform == "daikin"
+        and shares_registered_controller(head, registry.async_get(zone_entity_id))
+    )
 
 
-def _finite_float(value: Any) -> float | None:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if isfinite(parsed) else None
+def _has_main_temperature_target(state: State, synchronize_targets: bool) -> bool:
+    """Validate the synchronized rollback shape or the legacy head target."""
+    if synchronize_targets:
+        return has_finite_temperature_target(climate_target_snapshot(state))
+    attributes = state.attributes
+    return finite_float(climate_storage_value(attributes.get("temperature"))) is not None or (
+        finite_float(climate_storage_value(attributes.get("target_temp_low"))) is not None
+        and finite_float(climate_storage_value(attributes.get("target_temp_high"))) is not None
+    )
 
 
 def _split_entity_values(value: Any) -> list[str]:

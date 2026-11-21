@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Context, HomeAssistant, State
 from homeassistant.exceptions import ServiceValidationError
 
+from .climate_inputs import climate_storage_value, finite
 from .const import CONF_ENPHASE_PROFILE_CONTROL_SERVICE, STATE_UNKNOWN_VALUES
 
 DEVICE_SERVICE_TIMEOUT_SECONDS = 30.0
@@ -16,6 +19,17 @@ DEVICE_SERVICE_TIMEOUT_SECONDS = 30.0
 
 class DeviceTargetUnavailable(ServiceValidationError):
     """A target was rejected locally before any service was dispatched."""
+
+
+@contextmanager
+def preserve_cancellation(interruption: BaseException | None) -> Iterator[None]:
+    """Keep cancellation in force if a mandatory recovery operation fails."""
+    try:
+        yield
+    except Exception as recovery_error:
+        if isinstance(interruption, asyncio.CancelledError):
+            raise interruption from recovery_error
+        raise
 
 
 async def async_call_device_service(
@@ -26,6 +40,7 @@ async def async_call_device_service(
     *,
     blocking: bool = True,
     context: Context | None = None,
+    on_dispatch: Callable[[], None] | None = None,
 ) -> None:
     """Bound dispatch; timeout is an uncertain command, not proof of rejection.
 
@@ -41,6 +56,8 @@ async def async_call_device_service(
     if any(not service_entity_available(hass, entity_id) for entity_id in entity_ids):
         raise DeviceTargetUnavailable("entity_target_unavailable")
     async with asyncio.timeout(DEVICE_SERVICE_TIMEOUT_SECONDS):
+        if on_dispatch is not None:
+            on_dispatch()
         if context is None:
             await hass.services.async_call(domain, service, service_data, blocking=blocking)
         else:
@@ -80,8 +97,32 @@ def profile_control_service(entry_data: dict[str, Any], profile_entity: str | No
 
 def zone_temperature_sync_deferred(state: State | None) -> bool:
     """Leave an off zone with no exposed target untouched for this takeover."""
-    return (
-        state is not None
-        and state.state == "off"
-        and all(state.attributes.get(key) is None for key in ("temperature", "target_temp_low", "target_temp_high"))
-    )
+    return state is not None and state.state == "off" and climate_targets_absent(state)
+
+
+def climate_targets_absent(state: State) -> bool:
+    """Distinguish unexposed targets from malformed target values."""
+    return all(state.attributes.get(key) is None for key in ("temperature", "target_temp_low", "target_temp_high"))
+
+
+def climate_target_snapshot(state: State | None) -> dict[str, Any]:
+    """Capture the target fields used to restore a thermostat."""
+    attributes = getattr(state, "attributes", {}) or {}
+    target_low = attributes.get("target_temp_low")
+    target_high = attributes.get("target_temp_high")
+    if target_low is not None and target_high is not None:
+        return {
+            "target_temp_low": climate_storage_value(target_low),
+            "target_temp_high": climate_storage_value(target_high),
+        }
+    temperature = attributes.get("temperature")
+    return {"target_temperature": climate_storage_value(temperature)} if temperature is not None else {}
+
+
+def has_finite_temperature_target(snapshot: dict[str, Any]) -> bool:
+    """Require a finite scalar or a complete, ordered range for restoration."""
+    if snapshot.get("target_temperature") is not None:
+        return finite(snapshot["target_temperature"]) is not None
+    low = finite(snapshot.get("target_temp_low"))
+    high = finite(snapshot.get("target_temp_high"))
+    return low is not None and high is not None and low <= high

@@ -11,7 +11,12 @@ import pytest
 
 from custom_components.ha_energy_planner import storage
 from custom_components.ha_energy_planner.climate_runtime import economic_actions
-from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
+from custom_components.ha_energy_planner.const import (
+    DEFAULT_OPTIONS,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+)
+from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -490,6 +495,254 @@ def test_final_rollback_gate_does_not_claim_legacy_schedule_selected():
     assert status["reason"] == "rollback_target_unavailable"
     assert "restoration target" in status["summary"].lower()
     assert status["next_start"] is None
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["active", "review"])
+def test_dry_mode_explains_hvac_block_and_yields_to_actual_target_faults(dry_run: bool) -> None:
+    baseline_context = context()
+    baseline_context.current_hvac_mode = "dry"
+    options = {**OPTIONS, "dry_run": dry_run, "minimum_climate_confidence": 0, "grid_import_limit_kw": 1.5}
+    baseline = DryRunPlanner(options).create_plan(baseline_context)
+    assert any(a.desired_state.get("phase") == "preconditioning" for a in baseline.actions)
+    assert "grid_import_limit_exceeded" in ConstraintValidator(options).validate_plan(baseline_context, baseline)
+
+    ctx = context()
+    ctx.current_hvac_mode = "dry"
+    ctx.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    generated = DryRunPlanner(options).create_plan(ctx)
+    assert not any(a.asset == ActionAsset.DAIKIN for a in generated.actions)
+    assert all(slot.projected_hvac_load_kw == 0 for slot in ctx.slots)
+    assert ConstraintValidator(options).validate_plan(ctx, generated) == []
+    status = generated.device_plans["climate"]["preconditioning"]
+    assert status["status"] == "blocked"
+    assert status["reason"] == HVAC_DRY_ZONE_TARGETS_ABSENT
+    assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+    assert next(row for row in generated.rejected_actions if row["device"] == "Climate")["reason"] == status["summary"]
+    assert status["next_start"] is None
+    assert "after Dry mode ends" in status["next_step"]
+
+    fault_context = context()
+    fault_context.current_hvac_mode = "dry"
+    fault_context.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT, "climate_zone_target_unavailable"]
+    fault_plan = DryRunPlanner(options).create_plan(fault_context)
+    blocked = fault_plan.device_plans["climate"]["preconditioning"]
+    assert blocked["reason"] == "rollback_target_unavailable"
+    rejection = next(row for row in fault_plan.rejected_actions if row["device"] == "Climate")
+    assert rejection["reason"] == blocked["summary"]
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_dry_mode_preserves_existing_load_and_releases_only_owned_hvac(owned: bool) -> None:
+    ctx = context()
+    ctx.current_hvac_mode = "dry"
+    ctx.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    ctx.climate_inputs = {"zones": {}}
+    ctx.climate_engine["scheduled"] = {"mode": "heat"}
+    ctx.hvac_control = {"released_until": NOW, "required_evidence_lost": HVAC_DRY_ZONE_TARGETS_ABSENT}
+    if owned:
+        ctx.hvac_control["phase"] = "preconditioning"
+    for slot in ctx.slots:
+        slot.projected_hvac_load_kw = 0.4
+
+    plan = DryRunPlanner(OPTIONS).create_plan(ctx)
+
+    climate_actions = [a for a in plan.actions if a.asset == ActionAsset.DAIKIN]
+    assert [a.kind for a in climate_actions] == ([ActionKind.RELEASE_HVAC] if owned else [])
+    assert all(a.execute_not_before == NOW for a in climate_actions)
+    assert all(slot.projected_hvac_load_kw == 0.4 for slot in ctx.slots)
+    assert "scheduled" not in ctx.climate_engine
+
+
+@pytest.mark.parametrize(
+    ("mode", "input_health"),
+    [
+        (PlannerMode.DISABLED, InputHealth.HEALTHY),
+        (PlannerMode.ACTIVE_DEGRADED, InputHealth.UNSAFE),
+        (PlannerMode.DRY_RUN, InputHealth.UNSAFE),
+    ],
+)
+def test_when_dry_mode_and_planner_disabled_or_unsafe_explain_global_block(
+    mode: PlannerMode, input_health: InputHealth,
+) -> None:
+    ctx = context()
+    ctx.input_health = input_health
+    ctx.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    status = planning_status(ctx, [], mode, "", OPTIONS)
+    assert status["reason"] == "planner_not_active"
+    assert "after Dry mode ends" not in status["next_step"]
+
+
+@pytest.mark.parametrize(
+    ("remaining_block", "expected"),
+    [
+        (None, HVAC_DRY_ZONE_TARGETS_ABSENT),
+        ("main_climate_target_unavailable", "rollback_target_unavailable"),
+        ("planner_not_active", "planner_not_active"),
+        ("restore", "pending_restore"),
+        ("owned_preconditioning", HVAC_DRY_ZONE_TARGETS_ABSENT),
+        ("owned_preconditioning_fault", "rollback_target_unavailable"),
+        ("manual_override", HVAC_DRY_ZONE_TARGETS_ABSENT),
+    ],
+)
+def test_current_status_explains_dry_rejection_from_queued_action(remaining_block: str | None, expected: str) -> None:
+    scheduled = plan()
+    history = record_plan({}, to_jsonable(scheduled))
+    assert history.get("pending")
+    refusal = (
+        outcome(reason="manual_hvac_override_detected", capability_issues=[HVAC_DRY_ZONE_TARGETS_ABSENT])
+        if remaining_block == "manual_override" else outcome(reason=HVAC_DRY_ZONE_TARGETS_ABSENT)
+    )
+    history = record_outcome(history, to_jsonable(refusal))
+    store = {"preconditioning_history": history}
+    if remaining_block == "main_climate_target_unavailable":
+        scheduled.input_issues.append(remaining_block)
+    elif remaining_block == "planner_not_active":
+        scheduled.device_plans["climate"]["preconditioning"].update(
+            status="blocked", reason=remaining_block, summary="Planner disabled",
+        )
+    elif remaining_block == "restore":
+        store["ownership"] = {"hvac_control": {"required_evidence_lost": "hvac_release_failed"}}
+    elif remaining_block in {"owned_preconditioning", "owned_preconditioning_fault"}:
+        store["ownership"] = {"hvac_control": {
+            "phase": "preconditioning", "main_state": {"hvac_mode": "cool"}, "main_state_committed": True,
+        }}
+        if remaining_block == "owned_preconditioning_fault":
+            scheduled.input_issues.append("climate_zone_target_unavailable")
+
+    status = current_status(store, scheduled)
+    assert status["last_attempt"]["reason"] == refusal.reason
+    assert status["reason"] == expected
+    if expected == HVAC_DRY_ZONE_TARGETS_ABSENT:
+        assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+        assert "after Dry mode ends" in status["next_step"]
+
+
+def test_planned_dry_block_takes_precedence_over_a_stored_running_phase() -> None:
+    ctx = context()
+    ctx.input_issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    scheduled = plan()
+    scheduled.input_issues = ctx.input_issues
+    scheduled.device_plans["climate"]["preconditioning"] = planning_status(
+        ctx, [], PlannerMode.ACTIVE_HEALTHY, "", OPTIONS,
+    )
+    store = {"ownership": {"hvac_control": {"phase": "pre_peak_coast", "main_state_committed": True}}}
+
+    status = current_status(store, scheduled)
+    assert status["status"] == "blocked"
+    assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+
+
+@pytest.mark.parametrize(
+    ("live_issues", "expected"),
+    [
+        (f"climate_zone_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}", HVAC_DRY_ZONE_TARGETS_ABSENT),
+        (f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}", "rollback_target_unavailable"),
+        (None, None),
+    ],
+)
+def test_queued_rejection_reports_live_capability_issues(live_issues: str | None, expected: str | None) -> None:
+    scheduled = plan()
+    history = record_plan({}, to_jsonable(scheduled))
+    history = record_outcome(history, to_jsonable(outcome(reason=live_issues)))
+
+    status = current_status({"preconditioning_history": history}, scheduled)
+    assert status["reason"] == expected
+    assert status["last_attempt"]["reason"] == live_issues
+    if expected == HVAC_DRY_ZONE_TARGETS_ABSENT:
+        assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+    elif expected == "rollback_target_unavailable":
+        assert "restoration target" in status["summary"]
+    else:
+        assert status["summary"] == "The scheduled preconditioning command did not run."
+
+
+@pytest.mark.parametrize(("phase", "target_fault"), [("pre_peak_coast", False), ("peak_coast", True)])
+@pytest.mark.parametrize("retried", [False, True])
+def test_queued_coast_dry_refusal_reaches_current_status(phase: str, target_fault: bool, retried: bool) -> None:
+    scheduled = plan()
+    history = record_plan({}, to_jsonable(scheduled)) if phase == "pre_peak_coast" else {}
+    issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    if target_fault:
+        issues.append("climate_zone_target_unavailable")
+    refusal = to_jsonable(outcome(
+        reason=",".join(issues), capability_issues=issues, desired_state={"phase": phase},
+    ))
+    assert record_outcome(history, refusal) == history
+    audit: list[dict[str, object] | None] = [refusal]
+    if retried:
+        audit.append({**refusal, "result": "applied", "reason": "hvac_action_applied", "capability_issues": []})
+    audit.append({**refusal, "plan_id": "unrelated-plan"})
+    audit.append({**refusal, "asset": "ev"})
+    audit.append({**refusal, "kind": "release_hvac"})
+    audit.append(None)
+    store = {
+        "ownership": {"hvac_control": {"phase": "preconditioning"}},
+        "preconditioning_history": history,
+        "execution_audit": audit,
+    }
+
+    status = current_status(store, scheduled)
+
+    if retried:
+        assert status["status"] == "running"
+        return
+    assert status["status"] == "blocked"
+    assert status["last_attempt"]["capability_issues"] == issues
+    if target_fault:
+        assert status["reason"] == "rollback_target_unavailable"
+    else:
+        assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("restoration_pending", [False, True])
+def test_dry_failure_preserves_capability_audit_and_shows_current_blocker(monkeypatch, mixed, restoration_pending):
+    class Disk:
+        saved = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_load(self):
+            return deepcopy(self.saved)
+
+        async def async_save(self, data):
+            Disk.saved = deepcopy(data)
+
+    monkeypatch.setattr(storage, "Store", Disk)
+    issues = [HVAC_DRY_ZONE_TARGETS_ABSENT, "daikin_climate_unavailable"]
+    if mixed:
+        issues.insert(0, "climate_zone_target_unavailable")
+    failure = "hvac_acquisition_rollback_failed" if restoration_pending else "hvac_automation_service_failed"
+
+    async def scenario():
+        scheduled = plan()
+        first = storage.PlannerStore(object())
+        await first.async_save_plan(scheduled)
+        if restoration_pending:
+            await first.async_save_ownership({"hvac_control": {"required_evidence_lost": failure}})
+        await first.async_add_outcome(outcome(
+            OutcomeResult.FAILED, reason=failure, command_sent=True,
+            capability_issues=[*issues, HVAC_DRY_ZONE_TARGETS_ABSENT, "unexpected_payload"],
+        ))
+
+        reloaded = storage.PlannerStore(object())
+        await reloaded.async_load()
+        for audit in (reloaded.data["execution_audit"][-1], reloaded.data["climate_audit"][-1]["outcome"]):
+            assert audit["reason"] == failure
+            assert audit["capability_issues"] == issues
+            assert audit["command_sent"] is True
+        status = current_status(reloaded.data, scheduled)
+        assert status["last_attempt"]["reason"] == failure
+        assert status["last_attempt"]["capability_issues"] == issues
+        if restoration_pending:
+            assert (status["status"], status["reason"]) == ("restoring", "pending_restore")
+        elif mixed:
+            assert status["reason"] == "rollback_target_unavailable"
+        else:
+            assert status["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
+
+    asyncio.run(scenario())
 
 
 def test_store_restart_between_ownership_and_outcome_writes_recovers_confirmation(monkeypatch):

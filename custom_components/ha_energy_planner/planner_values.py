@@ -10,7 +10,7 @@ def finite_float(value: Any) -> float | None:
     """Return a finite lifecycle scalar."""
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if isfinite(number) else None
 

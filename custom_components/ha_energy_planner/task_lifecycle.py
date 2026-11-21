@@ -31,6 +31,7 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     # A refresh task may already be queued even after its timer/listener is
     # cancelled. Suppress its eventual commit until setup is resumed.
     self._tearing_down = True
+    self._production_arm_request = None
     if "history_training" in self.__dict__:
         self.history_training.stop()
     cancel_deferred_notifications_for_entry(
@@ -47,10 +48,23 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if self._boundary_cancel is not None:
         self._boundary_cancel()
         self._boundary_cancel = None
+    tariff_cancel = getattr(self, "_tariff_retry_cancel", None)
+    if tariff_cancel is not None:
+        tariff_cancel()
+        self._tariff_retry_cancel = None
+    self._tariff_retry_at = None
+    self._tariff_retry_window_end = None
+    self._tariff_retry_last_requested_at = None
     export_cancel = getattr(self, "_export_boundary_cancel", None)
     if export_cancel is not None:
         export_cancel()
         self._export_boundary_cancel = None
+    self._export_boundary_followup_due = False
+    export_retry_cancel = getattr(self, "_export_retry_cancel", None)
+    if export_retry_cancel is not None:
+        export_retry_cancel()
+        self._export_retry_cancel = None
+        self._export_retry_at = None
     ai_task = getattr(self, "_ai_advice_task", None)
     if ai_task is not None and not ai_task.done():
         ai_task.cancel()
@@ -83,6 +97,9 @@ async def async_wait_for_plan_execution(self: EnergyPlannerCoordinator) -> None:
     execution_task = getattr(self, "_plan_execution_task", None)
     if execution_task is not None:
         tasks.add(execution_task)
+    reconciliation_task = getattr(self, "_export_reconcile_task", None)
+    if reconciliation_task is not None:
+        tasks.add(reconciliation_task)
     if not tasks:
         return
     results = await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)

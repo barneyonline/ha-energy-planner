@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
-from .enphase_export_limit import target_identity
+from .enphase_export_limit import (
+    COMPANION_UPGRADE_REQUIRED,
+    GATEWAY_CHANGED,
+    GATEWAY_UNVERIFIED,
+    live_owned_gateway_issue,
+    retry_status,
+    target_identity,
+)
 from .export_limit_cooldown import cooldown_status
 from .models import ActionAsset, ActionKind, InputHealth, PlanAction, to_jsonable
 from .preflight import _current_plan_report
@@ -44,24 +51,31 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     plan = coordinator.data
     status = dict(plan.device_plans.get("enphase_export_limit", {})) if plan is not None else {}
     ownership = coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {})
+    runtime_reason: str | None = None
     if isinstance(ownership, dict) and ownership:
         status["ownership"] = dict(ownership)
-        reason = ownership.get("pause") or (
+        runtime_reason = ownership.get("pause") or (
             "export_limit_pending" if ownership.get("pending") else
             "export_limit_restoration_pending" if ownership.get("restoring") else None
         )
-        if reason:
-            status.update(ready=False, reason=reason)
+        if runtime_reason:
+            status.update(ready=False, reason=runtime_reason)
     if getattr(coordinator, "options", {}).get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
         pause = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow(),
                                      asset="enphase_export_limit")
         if pause:
+            runtime_reason = pause
             status.update(ready=False, reason=pause)
     hass = getattr(coordinator, "hass", None)
     entity = getattr(coordinator, "entry_data", {}).get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
     identity = target_identity(hass, entity) if hass is not None and entity else None
     if identity is None and isinstance(ownership, dict):
         identity = ownership.get("identity")
+    if hass is not None and isinstance(ownership, dict) and (
+        gateway_issue := live_owned_gateway_issue(hass, entity, ownership, dt_util.utcnow())
+    ):
+        runtime_reason = gateway_issue
+        status.update(ready=False, reason=gateway_issue, summary=plain_reason(gateway_issue))
     timing = cooldown_status(coordinator.store.data, identity,
                              getattr(coordinator, "options", {}), dt_util.utcnow())
     status.update(timing)
@@ -70,8 +84,28 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
             if status.get("reason") in {None, "export_limit_restoration_pending"} else status["reason"]))
         status["summary"] = ("Export setting changes are deferred until "
                              f"{timing['next_eligible_change_at']}; latest tariff and feedback will be rechecked.")
+    if getattr(coordinator, "_export_reconcile_pending", False):
+        status.update(ready=False, reconciliation_pending=True)
+        if runtime_reason and status.get("reason") == runtime_reason:
+            # Queueing does not replace a durable pause or outstanding readback.
+            status["summary"] = plain_reason(runtime_reason)
+        elif not timing.get("deferred"):
+            status.update(reason="export_reconciliation_pending",
+                          summary="Waiting for serialized control reconciliation; planning continues.")
     if status.get("reason") in {"export_limit_pending", "export_limit_restoration_pending"}:
         status["summary"] = "Waiting for gateway confirmation; the planned setting is not yet confirmed."
+    retry = (
+        retry_status(ownership, running=getattr(coordinator, "_export_retry_running", False))
+        if isinstance(ownership, dict) else {}
+    )
+    if retry:
+        scheduled = getattr(coordinator, "_export_retry_at", None) if retry["state"] == "scheduled" else None
+        retry["next_attempt_at"] = scheduled.isoformat() if scheduled is not None else None
+        if retry["state"] == "scheduled" and scheduled is None:
+            retry["state"] = "suspended"
+        if retry.get("operator_action"):
+            status["summary"] = retry["operator_action"]
+        status["retry"] = retry
     return status
 
 
@@ -597,6 +631,9 @@ def plain_reason(value: Any) -> str:
     """Return a plain-English explanation for an internal reason or issue code."""
     text = str(value or "").strip()
     labels = {
+        COMPANION_UPGRADE_REQUIRED: "Upgrade Enphase Energy to enable verified Export Limit recovery.",
+        GATEWAY_CHANGED: "Export Limit ownership belongs to a different gateway.",
+        GATEWAY_UNVERIFIED: "Waiting for Export Limit readback verified against the active gateway.",
         "ev_load_fallback_continue": "Consumption unavailable; continuing with conservative forecast limits.",
         "ev_load_fallback_waiting": "Consumption unavailable; waiting for stable readings before starting.",
         "ev_load_fallback_capacity_pause": "Charging paused: conservative household capacity is insufficient.",

@@ -58,6 +58,47 @@ class FakeStore:
         FakeStore.save_count += 1
 
 
+@pytest.mark.parametrize("repair_on_load", [False, True])
+def test_export_attempt_clock_repair_is_persisted_once(monkeypatch, repair_on_load):
+    from custom_components.ha_energy_planner.action_limits import action_budget
+
+    now = datetime.now(UTC)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(storage_module, "datetime", Clock)
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    future = (now + timedelta(days=30)).isoformat()
+    attempt = dict(asset="enphase_export_limit", kind="set_export_limit", result="pending",
+                   attempted_at=future, reason="export_limit_pending")
+
+    async def run():
+        store = PlannerStore(object(), "export-clock")
+        if repair_on_load:
+            monkeypatch.setattr(FakeStore, "loaded", {"action_attempts": [attempt], "execution_audit": [attempt]})
+            await store.async_load()
+        else:
+            store.data.update(action_attempts=[attempt], execution_audit=[attempt])
+            await store.async_reanchor_export_attempts(now)
+        assert FakeStore.saved["action_attempts"][0]["attempted_at"] == now.isoformat()
+        assert FakeStore.saved["execution_audit"][0]["attempted_at"] == future
+        monkeypatch.setattr(FakeStore, "loaded", deepcopy(FakeStore.saved))
+        restarted = PlannerStore(object(), "export-clock")
+        await restarted.async_load()
+        await restarted.async_reanchor_export_attempts(now + timedelta(hours=1))
+        ledger = restarted.data["action_attempts"]
+        assert ledger[0]["attempted_at"] == now.isoformat()
+        cap = {"max_daily_export_limit_actions": 1}
+        assert action_budget(ledger, cap, now + timedelta(hours=23), "enphase_export_limit")["remaining"] == 0
+        assert action_budget(ledger, cap, now + timedelta(hours=24), "enphase_export_limit")["remaining"] == 1
+
+    asyncio.run(run())
+
+
 def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.created_keys = []
@@ -306,6 +347,37 @@ def test_store_delay_save_batches_multiple_mutations(monkeypatch: object) -> Non
     assert FakeStore.saved["ownership"] == {"enphase_profile": "AI Optimisation"}
     assert FakeStore.saved["ev_charge_calibration"] == {"status": "ready"}
     assert FakeStore.saved["discovery"] == {"ok": True}
+
+
+def test_unchanged_batched_input_does_not_wait_for_inflight_store_write(monkeypatch: object) -> None:
+    async def run() -> None:
+        started, release, inputs_ready = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class SlowStore(FakeStore):
+            async def async_save(self, data: dict[str, Any]) -> None:
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(storage_module, "Store", SlowStore)
+        store = PlannerStore(object())
+
+        async def refresh():
+            async with store.async_delay_save():
+                await store.async_save_discovery({})
+                inputs_ready.set()
+
+        write = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
+        await started.wait()
+        planning = asyncio.create_task(refresh())
+        try:
+            await asyncio.sleep(0)
+            assert inputs_ready.is_set()
+            assert not planning.done()  # The final flush still waits for durability.
+        finally:
+            release.set()
+            await asyncio.gather(write, planning)
+
+    asyncio.run(run())
 
 
 def test_store_forced_flush_persists_inside_delay_context(monkeypatch: object) -> None:
@@ -1124,6 +1196,36 @@ def test_calendar_history_persists_with_plan_and_survives_reload(monkeypatch):
         assert restored.data["calendar_history"] == update_calendar_history({}, [event], now)
 
     asyncio.run(run())
+
+
+def test_loading_unsorted_legacy_history_persists_newest_confirmations(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import CALENDAR_HISTORY_HARD_CAP
+
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    monkeypatch.setattr(FakeStore, "saved", None)
+    now = datetime.now(UTC)
+    records = []
+    for index in range(CALENDAR_HISTORY_HARD_CAP + 1):
+        start = (now - timedelta(minutes=index + 2)).isoformat()
+        records.append({"uid": f"confirmation-{index}", "summary": "Confirmed action",
+                        "start": start, "end": (now - timedelta(minutes=index + 1)).isoformat(),
+                        "confirmed_start": start})
+    # Legacy confirmation handlers appended delayed outcomes after newer entries.
+    legacy = {"calendar_history": {"history": [*reversed(records[:-1]), records[-1]], "pending": []}}
+    monkeypatch.setattr(FakeStore, "loaded", deepcopy(legacy))
+    store = PlannerStore(object(), "unsorted-history")
+
+    asyncio.run(store.async_load())
+
+    expected = list(reversed(records[:-1]))
+    assert store.data["calendar_history"]["history"] == expected
+    assert FakeStore.saved["calendar_history"]["history"] == expected
+    monkeypatch.setattr(FakeStore, "loaded", deepcopy(FakeStore.saved))
+    restored = PlannerStore(object(), "unsorted-history")
+    asyncio.run(restored.async_load())
+    assert restored.data["calendar_history"]["history"] == expected
+    assert legacy["calendar_history"]["history"][-1] == records[-1]
 
 
 def test_store_records_discrete_confirmation_and_filters_unconfirmed_history(monkeypatch):

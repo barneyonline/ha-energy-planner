@@ -3,23 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 from zoneinfo import ZoneInfo
 
 import pytest
+from aiohttp import ClientResponseError, ServerDisconnectedError
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import State
 from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
-from custom_components.ha_energy_planner.action_limits import action_budget
+from custom_components.ha_energy_planner.action_limits import action_budget, budget_history, reanchor_export_attempts
 from custom_components.ha_energy_planner.calendar_history import confirm_calendar_action
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
+    CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DRY_RUN,
     CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     CONF_PLANNER_ENABLED,
     DEFAULT_OPTIONS,
 )
@@ -44,6 +53,7 @@ from custom_components.ha_energy_planner.models import (
 from custom_components.ha_energy_planner.planner import DryRunPlanner
 
 NOW = datetime(2026, 10, 1, 0, 10, tzinfo=UTC)
+GATEWAY = "a" * 64
 ENTITY = "sensor.enphase_export_limit"
 DATA = {CONF_ENPHASE_EXPORT_LIMIT_ENTITY: ENTITY, CONF_AMBER_EXPORT_PRICE: "sensor.export_price"}
 OPTIONS = {**DEFAULT_OPTIONS, CONF_PLANNER_ENABLED: True, CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True}
@@ -92,6 +102,8 @@ def limit_state(watts=None, *, pending=False, slew=100.0, readback=None):
             "pending_requested_at": NOW.isoformat() if pending else None,
             "request_status": "pending" if pending else "confirmed",
             "last_successful_readback": readback if readback is not None else NOW.timestamp(),
+            "gateway_identity": GATEWAY,
+            "gateway_identity_verified": True,
         },
     )
 
@@ -108,10 +120,20 @@ class Store:
     async def async_save_ownership(self, value):
         self.data["ownership"] = deepcopy(value)
 
+    async def async_save_control_pause(self, value):
+        self.data["control_pause"] = deepcopy(value)
+
+    async def async_save_production(self, value):
+        self.data["production"] = to_jsonable(value)
+
     async def async_flush(self):
         self.flushes += 1
         if self.fail:
             raise OSError("disk failed")
+
+    @asynccontextmanager
+    async def async_delay_save(self):
+        yield
 
     async def async_add_outcome(self, value):
         self.data["execution_audit"].append(to_jsonable(value))
@@ -121,6 +143,9 @@ class Store:
 
     async def async_save_command_rate_limits(self, value):
         self.data["command_rate_limits"] = value
+
+    async def async_reanchor_export_attempts(self, now):
+        self.data["action_attempts"] = reanchor_export_attempts(budget_history(self.data), now)
 
 
 @pytest.fixture
@@ -148,6 +173,9 @@ def setup(monkeypatch):
 
     async def call(domain, service, data, **kwargs):
         assert store.flushes > 0
+        if domain == "enphase_ev" and "expected_gateway" in data:
+            assert data["expected_gateway"] == states[ENTITY].attributes["gateway_identity"]
+            data = {key: value for key, value in data.items() if key != "expected_gateway"}
         calls.append((domain, service, data))
         if domain != "enphase_ev":
             return
@@ -207,11 +235,11 @@ def advance_clock(setup, seconds=300):
     return setup.clock["now"]
 
 
-def context(evidence):
+def context(evidence, now=NOW):
     return DecisionContext(
-        NOW,
+        now,
         "export-plan",
-        [DecisionSlot(NOW, 0.2, -0.1, 5.0, 1.0)],
+        [DecisionSlot(now, 0.2, -0.1, 5.0, 1.0)],
         None,
         None,
         OccupancyState.UNKNOWN,
@@ -350,6 +378,7 @@ def test_amber_export_execution_confirms_sign_changes_without_repeating_commands
         (lambda s: s.attributes.update(forecasts=[-1]), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(start_time="2026-10-01T00:00:00"), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(per_kwh=float("nan")), "export_tariff_invalid"),
+        (lambda s: s.attributes["forecasts"][0].update(per_kwh=10**1000), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(end_time="bad"), "export_tariff_invalid"),
         (
             lambda s: s.attributes["forecasts"][0].update(end_time="2026-10-01T00:20:00+00:00"),
@@ -389,6 +418,28 @@ def test_explicit_cadence_gaps_and_dst():
     assert tariff_blocks(s, local, OPTIONS)[1] is None
 
 
+@pytest.mark.parametrize("path", sorted(
+    path for path in (Path(__file__).parent / "fixtures" / "live_schema").glob("export_tariff_*.json")
+    if path.name.startswith(("export_tariff_cadence_", "export_tariff_conflicting_"))
+    or "_out_of_range" in path.name
+), ids=lambda path: path.stem)
+def test_export_tariff_rejects_invalid_live_schema(path):
+    fixture = json.loads(path.read_text())
+    now = datetime.fromisoformat(fixture["now"])
+    state = SimpleNamespace(**fixture["state"])
+    state.last_updated = datetime.fromisoformat(state.last_updated)
+    assert tariff_blocks(state, now, OPTIONS) == (fixture["expected"], fixture["expected_issue"])
+
+
+@pytest.mark.parametrize("ignored", ["invalid", "sNaN", None, 0, "-1e999999999999999999999"])
+def test_export_continues_to_accept_agreeing_cadence_aliases(ignored):
+    state = price_state((-0.1,), explicit=False)
+    state.attributes.update(forecast_interval_minutes="30", forecastIntervalMinutes=30.0, interval_minutes=ignored)
+    blocks, issue = tariff_blocks(state, NOW, OPTIONS)
+    assert issue is None
+    assert blocks[0]["watts"] == 0
+
+
 def test_preview_transitions_and_price_only_planning(setup):
     ev = runtime.evidence(setup.hass, DATA, OPTIONS, NOW)
     ctx = context(ev)
@@ -414,7 +465,8 @@ def test_preview_transitions_and_price_only_planning(setup):
 @pytest.mark.parametrize(
     "change,reason",
     [
-        ({"last_successful_readback": None}, "export_limit_readback_invalid"),
+        ({"last_successful_readback": None}, "export_limit_entity_unavailable"),
+        ({"last_successful_readback": "invalid"}, "export_limit_readback_invalid"),
         ({"last_successful_readback": NOW.timestamp() - 601}, "export_limit_readback_stale"),
         ({"slew_rate": 0}, "export_limit_unsupported"),
         ({"pending": "false"}, "export_limit_unsupported"),
@@ -803,7 +855,8 @@ def test_readback_timeout_without_fresh_feedback_and_restore_retry(setup):
 def test_restore_already_baseline_and_unsupported_owned_state(setup):
     async def run():
         observed, _ = runtime.feedback(setup.hass, ENTITY, NOW)
-        await setup.control.save({"identity": observed["identity"], "baseline": {"watts": None, "slew_rate": 100}})
+        await setup.control.save({"identity": observed["identity"], "gateway_identity": GATEWAY,
+                                  "baseline": {"watts": None, "slew_rate": 100}})
         assert (await setup.control.restore(NOW))[0] == OutcomeResult.RESTORED
         await setup.control.save({"identity": observed["identity"], "expected": {"watts": None, "slew_rate": 100}})
         setup.states[ENTITY].state = "unsupported"
@@ -879,6 +932,312 @@ def test_export_only_preflight_discovery_and_dry_run_evidence(setup, request, ma
         assert report["control_areas"]["confidence_eligible"] == [EXPORT_ASSET]
         setup.hass.services.has_service = lambda *args: False
         assert not CapabilityDiscovery(setup.hass, mapping, OPTIONS).inspect().for_asset(EXPORT_ASSET).supported
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", [
+    "settled", "in_flight", "changed_feedback", "retry_past_grace",
+    "retry_past_grace_repeat", "retry_past_grace_tariff_change", "retry_past_grace_external",
+])
+def test_export_only_startup_validation_and_activation_wait_for_reconciliation(setup, monkeypatch, scenario, request):
+
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner import startup_recovery
+
+    async def run():
+        opts = {**OPTIONS, CONF_DRY_RUN: False, "ai_enabled": False}
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {"armed": False}
+        owner._startup_auto_recovery_authorized = True
+        owner._startup_auto_recovery_validation_active = False
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        checks = []
+        first_flush = asyncio.Event()
+        release_first_flush = asyncio.Event()
+
+        async def flush():
+            # Force the reconciliation task to yield before the plan can use it.
+            validating, active = owner._startup_auto_recovery_validation_active, owner.active_control
+            if validating or active:
+                assert not owner._planner_lock.locked()
+            checks.append((validating, active))
+            if scenario == "in_flight" and len(checks) == 1:
+                first_flush.set()
+                await release_first_flush.wait()
+            elif scenario == "changed_feedback":
+                setup.states[ENTITY] = limit_state(0)
+            await asyncio.sleep(0)
+
+        owner.store.async_flush = flush
+
+        async def refresh():
+            owner.data = await owner._async_update_data()
+
+        owner.async_refresh = refresh
+        monkeypatch.setattr(module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(
+                runtime.evidence(setup.hass, DATA, opts, setup.clock["now"]), setup.clock["now"],
+            ),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        if scenario.startswith("retry_past_grace"):
+            fixture = request.getfixturevalue("retry_owner")
+            opts[CONF_COMMAND_RATE_LIMIT_SECONDS] = 3600
+            owner.entry.options[CONF_COMMAND_RATE_LIMIT_SECONDS] = 3600
+            writer = fixture.create(opts)
+            setup.states[ENTITY] = limit_state(0)
+            await setup.control.save({
+                "identity": runtime.target_identity(setup.hass, ENTITY),
+                "gateway_identity": GATEWAY,
+                "gateway_identity_verified": True,
+                "baseline": {"watts": None, "slew_rate": 100.0},
+                "expected": {"watts": 0, "slew_rate": 100.0},
+            })
+            await setup.control.prepare_cooldown(NOW - timedelta(hours=1))
+
+            def positive_tariff(now):
+                tariff = price_state((0.1, 0.1), start=now.replace(minute=0))
+                tariff.last_updated = now
+                setup.states["sensor.export_price"] = tariff
+
+            positive_tariff(NOW)
+            await writer.executor.async_execute_export_limit(action(setup), NOW)
+            owner.store.data = deepcopy(setup.store.data)
+            owner._startup_auto_recovery_authorized = True
+            owner._schedule_export_retry()
+            wakeup = fixture.timers[-1]
+            assert wakeup.delay == 3600
+            positive_tariff(advance_clock(setup, 1800))
+            ready, reason = await owner._async_run_startup_auto_recovery_validation()
+            assert not ready
+            await startup_recovery._async_enter_startup_safe_recovery(owner, reason)
+            assert not owner.active_control
+            for _ in range(2):
+                owner._startup_auto_recovery_authorized = False
+                assert await owner.async_reconcile_production_evidence_contract()
+            # Model the fully-started callback for disarmed recovery.
+            owner._export_retry_startup_blocked = False
+            now = advance_clock(setup, 1800)
+            positive_tariff(now)
+            wakeup.wake(now)
+            await asyncio.gather(*owner._listener_tasks)
+            assert not owner.active_control
+            assert len(setup.calls) == 1
+            retry = owner.store.data["ownership"][EXPORT_ASSET]["retry"]
+            assert retry["attempts"] == 1 and retry["state"] == "ready"
+            if scenario == "retry_past_grace_tariff_change":
+                tariff = price_state((-0.1, -0.1), start=now.replace(minute=0))
+                tariff.last_updated = now
+                setup.states["sensor.export_price"] = tariff
+            if scenario == "retry_past_grace_external":
+                setup.states[ENTITY] = limit_state(3500, readback=now.timestamp())
+            assert await owner._async_run_startup_auto_recovery_validation() == (True, "validation_succeeded")
+            assert await owner._async_reactivate_after_startup_recovery(1) == (True, "automatic_control_reactivated")
+            assert owner.active_control
+            setup.store.data = owner.store.data
+            if scenario == "retry_past_grace_tariff_change":
+                assert "retry" not in setup.control.state
+                assert len(setup.calls) == 1
+                return
+            if scenario in {"retry_past_grace_repeat", "retry_past_grace_external"}:
+                owner.executor = writer.executor
+                await owner._async_retry_export_limit()
+                saved = setup.control.state["retry"]
+                assert saved["attempts"] == 1 and saved["state"] == "scheduled"
+                assert saved["next_attempt_at"] == (now + timedelta(minutes=5)).isoformat()
+                if scenario == "retry_past_grace_external":
+                    assert setup.control.state["baseline"]["watts"] == 3500
+                owner._schedule_export_retry()
+                wakeup = fixture.timers[-1]
+                assert wakeup.delay == 3600
+                now = advance_clock(setup, 3600)
+                positive_tariff(now)
+                setup.mode["value"] = "confirm"
+                wakeup.wake(now)
+                await asyncio.gather(*owner._listener_tasks)
+                assert len(setup.calls) == 3 and "retry" not in setup.control.state
+                return
+            setup.mode["value"] = "confirm"
+            owner.executor = writer.executor
+            await owner._async_retry_export_limit()
+            assert setup.calls[-1][1] == "disable_export_limit" and len(setup.calls) == 2
+            return
+        if scenario == "in_flight":
+            await owner._async_update_data()
+            await asyncio.wait_for(first_flush.wait(), 1)
+            owner._schedule_plan_execution.reset_mock()
+        validation = asyncio.create_task(owner._async_run_startup_auto_recovery_validation())
+        await asyncio.sleep(0)
+        release_first_flush.set()
+        result = await validation
+        owner._schedule_plan_execution.assert_not_called()
+        if scenario == "changed_feedback":
+            assert result[0] is False and not owner.active_control
+            assert owner._export_reconcile_pending
+            owner._schedule_debounced_refresh.assert_not_called()
+            return
+        assert result == (True, "validation_succeeded")
+        assert await owner._async_reactivate_after_startup_recovery(3) == (True, "automatic_control_reactivated")
+        assert checks == ([(False, False)] if scenario == "in_flight" else []) + [(True, False), (False, True)]
+        assert owner.data.control_area_health[EXPORT_ASSET]["ready"]
+        assert owner.active_control
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", [
+    "pending", "completed", "completed_with_pause", "competing_refresh", "competing_provisional", "weather_update",
+    "planner_lock_update", "operator_arm", "arm_then_disarm", "enable_then_disable", "unavailable",
+])
+def test_operator_control_transition_checks_reconciled_export_plan(setup, monkeypatch, scenario):
+    from unittest.mock import Mock
+
+    from homeassistant.exceptions import HomeAssistantError
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
+
+    async def run():
+        arm_only = scenario in {"operator_arm", "arm_then_disarm"}
+        stop_requested = scenario in {"arm_then_disarm", "enable_then_disable"}
+        opts = {**OPTIONS, CONF_PLANNER_ENABLED: arm_only, CONF_DRY_RUN: True, "ai_enabled": False}
+        mapping = {**DATA, "weather_entity": "weather.home"} if scenario == "weather_update" else DATA
+        owner = _coordinator_for_runtime_services(entry_data=mapping, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {
+            "armed": False, "dry_run_ready_cycles": 3,
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(mapping, opts),
+        }
+        setup.hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, options: setattr(entry, "options", options),
+        )
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        release, checked = asyncio.Event(), asyncio.Event()
+        stop_saved = asyncio.Event()
+        start_competing_refresh = asyncio.Event()
+        preflight_reasons = []
+        if scenario == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        if scenario == "completed_with_pause":
+            owner.store.data["ownership"] = {EXPORT_ASSET: {
+                "identity": runtime.target_identity(setup.hass, ENTITY), "pause": "external_export_limit_conflict",
+            }}
+
+        save_rate_limits = owner.store.async_save_command_rate_limits
+        save_production = owner.store.async_save_production
+
+        async def wait_then_save_rate_limits(value):
+            await release.wait()
+            await save_rate_limits(value)
+
+        async def record_stop(production):
+            await save_production(production)
+            if production.get("disarmed_reason") and not production.get("armed"):
+                stop_saved.set()
+
+        async def competing_refresh():
+            await start_competing_refresh.wait()
+            owner.data = await owner._async_update_data()
+
+        async def weather(*args, **kwargs):
+            if scenario == "weather_update" and owner._pending_refresh_trigger == "automatic_control_preflight":
+                setup.states[ENTITY] = limit_state(1500)
+                await asyncio.sleep(0)
+            return {}, {}
+
+        competitor = asyncio.create_task(competing_refresh()) if scenario.startswith("competing_") else None
+
+        async def refresh():
+            if owner._pending_refresh_trigger == "automatic_control_preflight":
+                if competitor is not None:
+                    start_competing_refresh.set()
+                    await competitor
+                    if scenario == "competing_provisional":
+                        release.set()
+                if scenario == "planner_lock_update":
+                    await owner._planner_lock.acquire()
+
+                    def change_and_unlock():
+                        setup.states[ENTITY] = limit_state(1500)
+                        owner._planner_lock.release()
+
+                    asyncio.get_running_loop().call_soon(change_and_unlock)
+            owner.data = await owner._async_update_data()
+            if (scenario.startswith("completed") or scenario in {"competing_refresh", "planner_lock_update"}) and (
+                worker := owner._export_reconcile_task
+            ) is not None:
+                release.set()
+                await worker
+
+        def preflight(hass, coordinator):
+            preflight_reasons.append(coordinator.data.control_area_health[EXPORT_ASSET]["reason"])
+            checked.set()
+            return build_preflight_report(hass, coordinator)
+
+        owner.store.async_save_command_rate_limits = wait_then_save_rate_limits
+        owner.store.async_save_production = record_stop
+        owner.async_refresh = owner.async_request_refresh = refresh
+        owner._async_weather_forecast = weather
+        monkeypatch.setattr(module, "build_preflight_report", preflight)
+        monkeypatch.setattr(module, "InputManager", lambda hass, data, options, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(runtime.evidence(hass, data, options, NOW)),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        if arm_only:
+            owner._mark_forced_refresh("state_change")
+            await refresh()
+            enable = asyncio.create_task(owner.async_operator_arm_production_control())
+        else:
+            enable = asyncio.create_task(owner.async_set_active_control(True))
+        await asyncio.wait_for(checked.wait(), 1)
+        stop = None
+        if stop_requested:
+            stop = asyncio.create_task(
+                owner.async_operator_disarm_production_control() if arm_only else owner.async_set_active_control(False)
+            )
+            await asyncio.wait_for(stop_saved.wait(), 1)
+        if scenario != "competing_provisional":
+            release.set()
+        try:
+            if scenario == "unavailable":
+                with pytest.raises(HomeAssistantError, match="Automatic control is not ready"):
+                    await enable
+            else:
+                await enable
+            if stop is not None:
+                await stop
+        finally:
+            if (worker := owner._export_reconcile_task) is not None:
+                await worker
+        assert preflight_reasons == [
+            "external_export_limit_conflict" if scenario == "completed_with_pause" else "export_reconciliation_pending",
+            "export_limit_entity_unavailable" if scenario == "unavailable" else None,
+        ]
+        armed = not stop_requested and scenario != "unavailable"
+        assert owner.store.data["production"]["armed"] is armed
+        assert owner.active_control is (armed and not arm_only)
+        if stop_requested:
+            assert owner.dry_run
+            assert all(not saved.get("armed") for saved in owner.store.production_saves)
+        assert not setup.calls
 
     asyncio.run(run())
 
@@ -965,7 +1324,10 @@ def test_restore_isolated_from_profile_and_pending_outcome(setup):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("stage", ["seed", "pending", "restore", "review", "unsupported", "off_restore", "off"])
+@pytest.mark.parametrize("stage", [
+    "seed", "pending", "restore", "review", "unsupported", "off_restore", "off", "reconciliation_pending",
+    "replacement", "legacy_baseline", "unverified_readback",
+])
 def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, stage):
     from test_coordinator import _coordinator_for_runtime_services
 
@@ -993,6 +1355,20 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
         coordinator._schedule_debounced_refresh = lambda *args, **kwargs: None
         if stage == "unsupported":
             setup.states[ENTITY].state = "unsupported"
+        identity_case = stage in {"replacement", "legacy_baseline", "unverified_readback"}
+        if identity_case:
+            ready_plan = DryRunPlanner(opts).create_plan(context(runtime.evidence(setup.hass, DATA, opts, NOW)))
+            assert ready_plan.control_area_health[EXPORT_ASSET]["ready"]
+            original = {"watts": None, "slew_rate": 100}
+            ownership = {"identity": runtime.target_identity(setup.hass, ENTITY), "baseline": original,
+                         "expected": original}
+            if stage != "legacy_baseline":
+                ownership["gateway_identity"] = GATEWAY
+            await setup.control.save(ownership)
+            if stage == "replacement":
+                setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+            elif stage == "unverified_readback":
+                setup.states[ENTITY].attributes["gateway_identity_verified"] = False
         ctx = context({} if stage in {"off_restore", "off"} else runtime.evidence(setup.hass, DATA, opts, NOW))
         monkeypatch.setattr(module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {}, build_context=lambda overrides: ctx,
@@ -1011,7 +1387,15 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             setup.mode["value"] = "pending"
             coordinator.store.async_add_outcome = setup.store.async_add_outcome
             coordinator.store.async_flush = setup.store.async_flush
-        await coordinator._async_reconcile_export_limit()
+        if stage == "off_restore":
+            setup.hass.async_create_task = asyncio.create_task
+            worker = coordinator._admit_export_reconciliation(schedule_followup=False)
+            assert worker is not None
+            await worker
+        else:
+            await coordinator._async_reconcile_export_limit()
+        if stage == "reconciliation_pending":
+            coordinator._export_reconcile_pending = True
         result = await coordinator._async_update_data_locked(defer_execution=True)
         if "history_training" in coordinator.__dict__ and coordinator.history_training.task:
             await coordinator.history_training.task
@@ -1021,6 +1405,25 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             assert not result.actions
             return
         assert result.control_area_health[EXPORT_ASSET]
+        if identity_case:
+            from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+            from custom_components.ha_energy_planner.preflight import build_preflight_report
+
+            reason = runtime.GATEWAY_CHANGED if stage == "replacement" else runtime.GATEWAY_UNVERIFIED
+            assert result.control_area_health[EXPORT_ASSET]["reason"] == reason
+            assert not result.actions
+            # Preflight and presentation must catch the mismatch even before
+            # the coordinator publishes a replacement for a ready plan.
+            coordinator.data = ready_plan
+            assert export_limit_status(coordinator)["reason"] == reason
+            report = build_preflight_report(setup.hass, coordinator)
+            assert not report["safe_to_activate_now"]
+            assert EXPORT_ASSET not in report["control_areas"]["confidence_eligible"]
+            assert report["control_areas"]["details"][EXPORT_ASSET]["reason"] == reason
+            snapshot = coordinator._export_reconciliation_inputs()
+            assert snapshot.issue == reason and not snapshot.reusable
+            assert setup.control.state == ownership
+            assert not setup.calls
         if stage == "seed":
             assert EXPORT_ASSET in coordinator.store.data["ownership"]
         elif stage != "review":
@@ -1048,6 +1451,62 @@ def test_feedback_attribute_change_requests_fresh_plan(setup, monkeypatch):
     callbacks[0](FakeEvent(ENTITY, "pending", "pending"))
     assert requests[-1][0] == ("export_limit_feedback",)
     assert requests[-1][1]["force"]
+
+
+@pytest.mark.parametrize("poll", ["later", "changed_watts", "stale_recovery", "backward", "gateway_pending",
+                                  "planner_pending", "restoring"])
+def test_export_feedback_poll_keeps_queued_release_current_only_for_settled_settings(setup, monkeypatch, poll):
+    from test_coordinator import _coordinated_action, _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.models import ActionAsset
+
+    async def run():
+        callbacks = []
+        monkeypatch.setattr(module, "async_track_state_change_event", lambda hass, ids, callback: (
+            callbacks.append(callback) or (lambda: None)))
+        monkeypatch.setattr(module, "async_call_later", lambda *args: lambda: None)
+        setup.hass.async_create_task = asyncio.create_task
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        if poll in {"planner_pending", "restoring"}:
+            key = "pending" if poll == "planner_pending" else "restoring"
+            owner.store.data["ownership"] = {EXPORT_ASSET: {key: True}}
+        if poll == "stale_recovery":
+            setup.states[ENTITY] = limit_state(readback=NOW.timestamp() - 601)
+        owner.async_start_listeners()
+
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile():
+            started.set()
+            await finish.wait()
+
+        owner._async_reconcile_export_limit_locked = reconcile
+        worker = owner._admit_export_reconciliation()
+        await asyncio.wait_for(started.wait(), 1)
+        plan = _plan("queued-release-during-poll")
+        plan.created_at = NOW
+        release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+        plan.actions = [release]
+        owner._pending_plan_execution = (owner._refresh_generation, plan, object(), owner.planner_options)
+        drain = asyncio.create_task(owner._async_drain_plan_execution())
+        await asyncio.sleep(0)
+        assert not drain.done()
+
+        old = setup.states[ENTITY]
+        setup.clock["now"] += timedelta(seconds=60)
+        new = limit_state(
+            3000 if poll == "changed_watts" else None,
+            pending=poll == "gateway_pending",
+            readback=NOW.timestamp() - 1 if poll == "backward" else setup.clock["now"].timestamp(),
+        )
+        setup.states[ENTITY] = new
+        callbacks[0](SimpleNamespace(data={"entity_id": ENTITY, "old_state": old, "new_state": new}))
+        finish.set()
+        await asyncio.wait_for(asyncio.gather(worker, drain), 1)
+        assert [item.actions for item, _ in owner.executor.evaluated] == ([[release]] if poll == "later" else [])
+
+    asyncio.run(run())
 
 
 def test_independent_toggle_and_explicit_resume(setup, monkeypatch):
@@ -1095,10 +1554,30 @@ def test_dispatch_target_disappears_during_durable_flush(setup):
 
         async def remove_target():
             await original_flush()
-            setup.states.pop(ENTITY)
+            setup.states.pop(ENTITY, None)
 
         setup.store.async_flush = remove_target
         assert await setup.control.execute(a, NOW) == (OutcomeResult.REJECTED, "export_limit_entity_unavailable", False)
+        assert not setup.control.state
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("original,latest", [(GATEWAY, "b" * 64), (GATEWAY, None), (None, GATEWAY)])
+def test_dispatch_gateway_identity_changes_during_durable_flush(setup, original, latest):
+    async def run():
+        setup.states[ENTITY].attributes["gateway_identity"] = original
+        original_flush = setup.store.async_flush
+        a = action(setup)
+
+        async def replace_gateway():
+            await original_flush()
+            setup.states[ENTITY].attributes["gateway_identity"] = latest
+
+        setup.store.async_flush = replace_gateway
+        reason = runtime.GATEWAY_CHANGED if original and latest else runtime.GATEWAY_UNVERIFIED
+        assert await setup.control.execute(a, NOW) == (OutcomeResult.REJECTED, reason, False)
         assert not setup.control.state
         assert not setup.calls
 
@@ -1112,7 +1591,8 @@ def test_pending_before_ownership_and_restoration_suppress_policy(setup):
         assert (await setup.control.execute(a, NOW))[1] == "export_limit_pending"
         setup.states[ENTITY] = limit_state()
         observed, _ = runtime.feedback(setup.hass, ENTITY, NOW)
-        await setup.control.save({"identity": observed["identity"], "baseline": {"watts": 3000, "slew_rate": 100},
+        await setup.control.save({"identity": observed["identity"], "gateway_identity": GATEWAY,
+                                  "baseline": {"watts": 3000, "slew_rate": 100},
                                   "restoring": True})
         assert (await setup.control.execute(a, NOW))[1] == "export_limit_restoration_pending"
         assert not setup.calls
@@ -1348,13 +1828,19 @@ def test_resume_service_accepts_export_area(setup):
 
 
 @pytest.mark.parametrize(
-    "change", ["unarmed", "dry_run", "mapping", "registry", "pending", "external", "expired", "tariff"])
+    "change",
+    ["unarmed", "dry_run", "mapping", "registry", "pending", "external", "expired", "tariff", "nested_tariff"],
+)
 def test_dispatch_rechecks_after_persistence(setup, monkeypatch, change):
     from custom_components.ha_energy_planner.executor import Executor
     from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
     async def run():
         opts = {**OPTIONS, CONF_DRY_RUN: False}
+        if change == "nested_tariff":
+            entity = DATA[CONF_AMBER_EXPORT_PRICE]
+            raw = setup.states[entity]
+            setup.states[entity] = State(entity, raw.state, raw.attributes, last_updated=NOW)
         ctx = context(runtime.evidence(setup.hass, DATA, opts, NOW))
         plan = DryRunPlanner(opts).create_plan(ctx)
         plan.actions = plan.actions[:1]
@@ -1378,6 +1864,8 @@ def test_dispatch_rechecks_after_persistence(setup, monkeypatch, change):
                 setup.states[ENTITY] = limit_state(5000)
             elif change == "expired":
                 monkeypatch.setattr(runtime, "datetime", SimpleNamespace(now=lambda tz: NOW.replace(minute=30)))
+            elif change == "nested_tariff":
+                setup.states["sensor.export_price"].attributes["forecasts"][0]["per_kwh"] = 0.2
             else:
                 setup.states["sensor.export_price"] = price_state((0, 1, 1))
 
@@ -1409,6 +1897,2463 @@ def test_target_race_at_service_boundary_and_upstream_controls_disabled(setup, m
         outcome = await setup.control.execute(a, NOW)
         assert outcome[1] == "export_limit_service_rejected:controls_disabled"
         assert setup.control.state["pause"] == outcome[1]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("cause", "domain", "temporary"), [
+    (TimeoutError(), "enphase_ev", True),
+    (ServerDisconnectedError(), "enphase_ev", True),
+    (ClientResponseError(None, (), status=503), "enphase_ev", True),
+    (ClientResponseError(None, (), status=403), "enphase_ev", False),
+    (ValueError(), "enphase_ev", False),
+    (None, "enphase_ev", False),
+    (TimeoutError(), "other", False),
+])
+def test_export_retry_requires_evidence_of_a_temporary_rejection(setup, monkeypatch, cause, domain, temporary):
+    async def reject(*args):
+        raise ServiceValidationError(translation_domain=domain, translation_key="export_limit_unavailable") from cause
+
+    monkeypatch.setattr(runtime, "async_call_device_service", reject)
+    result = asyncio.run(setup.control.execute(action(setup), NOW))
+    assert result == (OutcomeResult.FAILED, "export_limit_service_rejected:installer_or_gateway_unavailable", True)
+    assert bool(setup.control.state.get("retry")) is temporary
+    assert "pending" not in setup.control.state
+
+
+def installer_rejection(key="export_limit_unavailable", cause=None):
+    error = ServiceValidationError(translation_domain="enphase_ev", translation_key=key)
+    error.__cause__ = cause
+    return error
+
+
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize(("key", "reason"), [
+    ("export_limit_changed", "export_limit_target_changed"),
+    ("export_limit_pending", "export_limit_pending"),
+    ("export_limit_mismatch", runtime.INSTALLER_FORM_MISMATCH),
+])
+def test_identity_bound_service_rejection_rolls_back_unsent_write(setup, monkeypatch, restore, key, reason):
+    async def run():
+        if restore:
+            setup.mode["value"] = "confirm"
+            await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup) if restore else NOW
+        prior_timing = setup.control.cooldown(now)["last_dispatch_reserved_at"]
+
+        async def reject(hass, domain, service, data):
+            assert domain == "enphase_ev" and data["expected_gateway"] == GATEWAY
+            raise installer_rejection(key)
+
+        monkeypatch.setattr(runtime, "async_call_device_service", reject)
+        if restore:
+            result = await setup.control.restore(now)
+            assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+            assert setup.control.state["gateway_identity"] == GATEWAY
+            assert setup.store.data["execution_audit"][-1]["command_sent"] is False
+        else:
+            result = await setup.control.execute(action(setup), now)
+            assert "baseline" not in setup.control.state
+        assert result == (OutcomeResult.PENDING if restore else OutcomeResult.REJECTED, reason, False)
+        assert setup.control.state.get("pause") == (reason if key == "export_limit_mismatch" else None)
+        assert not setup.control.state.get("pending")
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == prior_timing
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == int(restore)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_installer_probe_failure_counts_when_it_publishes_unavailable(setup, retry_owner, expired):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        rejection = (installer_rejection("export_limit_session_expired") if expired
+                     else installer_rejection(cause=TimeoutError()))
+
+        async def prepare():
+            setup.states[ENTITY].state = "unavailable"
+            raise rejection
+
+        upstream = retry_owner.upstream
+        upstream.async_prepare.side_effect = prepare
+        for _ in range(4):
+            now = advance_clock(setup)
+            setup.states[ENTITY] = limit_state(readback=now.timestamp())
+            await owner._async_retry_export_limit()
+
+        retry = setup.control.state["retry"]
+        assert retry["state"] == "operator_required"
+        assert retry["attempts"] == upstream.async_prepare.await_count == (1 if expired else 3)
+        assert setup.control.state["pause"] == (
+            runtime.INSTALLER_SESSION_EXPIRED if expired else "export_limit_retry_exhausted"
+        )
+        upstream.async_apply_guarded.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_guarded_retry_form_mismatch_requires_operator_without_write_charge(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        upstream = retry_owner.upstream
+        upstream.async_apply_guarded.side_effect = installer_rejection("export_limit_mismatch")
+        now = advance_clock(setup)
+        await owner._async_retry_export_limit()
+        assert setup.control.state["pause"] == runtime.INSTALLER_FORM_MISMATCH
+        assert setup.control.state["retry"]["state"] == "operator_required"
+        assert setup.control.state["retry"]["attempts"] == 0
+        assert "pending" not in setup.control.state
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+        advance_clock(setup)
+        await owner._async_retry_export_limit()
+        upstream.async_apply_guarded.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("transient", [False, True])
+def test_guarded_retry_classifies_gateway_rejection_after_successful_prepare(setup, retry_owner, transient):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        upstream = retry_owner.upstream
+        failure = ClientResponseError(None, (), status=503) if transient else None
+        upstream.async_apply_guarded.side_effect = installer_rejection(cause=failure)
+        for _ in range(4):
+            now = advance_clock(setup)
+            await owner._async_retry_export_limit()
+        retry = setup.control.state["retry"]
+        assert retry["attempts"] == (3 if transient else 0)
+        assert retry["state"] == "operator_required"
+        assert retry["reason"] == (runtime.UNAVAILABLE_REJECTION if transient else runtime.INSTALLER_WRITE_REJECTED)
+        assert upstream.async_prepare.await_count == upstream.async_apply_guarded.await_count == (3 if transient else 1)
+        assert "pending" not in setup.control.state
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("saved, replacement", [(GATEWAY, "b" * 64), (GATEWAY, None), (None, GATEWAY)])
+def test_retry_and_restoration_require_original_gateway(setup, retry_owner, saved, replacement):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        assert setup.control.state["gateway_identity"] == GATEWAY
+        if saved is None:
+            setup.store.data["ownership"][EXPORT_ASSET].pop("gateway_identity")
+        now = advance_clock(setup)
+        setup.states[ENTITY].attributes["gateway_identity"] = replacement
+        await owner._async_retry_export_limit()
+        expected = runtime.GATEWAY_CHANGED if saved and replacement else runtime.GATEWAY_UNVERIFIED
+        assert setup.control.state["pause"] == expected
+        assert setup.control.state["retry"]["state"] == "operator_required"
+        assert (await setup.control.restore(now))[1] == expected
+        retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+        assert len(setup.calls) == 1
+        if replacement:
+            await setup.control.resume()
+            assert not setup.control.state
+
+    asyncio.run(run())
+
+
+def test_retry_rechecks_gateway_before_a_prepared_no_op(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+
+        async def prepare_then_replace():
+            snapshot = await retry_owner.prepare()
+            setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+            setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+            return snapshot
+
+        retry_owner.upstream.async_prepare.side_effect = prepare_then_replace
+        await owner._async_retry_export_limit()
+        retry = setup.control.state["retry"]
+        assert (retry["state"], retry["reason"], retry["attempts"]) == ("operator_required", runtime.GATEWAY_CHANGED, 0)
+        assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+        retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_retry_cannot_settle_matching_watts_from_unverified_readback(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+
+        async def prepare_then_unverified():
+            setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+            snapshot = await retry_owner.prepare()
+            setup.states[ENTITY].attributes["gateway_identity_verified"] = False
+            return snapshot
+
+        retry_owner.upstream.async_prepare.side_effect = prepare_then_unverified
+        await owner._async_retry_export_limit()
+        assert setup.control.state["retry"]["reason"] == runtime.GATEWAY_UNVERIFIED
+        assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+        retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_unverified_gateway_hash_cannot_complete_confirmation_or_no_write_restore(setup, pending):
+    async def run():
+        setup.mode["value"] = "pending" if pending else "confirm"
+        await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup, 60)
+        ownership = setup.control.state
+        state = limit_state(0 if pending else ownership["baseline"]["watts"], readback=now.timestamp())
+        state.attributes.pop("gateway_identity_verified")
+        setup.states[ENTITY] = state
+        audit = deepcopy(setup.store.data["execution_audit"])
+        if pending:
+            assert await setup.control.reconcile(now) == runtime.GATEWAY_UNVERIFIED
+            assert setup.control.state["pending"] == ownership["pending"]
+        else:
+            assert await setup.control.restore(now) == (OutcomeResult.PENDING, runtime.GATEWAY_UNVERIFIED, False)
+            assert setup.control.state["restoring"]
+        assert setup.control.state["baseline"] == ownership["baseline"]
+        assert setup.store.data["execution_audit"] == audit
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "replacement", ["settled", "pending", "stale", "unverified", "wrong_target", "same_gateway"],
+)
+@pytest.mark.parametrize("receipt_saved", [True, False])
+def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_request(
+    setup, monkeypatch, replacement, receipt_saved,
+):
+    from test_coordinator import _coordinator_for_runtime_services
+
+    async def run():
+        await setup.control.execute(action(setup), NOW)
+        owned = setup.control.state
+        timing_key = runtime.control_key(owned["identity"])
+        if not receipt_saved:
+            setup.store.data["execution_audit"].clear()
+            owned["pending"]["attempt_recorded"] = False
+            await setup.control.save(owned)
+        now = advance_clock(setup, 60)
+        setup.states[ENTITY] = limit_state(
+            0, pending=replacement == "pending",
+            readback=NOW.timestamp() - 601 if replacement == "stale" else now.timestamp(),
+        )
+        setup.states[ENTITY].attributes["gateway_identity"] = (
+            None if replacement == "unverified" else GATEWAY if replacement == "same_gateway" else "b" * 64
+        )
+        if replacement == "wrong_target":
+            setup.registry[ENTITY].device_id = "different-control"
+
+        monkeypatch.setattr(runtime, "installer_runtime", lambda *_: None)
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        await owner.async_resume_control(asset=EXPORT_ASSET)
+        if replacement == "settled":
+            assert not setup.control.state
+            assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+            assert setup.control.cooldown(now)["deferred"]
+            assert [row["result"] for row in setup.store.data["execution_audit"]] == [
+                OutcomeResult.PENDING, OutcomeResult.FAILED,
+            ]
+            assert not setup.store.data["calendar_history"].get("history")
+        else:
+            assert setup.control.state == owned
+        assert setup.store.data["command_rate_limits"][timing_key]["attempted_at"] == NOW.timestamp()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("result", ["retired", "still_pending", "refused", "unavailable", "timeout", "remapped"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_checks_companion_retirement_before_releasing_original_ownership(setup, monkeypatch, result, legacy):
+    from test_coordinator import _coordinator_for_runtime_services
+
+    async def run():
+        replacement = "b" * 64
+        original = None if legacy else GATEWAY
+        if legacy:
+            setup.states[ENTITY].attributes.pop("gateway_identity")
+        await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup, 600)
+        setup.states[ENTITY] = limit_state(0, pending=True, readback=now.timestamp())
+        setup.states[ENTITY].attributes.update(gateway_identity=replacement, request_status="unconfirmed")
+        if legacy:
+            assert await setup.control.reconcile(now) == "export_limit_unconfirmed"
+        ownership = setup.control.state
+        budget = action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"]
+
+        async def retire(gateway, *, original_gateway):
+            assert gateway == replacement and original_gateway == original
+            assert setup.control.state == ownership
+            if result == "unavailable":
+                raise installer_rejection()
+            if result == "timeout":
+                raise TimeoutError
+            if result == "refused":
+                return False
+            if result != "still_pending":
+                setup.states[ENTITY].attributes["pending"] = False
+                setup.states[ENTITY].state = "zero_export"
+            if result == "remapped":
+                setup.registry[ENTITY].device_id = "another-control"
+            return True
+
+        retire_hook = AsyncMock(side_effect=retire)
+        monkeypatch.setattr(runtime, "installer_runtime", lambda *_: SimpleNamespace(
+            async_retire_replaced_intent=retire_hook,
+        ))
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        await owner.async_resume_control(asset=EXPORT_ASSET)
+        retire_hook.assert_awaited_once_with(replacement, original_gateway=original)
+        assert setup.control.state == ({} if result == "retired" else ownership)
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == budget == 1
+        audit = setup.store.data["execution_audit"]
+        assert [row["result"] for row in audit] == (
+            [OutcomeResult.PENDING, OutcomeResult.FAILED] if result == "retired" or legacy else [OutcomeResult.PENDING]
+        )
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("saved_gateway", [None, GATEWAY])
+@pytest.mark.parametrize("restore", [False, True])
+def test_pending_gateway_mismatch_never_confirms_and_can_be_retired(setup, saved_gateway, restore):
+    async def run():
+        if saved_gateway is None:
+            setup.states[ENTITY].attributes.pop("gateway_identity")
+        await setup.control.execute(action(setup), NOW)
+        ownership = setup.control.state
+        ownership["pending"]["restore"] = restore
+        await setup.control.save(ownership)
+        now = advance_clock(setup, 60)
+        setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+        setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+        issue = runtime.GATEWAY_CHANGED if saved_gateway else runtime.GATEWAY_UNVERIFIED
+        assert await setup.control.reconcile(now) == issue
+        assert setup.control.state["pending"]
+        if saved_gateway is None:
+            await setup.control.resume()
+            assert setup.control.state["pending"]
+        now = advance_clock(setup, 600)
+        assert await setup.control.reconcile(now) == "export_limit_unconfirmed"
+        assert await setup.control.reconcile(now) == "export_limit_unconfirmed"
+        assert [row["result"] for row in setup.store.data["execution_audit"]] == [
+            OutcomeResult.PENDING, OutcomeResult.FAILED,
+        ]
+        await setup.control.resume()
+        assert not setup.control.state
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+        assert not setup.store.data["calendar_history"].get("history")
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("same_target", [True, False])
+def test_explicit_resume_retires_settled_baseline_only_for_same_control(setup, same_target):
+    from test_coordinator import _coordinator_for_runtime_services
+
+    async def run():
+        setup.states[ENTITY] = limit_state(3000)
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(action(setup), NOW)
+        owned = setup.control.state
+        assert owned["baseline"]["watts"] == 3000 and not owned.get("pending")
+        timing = deepcopy(setup.store.data["command_rate_limits"])
+        now = advance_clock(setup, 60)
+        setup.states[ENTITY] = limit_state(5000, readback=now.timestamp())
+        setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+        if not same_target:
+            setup.registry[ENTITY].device_id = "different-control"
+
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        await owner.async_resume_control(asset=EXPORT_ASSET)
+        assert setup.control.state == ({} if same_target else owned)
+        assert setup.store.data["command_rate_limits"] == timing
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_legacy_ready_retry_without_baseline_requires_resume(setup):
+    async def run():
+        setup.states[ENTITY] = limit_state(0)
+        await setup.control.save({
+            "identity": runtime.target_identity(setup.hass, ENTITY),
+            "expected": {"watts": 0, "slew_rate": 100.0},
+            "retry": {"state": "ready", "attempts": 1, "next_attempt_at": None},
+        })
+        assert await setup.control.reconcile(NOW) == runtime.GATEWAY_UNVERIFIED
+        assert setup.control.state["retry"]["state"] == "ready"
+        await setup.control.resume()
+        assert not setup.control.state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["confirm", "restore", "retry"])
+def test_reconciliation_rechecks_gateway_after_alias_save(select_setup, operation):
+    setup = select_setup
+
+    async def run():
+        control = runtime.ExportLimitControl(setup.hass, setup.store, setup.mapping)
+        state = {"identity": runtime.target_identity(setup.hass, setup.sensor), "gateway_identity": GATEWAY}
+        if operation == "retry":
+            state["retry"] = {"state": "ready", "attempts": 1, "next_attempt_at": None}
+        else:
+            state["baseline"] = {"watts": None, "slew_rate": 100.0}
+            state["pending"] = {
+                "action_id": "alias-request", "plan_id": "alias-plan", "kind": "set_export_limit",
+                "identity": state["identity"], "sent_at": NOW.timestamp(), "confirmation_not_before": NOW.timestamp(),
+                "attempt_recorded": True, "watts": 0, "slew_rate": None, "restore": operation == "restore",
+                "pre_state": {"watts": None, "slew_rate": 100.0},
+            }
+        await control.save(state)
+        setup.states[setup.sensor] = limit_state(0)
+        save = setup.store.async_save_ownership
+
+        async def save_then_replace(ownership):
+            await save(ownership)
+            setup.states[setup.sensor].attributes["gateway_identity"] = "b" * 64
+
+        setup.store.async_save_ownership = save_then_replace
+        assert await control.reconcile(NOW) == runtime.GATEWAY_CHANGED
+        assert control.state == {**state, "identity": runtime.target_identity(setup.hass, setup.select)}
+        assert not setup.store.data["execution_audit"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("gateway", ["b" * 64, None])
+def test_no_write_restore_rechecks_gateway_after_reconciliation(setup, gateway):
+    async def run():
+        control = setup.control
+        baseline = {"watts": None, "slew_rate": 100.0}
+        await control.save({
+            "identity": runtime.target_identity(setup.hass, ENTITY),
+            "gateway_identity": GATEWAY, "baseline": baseline, "expected": baseline,
+        })
+        reconcile = control.reconcile
+
+        async def reconcile_then_change_gateway(now):
+            result = await reconcile(now)
+            setup.states[ENTITY].attributes["gateway_identity"] = gateway
+            return result
+
+        control.reconcile = reconcile_then_change_gateway
+        assert await control.restore(NOW) == (
+            OutcomeResult.PENDING, runtime.GATEWAY_CHANGED if gateway else runtime.GATEWAY_UNVERIFIED, False,
+        )
+        assert control.state["baseline"] == baseline
+        assert control.state["gateway_identity"] == GATEWAY
+        assert control.state["restoring"]
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("change", "issue"), [
+    ("none", None),
+    ("replacement", runtime.GATEWAY_CHANGED),
+    ("unverified", runtime.GATEWAY_UNVERIFIED),
+    ("remapped", "export_limit_target_changed"),
+    ("stale", "export_limit_readback_stale"),
+    ("pending", "export_limit_pending"),
+])
+def test_pending_restore_revalidates_feedback_after_alias_save(select_setup, change, issue):
+    setup = select_setup
+
+    async def run():
+        sensor_mapping = {**setup.mapping, CONF_ENPHASE_EXPORT_LIMIT_ENTITY: setup.sensor}
+        original = runtime.ExportLimitControl(setup.hass, setup.store, sensor_mapping)
+        setup.mode["value"] = "confirm"
+        await original.execute(build_actions(context(runtime.evidence(
+            setup.hass, sensor_mapping, OPTIONS, NOW,
+        )))[0], NOW)
+        now = advance_clock(setup)
+        setup.mode["value"] = "pending"
+        assert await original.restore(now) == (OutcomeResult.PENDING, "export_limit_pending", True)
+        owned = original.state
+        assert owned["pending"]["restore"]
+        audit = deepcopy(setup.store.data["execution_audit"])
+        history = deepcopy(setup.store.data["calendar_history"])
+        setup.states[setup.sensor] = limit_state(readback=now.timestamp())
+        save = setup.store.async_save_ownership
+
+        async def save_alias(ownership):
+            await save(ownership)
+            state = ownership.get(EXPORT_ASSET)
+            if not state or state["identity"]["entity_id"] != setup.select:
+                return
+            attrs = setup.states[setup.sensor].attributes
+            if change == "replacement":
+                attrs["gateway_identity"] = "b" * 64
+            elif change == "unverified":
+                attrs.pop("gateway_identity")
+            elif change == "remapped":
+                setup.registry[setup.sensor].device_id = setup.registry[setup.select].device_id = "different-control"
+            elif change == "stale":
+                attrs["last_successful_readback"] = now.timestamp() - 601
+            elif change == "pending":
+                setup.states[setup.sensor] = limit_state(pending=True, readback=now.timestamp())
+
+        setup.store.async_save_ownership = save_alias
+        result = await setup.control.restore(now)
+        if issue is None:
+            assert result == (OutcomeResult.RESTORED, "export_limit_restored", False)
+            assert not setup.control.state
+        else:
+            assert result == (OutcomeResult.PENDING, issue, False)
+            for key in ("baseline", "gateway_identity", "pending"):
+                assert setup.control.state[key] == owned[key]
+            assert setup.store.data["execution_audit"] == audit
+            assert setup.store.data["calendar_history"] == history
+        assert len(setup.calls) == 2
+
+    asyncio.run(run())
+
+
+def test_retiring_guarded_runtime_defers_without_operator_pause(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        upstream = retry_owner.upstream
+
+        async def retire(*args, **kwargs):
+            upstream.stopped = True
+            raise installer_rejection("export_limit_disabled")
+
+        apply = upstream.async_apply_guarded.side_effect
+        upstream.async_apply_guarded.side_effect = retire
+        now = advance_clock(setup)
+        await owner._async_retry_export_limit()
+        retry = setup.control.state["retry"]
+        assert (retry["state"], retry["attempts"], retry["reason"]) == (
+            "scheduled", 0, "export_limit_target_changed",
+        )
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        replacement = SimpleNamespace(
+            enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
+            async_apply_guarded=AsyncMock(side_effect=apply),
+            verifies_export_limit_gateway=True,
+        )
+        retry_owner.entry.runtime_data.coordinator.export_limit_runtime = replacement
+        setup.mode["value"] = "confirm"
+        advance_clock(setup)
+        await owner._async_retry_export_limit()
+        replacement.async_apply_guarded.assert_awaited_once()
+        assert len(setup.calls) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("entry_state", [ConfigEntryState.UNLOAD_IN_PROGRESS, ConfigEntryState.SETUP_IN_PROGRESS])
+def test_enphase_reload_preserves_final_retry_before_probe(setup, retry_owner, entry_state):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        retry_owner.entry.state = entry_state
+        now = advance_clock(setup)
+        await owner._async_retry_export_limit()
+        assert setup.control.state["retry"] == {
+            "state": "scheduled", "attempts": 2, "reason": "export_limit_target_changed",
+            "next_attempt_at": (now + runtime.RETRY_INTERVAL).isoformat(),
+        }
+        retry_owner.upstream.async_prepare.assert_not_awaited()
+        retry_owner.entry.state = ConfigEntryState.LOADED
+        setup.mode["value"] = "confirm"
+        advance_clock(setup)
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+        assert len(setup.calls) == 2
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def retry_owner(setup, monkeypatch):
+    """Use real Planner control/dispatch with a site-specific fake Enphase runtime."""
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner.executor import Executor
+    from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+    timers = []
+
+    def call_later(hass, delay, wake):
+        timer = SimpleNamespace(delay=delay, wake=wake, cancel=Mock())
+        timers.append(timer)
+        return timer.cancel
+
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.async_call_later", call_later)
+
+    def create(options=None):
+        owner = _coordinator_for_runtime_services(
+            entry_data=dict(DATA), options={**OPTIONS, CONF_DRY_RUN: False, **(options or {})}, hass=setup.hass,
+        )
+        owner.store = setup.store
+        owner.executor = Executor(
+            setup.store, hass=setup.hass, entry_data=owner.entry_data, options=owner.planner_options,
+        )
+        owner.executor.export_write_blocked = owner._export_write_blocked
+        owner._listener_tasks = set()
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        setup.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+            owner.entry_data, owner.planner_options,
+        )
+        return owner
+
+    async def prepare():
+        # The actual Configure preparation hook does this read before fetching the installer form.
+        state = setup.states[ENTITY]
+        state.attributes["last_successful_readback"] = setup.clock["now"].timestamp()
+        watts = state.attributes["confirmed_watts"]
+        return SimpleNamespace(
+            supported=True, enabled=watts is not None, watts=watts,
+            slew=state.attributes["slew_rate"], gateway_identity=state.attributes["gateway_identity"],
+        )
+
+    upstream = SimpleNamespace(
+        async_prepare=AsyncMock(side_effect=prepare), enabled=True, pending=None, verifies_export_limit_gateway=True,
+    )
+    upstream_entry = SimpleNamespace(domain="enphase_ev", state=ConfigEntryState.LOADED, disabled_by=None,
+                                     runtime_data=SimpleNamespace(coordinator=SimpleNamespace(
+                                         export_limit_runtime=upstream,
+                                     )))
+    setup.hass.config_entries = SimpleNamespace(async_get_entry={"site-a": upstream_entry}.get)
+    service = setup.hass.services.async_call
+
+    async def call(domain, name, data, **kwargs):
+        if setup.mode["value"] in {"temporary", "expired", "ambiguous"}:
+            setup.calls.append((domain, name, data))
+            if setup.mode["value"] == "temporary":
+                raise installer_rejection(cause=TimeoutError())
+            if setup.mode["value"] == "expired":
+                raise installer_rejection("export_limit_session_expired")
+            raise installer_rejection()
+        await service(domain, name, data, **kwargs)
+
+    setup.hass.services.async_call = call
+
+    async def apply(watts, *, expected, before_write):
+        assert expected is not None
+        before_write()
+        service_data = {"entity_id": ENTITY}
+        if watts is not None:
+            service_data["limit_watts"] = watts
+        await call("enphase_ev", "disable_export_limit" if watts is None else "set_export_limit", service_data)
+
+    upstream.async_apply_guarded = AsyncMock(side_effect=apply)
+    setup.mode["value"] = "temporary"
+    return SimpleNamespace(create=create, upstream=upstream, entry=upstream_entry, prepare=prepare, timers=timers)
+
+
+@pytest.mark.parametrize("scenario", [
+    "negative", "changed_tariff", "external_match", "changed_baseline", "pending",
+    "timeout", "repeat", "expired", "ambiguous", "action_cap", "action_cap_late", "action_cap_noop",
+])
+def test_export_retry_replans_and_only_confirms_from_matching_feedback(setup, retry_owner, scenario):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        options = {CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: 1} if scenario in {"action_cap", "action_cap_noop"} else {}
+        owner = retry_owner.create(options)
+        # Keep the original restoration baseline across attempts.
+        if scenario not in {"changed_tariff", "changed_baseline", "action_cap_noop"}:
+            setup.states[ENTITY] = limit_state(5000)
+        if scenario != "changed_baseline":
+            await owner._async_reconcile_export_limit_locked()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        initial = setup.control.state["baseline"]
+        assert export_limit_status(owner)["retry"]["attempts"] == 0
+        now = advance_clock(setup)
+        if scenario in {"changed_tariff", "action_cap_noop"}:
+            setup.states["sensor.export_price"] = price_state((0.1, 0.0))
+        if scenario == "external_match":
+            setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+        if scenario == "changed_baseline":
+            setup.states[ENTITY] = limit_state(3500, readback=now.timestamp())
+            initial = {"watts": 3500, "slew_rate": 100.0}
+        setup.mode["value"] = {
+            "repeat": "temporary", "pending": "pending", "timeout": "timeout",
+            "expired": "expired", "ambiguous": "ambiguous",
+        }.get(scenario, "confirm")
+        if scenario == "action_cap_late":
+            setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+
+            async def close_allowance():
+                owner.entry.options[CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS] = 1
+                return await retry_owner.prepare()
+
+            retry_owner.upstream.async_prepare.side_effect = close_allowance
+        await owner._async_retry_export_limit()
+        checks = int(scenario != "action_cap")
+        assert retry_owner.upstream.async_prepare.await_count == checks
+
+        if scenario in {"changed_tariff", "external_match", "action_cap", "action_cap_late", "action_cap_noop"}:
+            assert len(setup.calls) == 1
+            if scenario in {"action_cap", "action_cap_late"}:
+                attempts = 2 if scenario == "action_cap_late" else 0
+                owner._schedule_export_retry()
+                wakeup = retry_owner.timers[-1]
+                assert wakeup.delay == 86400 - 300
+                advance_clock(setup)
+                await owner._async_retry_export_limit()
+                assert retry_owner.upstream.async_prepare.await_count == checks
+                assert setup.control.state["retry"]["attempts"] == attempts
+                now = advance_clock(setup, 86400 - 600)
+                tariff = price_state(start=now.replace(minute=0))
+                tariff.last_updated = now
+                setup.states["sensor.export_price"] = tariff
+                retry_owner.upstream.async_prepare.side_effect = retry_owner.prepare
+                wakeup.wake(now)
+                await asyncio.gather(*owner._listener_tasks)
+                assert len(setup.calls) == 2 and "retry" not in setup.control.state
+            else:
+                assert "retry" not in setup.control.state
+                assert "pause" not in setup.control.state
+        else:
+            assert len(setup.calls) == 2
+            assert setup.calls[-1] == ("enphase_ev", "set_export_limit", {"entity_id": ENTITY, "limit_watts": 0})
+            assert setup.control.state["baseline"] == initial
+            if scenario == "repeat":
+                assert setup.control.state["retry"]["attempts"] == 1
+                for _ in range(2):
+                    advance_clock(setup)
+                    await owner._async_retry_export_limit()
+                assert export_limit_status(owner)["retry"]["state"] == "operator_required"
+                assert export_limit_status(owner)["retry"]["operator_action"]
+                assert setup.control.state["pause"] == "export_limit_retry_exhausted"
+                advance_clock(setup)
+                await owner._async_retry_export_limit()
+                assert len(setup.calls) == 4
+                await setup.control.resume()
+                assert "retry" not in setup.control.state
+            elif scenario in {"expired", "ambiguous"}:
+                assert export_limit_status(owner)["retry"]["state"] == "operator_required"
+            elif scenario in {"negative", "changed_baseline"}:
+                assert setup.control.state["expected"]["watts"] == 0
+                assert "retry" not in setup.control.state
+                assert setup.store.data["execution_audit"][-1]["result"] == "applied"
+            else:
+                assert export_limit_status(owner)["retry"]["state"] == "awaiting_confirmation"
+                advance_clock(setup)
+                await owner._async_retry_export_limit()
+                assert len(setup.calls) == 2
+                setup.states[ENTITY] = limit_state(0, readback=setup.clock["now"].timestamp())
+                await owner._async_reconcile_export_limit_locked()
+                assert "retry" not in setup.control.state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("scenario", "reason", "terminal"), [
+    ("missing", runtime.COMPANION_UPGRADE_REQUIRED, True),
+    ("legacy_write", runtime.COMPANION_UPGRADE_REQUIRED, True),
+    ("legacy_guarded", runtime.COMPANION_UPGRADE_REQUIRED, True),
+    ("wrong_entry", "export_limit_retry_readiness_check_unavailable", False),
+    ("entry_unloaded", "export_limit_retry_readiness_check_unavailable", False),
+    ("entry_disabled", "export_limit_retry_readiness_check_unavailable", False),
+    ("other_domain", "export_limit_retry_readiness_check_unavailable", False),
+    ("unsupported", "export_limit_unsupported", True),
+    ("disabled", "export_limit_service_rejected:controls_disabled", True),
+    ("expired", "export_limit_service_rejected:installer_session_expired", True),
+    ("upstream_off", "export_limit_service_rejected:controls_disabled", True),
+    ("ambiguous", "export_limit_retry_readiness_rejected", True),
+    ("error", "export_limit_retry_readiness_check_failed", True),
+    ("unknown_shape", "export_limit_retry_readiness_check_unavailable", True),
+    ("timeout", "export_limit_retry_readiness_timeout", False),
+    ("temporary", runtime.UNAVAILABLE_REJECTION, False),
+    ("pending_before", "export_limit_pending", False),
+    ("pending_during", "export_limit_pending", False),
+    ("stale_settings", "export_limit_readback_stale", False),
+    ("stale_tariff", "export_tariff_stale", False),
+    ("different_settings", "export_limit_retry_readback_changed", False),
+])
+def test_export_retry_needs_installer_and_fresh_settled_policy_evidence(setup, retry_owner, scenario, reason, terminal):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        advance_clock(setup)
+        upstream = retry_owner.upstream
+        if scenario == "missing":
+            del upstream.async_prepare
+        elif scenario == "legacy_write":
+            upstream.async_apply = AsyncMock()
+            del upstream.async_apply_guarded
+        elif scenario == "legacy_guarded":
+            del upstream.verifies_export_limit_gateway
+        elif scenario == "wrong_entry":
+            setup.hass.config_entries.async_get_entry = lambda _: None
+        elif scenario == "entry_unloaded":
+            retry_owner.entry.state = ConfigEntryState.NOT_LOADED
+        elif scenario == "entry_disabled":
+            retry_owner.entry.disabled_by = "user"
+        elif scenario == "other_domain":
+            retry_owner.entry.domain = "other"
+        elif scenario == "unsupported":
+            upstream.async_prepare = AsyncMock(return_value=SimpleNamespace(supported=False))
+        elif scenario == "disabled":
+            upstream.enabled = False
+        elif scenario == "unknown_shape":
+            upstream.async_prepare = AsyncMock(return_value=SimpleNamespace(supported=True, enabled="no"))
+        elif scenario in {"timeout", "temporary", "expired", "upstream_off", "ambiguous", "error"}:
+            upstream.async_prepare.side_effect = {
+                "timeout": TimeoutError(),
+                "temporary": installer_rejection(cause=TimeoutError()),
+                "expired": installer_rejection("export_limit_session_expired"),
+                "upstream_off": installer_rejection("export_limit_disabled"),
+                "ambiguous": installer_rejection(),
+                "error": RuntimeError(),
+            }[scenario]
+        elif scenario == "pending_before":
+            setup.states[ENTITY] = limit_state(pending=True, readback=setup.clock["now"].timestamp())
+        elif scenario == "pending_during":
+            upstream.pending = {}
+        elif scenario == "stale_settings":
+            setup.states[ENTITY] = limit_state(readback=NOW.timestamp())
+            upstream.async_prepare = AsyncMock(return_value=SimpleNamespace(
+                supported=True, enabled=False, slew=100.0, gateway_identity=GATEWAY,
+            ))
+        elif scenario == "stale_tariff":
+            setup.states["sensor.export_price"].last_updated = NOW - timedelta(hours=1)
+        else:
+            upstream.async_prepare = AsyncMock(
+                return_value=SimpleNamespace(
+                    supported=True, enabled=True, watts=1, slew=100.0, gateway_identity=GATEWAY,
+                ),
+            )
+        setup.mode["value"] = "confirm"
+        await owner._async_retry_export_limit()
+        assert len(setup.calls) == 1
+        retry = setup.control.state["retry"]
+        free_check = reason == runtime.COMPANION_UPGRADE_REQUIRED or scenario in {
+            "pending_before", "pending_during", "different_settings",
+        }
+        assert retry["attempts"] == (0 if free_check else 1)
+        assert retry["reason"] == reason
+        assert retry["state"] == ("operator_required" if terminal else "scheduled")
+        if scenario == "legacy_write":
+            upstream.async_prepare.assert_not_called()
+            upstream.async_apply.assert_not_called()
+        if scenario == "legacy_guarded":
+            upstream.async_prepare.assert_not_called()
+            upstream.async_apply_guarded.assert_not_called()
+            status = runtime.retry_status(setup.control.state, running=False)
+            assert status["operator_action"].startswith("Upgrade Enphase Energy")
+        if scenario == "entry_unloaded":
+            retry_owner.entry.state = ConfigEntryState.LOADED
+            advance_clock(setup)
+            await owner._async_retry_export_limit()
+            assert len(setup.calls) == 2
+        if scenario == "pending_before":
+            for _ in range(3):
+                advance_clock(setup)
+                await owner._async_retry_export_limit()
+            upstream.async_prepare.assert_not_awaited()
+            assert setup.control.state["retry"]["attempts"] == 0
+            now = advance_clock(setup)
+            setup.states[ENTITY] = limit_state(readback=now.timestamp())
+            tariff = price_state((-0.1, -0.1), start=now.replace(minute=0))
+            tariff.last_updated = now
+            setup.states["sensor.export_price"] = tariff
+            await owner._async_retry_export_limit()
+            assert len(setup.calls) == 2
+        if scenario == "timeout":
+            for _ in range(2):
+                advance_clock(setup)
+                await owner._async_retry_export_limit()
+            assert setup.control.state["pause"] == "export_limit_retry_exhausted"
+            assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", [
+    "stop", "pause", "disable", "replace", "missing_target", "unavailable", "missing_readback",
+    "reload", "reload_rejected", "resume", "superseded", "overlap", "shutdown",
+])
+def test_export_retry_rechecks_authority_after_probe(setup, retry_owner, scenario):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        if scenario in {"reload_rejected", "replace", "missing_target", "unavailable", "missing_readback"}:
+            setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        await owner._async_reconcile_export_limit_locked()
+        advance_clock(setup)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def prepare():
+            assert not owner._command_lock.locked()
+            entered.set()
+            await release.wait()
+            if scenario == "reload_rejected":
+                raise installer_rejection("export_limit_disabled")
+            if scenario == "missing_readback":
+                return SimpleNamespace(supported=True, enabled=False, slew=100.0, watts=None, gateway_identity=GATEWAY)
+            return await retry_owner.prepare()
+
+        retry_owner.upstream.async_prepare.side_effect = prepare
+        setup.mode["value"] = "confirm"
+        retry_owner.timers[-1].wake(setup.clock["now"])
+        await entered.wait()
+        retry, = owner._listener_tasks
+        assert export_limit_status(owner)["retry"]["state"] == "checking"
+        await owner._async_retry_export_limit()
+        async with owner._command_lock:
+            await owner._async_reconcile_export_limit_locked()
+        if scenario == "stop":
+            setup.store.data["production"]["armed"] = False
+        elif scenario == "pause":
+            await owner.async_pause_control(15, "operator", asset=EXPORT_ASSET)
+        elif scenario == "disable":
+            owner.entry.options[CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED] = False
+        elif scenario == "replace":
+            setup.registry[ENTITY].device_id = "new-gateway"
+        elif scenario == "missing_target":
+            old_target = setup.registry.pop(ENTITY)
+        elif scenario == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        elif scenario == "missing_readback":
+            setup.states[ENTITY].attributes.pop("last_successful_readback")
+        elif scenario == "resume":
+            await owner.async_resume_control(asset=EXPORT_ASSET)
+        elif scenario == "superseded":
+            owned = setup.control.state
+            replacement_retry = {**owned["retry"], "state": "scheduled", "reason": "export_limit_pending"}
+            await setup.control.save({**owned, "retry": replacement_retry})
+        elif scenario in {"reload", "reload_rejected"}:
+            retry_owner.entry.runtime_data.coordinator.export_limit_runtime = SimpleNamespace(
+                enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
+                async_apply_guarded=retry_owner.upstream.async_apply_guarded,
+                verifies_export_limit_gateway=True,
+            )
+        elif scenario == "shutdown":
+            owner._begin_shutdown()
+        await owner._async_retry_export_limit()
+        release.set()
+        await retry
+        assert len(setup.calls) == (2 if scenario == "overlap" else 1)
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+        if scenario == "resume":
+            assert "retry" not in setup.control.state and "pause" not in setup.control.state
+        if scenario == "superseded":
+            assert setup.control.state["retry"] == replacement_retry
+            retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+        if scenario in {"reload_rejected", "replace", "missing_target", "unavailable", "missing_readback"}:
+            assert setup.control.state["retry"]["reason"] == (
+                "export_limit_entity_unavailable" if scenario in {"unavailable", "missing_readback"}
+                else "export_limit_target_changed"
+            )
+            assert setup.control.state["retry"]["state"] == "scheduled"
+            assert setup.control.state["retry"]["attempts"] == 2
+            if scenario == "replace":
+                setup.registry[ENTITY].device_id = "gateway-a"
+            elif scenario == "missing_target":
+                setup.registry[ENTITY] = old_target
+            elif scenario in {"unavailable", "missing_readback"}:
+                setup.states[ENTITY] = limit_state(readback=setup.clock["now"].timestamp())
+            advance_clock(setup)
+            await owner._async_retry_export_limit()
+            assert len(setup.calls) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    ("disable_planner", "export_limit_retry_interrupted"),
+    ("disarm", "export_limit_retry_interrupted"),
+    ("disable_enphase", "export_limit_upstream_controls_disabled"),
+    ("external", "external_export_limit_changed"),
+    ("reload_enphase", "export_limit_target_changed"),
+    ("reload_enphase_unavailable", "export_limit_target_changed"),
+    ("tariff_changed", "export_tariff_changed"),
+    ("tariff_expired", "export_tariff_expired"),
+    ("upstream_pending", "export_limit_pending"),
+    ("readback_regressed", "export_limit_retry_readback_changed"),
+])
+def test_export_retry_rechecks_stop_and_feedback_after_dispatch_reservation(setup, retry_owner, change, reason):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        deferred = {"tariff_changed", "tariff_expired", "external", "reload_enphase", "reload_enphase_unavailable"}
+        if change in deferred:
+            setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        advance_clock(setup)
+        setup.mode["value"] = "confirm"
+        flush = setup.store.async_flush
+
+        async def flush_with_change():
+            await flush()
+            if not setup.control.state.get("pending"):
+                return
+            if change == "disable_planner":
+                owner.entry.options[CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED] = False
+            elif change == "disarm":
+                setup.store.data["production"]["armed"] = False
+            elif change == "disable_enphase":
+                retry_owner.upstream.enabled = False
+            elif change in {"reload_enphase", "reload_enphase_unavailable"}:
+                retry_owner.entry.state = ConfigEntryState.NOT_LOADED
+                if change == "reload_enphase_unavailable":
+                    setup.states[ENTITY].state = "unavailable"
+            elif change == "tariff_changed":
+                setup.states["sensor.export_price"] = price_state((-0.2, -0.1))
+            elif change == "tariff_expired":
+                advance_clock(setup, 900)
+            elif change == "upstream_pending":
+                retry_owner.upstream.pending = {"watts": 5000}
+            elif change == "readback_regressed":
+                setup.states[ENTITY].attributes["last_successful_readback"] = NOW.timestamp()
+            else:
+                setup.states[ENTITY] = limit_state(5000, readback=setup.clock["now"].timestamp())
+
+        setup.store.async_flush = flush_with_change
+        await owner._async_retry_export_limit()
+        assert len(setup.calls) == 1
+        assert setup.control.state["retry"]["reason"] == reason
+        assert not setup.control.state.get("pending")
+        assert setup.control.cooldown(setup.clock["now"])["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert action_budget(budget_history(setup.store.data), {}, setup.clock["now"], EXPORT_ASSET)["used"] == 1
+        if change in deferred:
+            assert setup.control.state["retry"]["attempts"] == 2
+            assert setup.control.state["retry"]["state"] == "scheduled"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("startup_ready", [False, True])
+def test_retry_does_not_charge_a_competing_provider_request(setup, retry_owner, startup_ready):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owned = setup.control.state
+        owned["retry"]["attempts"] = 3 if startup_ready else 2
+        if startup_ready:
+            owned["retry"].update(state="ready", next_attempt_at=None)
+            owned.pop("pause")
+        await setup.control.save(owned)
+        retry_owner.upstream.async_apply_guarded.side_effect = installer_rejection("export_limit_pending")
+        await owner._async_retry_export_limit()
+
+        state = setup.control.state
+        assert not state.get("pending")
+        assert state["retry"]["attempts"] == (3 if startup_ready else 2)
+        assert state["retry"]["state"] == ("ready" if startup_ready else "scheduled")
+        assert state["retry"]["reason"] == "export_limit_pending"
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_export_retry_leaves_legacy_pauses_and_reconciles_new_terminal_feedback(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        await owner._async_reconcile_export_limit_locked()
+        timer = retry_owner.timers[-1]
+        original = setup.control.state
+        await setup.control.save({key: value for key, value in original.items() if key != "retry"})
+        owner._schedule_export_retry()
+        timer.cancel.assert_called_once()
+        assert owner._export_retry_at is None
+        now = advance_clock(setup)
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_not_called()
+        await setup.control.save(original)
+        claim = await setup.control.claim_retry(now)
+        setup.states[ENTITY].state = "unsupported"
+        assert (await setup.control.execute(action_before, now, retry=claim))[1] == "export_limit_unsupported"
+        await setup.control.finish_retry(claim, None)
+        assert setup.control.state["retry"]["state"] == "operator_required"
+        assert setup.control.state["pause"] == "export_limit_unsupported"
+        assert len(setup.calls) == 1
+
+    action_before = action(setup)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["pause", "disarm", "pending"])
+def test_retry_rechecks_admission_after_persisting_claim(setup, retry_owner, change):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        now = advance_clock(setup)
+        flush = setup.store.async_flush
+
+        async def change_during_flush():
+            await flush()
+            if setup.control.state["retry"]["state"] == "checking":
+                if change == "pending":
+                    setup.states[ENTITY] = limit_state(pending=True, readback=now.timestamp())
+                elif change == "disarm":
+                    setup.store.data["production"]["armed"] = False
+                else:
+                    await owner.async_pause_control(15, "operator", asset=EXPORT_ASSET)
+
+        setup.store.async_flush = change_during_flush
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_not_awaited()
+        retry = setup.control.state["retry"]
+        assert retry["state"] == "scheduled"
+        assert retry["attempts"] == 2
+        expected_reason = "export_limit_pending" if change == "pending" else "export_limit_retry_interrupted"
+        assert retry["reason"] == expected_reason
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_retry_refunds_final_check_when_runtime_reloads_during_reconciliation(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        advance_clock(setup)
+        save_ownership = setup.store.async_save_ownership
+        prepare = retry_owner.prepare
+
+        async def prepare_with_external_change():
+            # Reconciliation adopts this new baseline and persists it.
+            setup.states[ENTITY] = limit_state(5000)
+            return await prepare()
+
+        async def reload_during_adoption(ownership):
+            await save_ownership(ownership)
+            if ownership[EXPORT_ASSET].get("expected", {}).get("watts") == 5000:
+                retry_owner.entry.state = ConfigEntryState.NOT_LOADED
+                setup.states[ENTITY].state = "unavailable"
+
+        retry_owner.upstream.async_prepare.side_effect = prepare_with_external_change
+        setup.store.async_save_ownership = reload_during_adoption
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+        retry_owner.upstream.async_apply_guarded.assert_not_called()
+        assert setup.control.state["retry"]["attempts"] == 2
+        assert setup.control.state["retry"]["reason"] == "export_limit_target_changed"
+
+    asyncio.run(run())
+
+
+def test_unsupported_replacement_feedback_does_not_pause_owned_gateway(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        original = setup.control.state
+        setup.registry[ENTITY].device_id = "replacement"
+        setup.states[ENTITY].state = "unsupported"
+        await owner._async_reconcile_export_limit_locked()
+        assert setup.control.state == original
+
+        setup.registry[ENTITY].device_id = original["identity"]["device_id"]
+        setup.states[ENTITY] = limit_state(readback=now.timestamp())
+        setup.mode["value"] = "confirm"
+        await owner._async_retry_export_limit()
+        assert len(setup.calls) == 2
+        assert "retry" not in setup.control.state
+
+    asyncio.run(run())
+
+
+def test_unsupported_feedback_retires_startup_retry_readiness(setup, retry_owner):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owner._startup_auto_recovery_authorized = True
+        setup.store.data["production"]["armed"] = False
+        await owner._async_retry_export_limit()
+        assert export_limit_status(owner)["retry"]["state"] == "ready"
+
+        setup.states[ENTITY].state = "unsupported"
+        assert await setup.control.reconcile(now) == "export_limit_unsupported"
+        status = export_limit_status(owner)
+        assert status["retry"]["state"] == "operator_required"
+        assert status["retry"]["reason"] == "export_limit_unsupported"
+        assert status["retry"]["attempts"] == 1
+        assert status["retry"]["next_attempt_at"] is None
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_retry_waits_five_minutes_after_a_slow_failed_probe(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        advance_clock(setup)
+        flush = setup.store.async_flush
+
+        async def slow_flush():
+            await flush()
+            if setup.control.state["retry"]["state"] == "checking":
+                advance_clock(setup, 240)
+
+        setup.store.async_flush = slow_flush
+
+        async def failed_probe():
+            advance_clock(setup, 25)
+            raise TimeoutError
+
+        retry_owner.upstream.async_prepare.side_effect = failed_probe
+        await owner._async_retry_export_limit()
+        failed_at = setup.clock["now"]
+        owner._schedule_export_retry()
+        assert retry_owner.timers[-1].delay == 300
+        assert setup.control.state["retry"]["next_attempt_at"] == (failed_at + timedelta(minutes=5)).isoformat()
+        advance_clock(setup, 299)
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_export_retry_does_not_outlive_an_unrecorded_action_attempt(setup, retry_owner):
+    async def run():
+        options = {CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: 1}
+        owner = retry_owner.create(options)
+        saved = None
+        save = setup.store.async_save_ownership
+
+        async def capture_first_saved_retry(ownership):
+            nonlocal saved
+            await save(ownership)
+            if saved is None and ownership.get(EXPORT_ASSET, {}).get("retry"):
+                saved = deepcopy(setup.store.data)
+
+        setup.store.async_save_ownership = capture_first_saved_retry
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        assert saved is not None
+        setup.store.data = saved
+        owner = retry_owner.create(options)
+        advance_clock(setup)
+        setup.mode["value"] = "confirm"
+        await owner._async_retry_export_limit()
+        assert len(setup.calls) == 1
+        retry_owner.upstream.async_prepare.assert_not_called()
+        assert owner._export_retry_control().retry_deadline(setup.clock["now"]) == NOW + timedelta(hours=24)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("accepted", [True, False, None])
+def test_export_retry_accounting_survives_every_durable_dispatch_generation(setup, retry_owner, monkeypatch, accepted):
+    from custom_components.ha_energy_planner import storage
+
+    snapshots = []
+
+    class Disk:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_save(self, data):
+            snapshots.append(deepcopy(data))
+
+        async def async_load(self):
+            return snapshots[-1]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return setup.clock["now"]
+
+    monkeypatch.setattr(storage, "datetime", Clock)
+    monkeypatch.setattr(storage, "Store", Disk)
+
+    async def run():
+        owner = retry_owner.create({CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: 2})
+        store = storage.PlannerStore(setup.hass)
+        store.data["production"] = setup.store.data["production"]
+        owner.store = owner.executor.store = store
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        setup.mode["value"] = "confirm" if accepted else "temporary"
+        if accepted is None:
+            state = owner.store.data["ownership"][EXPORT_ASSET]
+            state["retry"] = {**state["retry"], "attempts": 2}
+        snapshot_at_dispatch = None
+        apply = retry_owner.upstream.async_apply_guarded.side_effect
+
+        async def capture_dispatch(*args, **kwargs):
+            nonlocal snapshot_at_dispatch
+            snapshot_at_dispatch = snapshots[-1]
+            assert snapshot_at_dispatch["ownership"][EXPORT_ASSET]["pending"]["attempt_recorded"] is False
+            setup.store.flushes = 1
+            if accepted is None:
+                raise TimeoutError
+            return await apply(*args, **kwargs)
+
+        retry_owner.upstream.async_apply_guarded.side_effect = capture_dispatch
+        await owner._async_retry_export_limit()
+        assert snapshot_at_dispatch is not None
+        dispatch_index = snapshots.index(snapshot_at_dispatch)
+        for saved in snapshots:
+            owned = saved.get("ownership", {}).get(EXPORT_ASSET, {})
+            if owned.get("pending"):
+                assert not any(
+                    row.get("attempted_at") == now.isoformat()
+                    and row.get("reason") == runtime.UNAVAILABLE_REJECTION
+                    for row in budget_history(saved)
+                )
+        if accepted is None:
+            rolled_back = snapshots[dispatch_index + 1]
+            owned = rolled_back["ownership"][EXPORT_ASSET]
+            assert "pending" not in owned
+            assert owned["retry"]["attempts"] == 2
+            assert owned["retry"]["state"] == "scheduled"
+            assert action_budget(budget_history(rolled_back), owner.options, now, EXPORT_ASSET)["used"] == 1
+            return
+        assert action_budget(budget_history(snapshots[-1]), owner.options, now, EXPORT_ASSET)["used"] == 2
+        if not accepted:
+            assert not snapshots[-1]["ownership"][EXPORT_ASSET].get("pending")
+            return
+
+        snapshots.append(snapshot_at_dispatch)
+        restarted = storage.PlannerStore(setup.hass)
+        await restarted.async_load()
+        restarted_control = runtime.ExportLimitControl(setup.hass, restarted, DATA, options=owner.options)
+        assert restarted_control.state["pending"]["attempt_recorded"] is False
+        assert await restarted_control.reconcile(now) is None
+        assert await restarted_control.reconcile(now) is None
+        assert action_budget(budget_history(restarted.data), owner.options, now, EXPORT_ASSET)["used"] == 2
+        assert restarted_control.state["expected"]["watts"] == 0
+
+    asyncio.run(run())
+
+
+def test_unsent_final_retry_rolls_back_timing_and_attempt_in_one_generation(setup, retry_owner, monkeypatch):
+    from custom_components.ha_energy_planner import storage
+
+    snapshots = []
+    fail_after_denial = False
+
+    class Disk:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_save(self, data):
+            snapshot = deepcopy(data)
+            snapshots.append(snapshot)
+            if fail_after_denial:
+                # A backend can fail after writing a generation. Restart from
+                # that generation and check the first durable rollback is complete.
+                raise OSError("simulated failure after saving rollback")
+
+        async def async_load(self):
+            return deepcopy(snapshots[-1])
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return setup.clock["now"]
+
+    monkeypatch.setattr(storage, "Store", Disk)
+    monkeypatch.setattr(storage, "datetime", Clock)
+
+    async def run():
+        nonlocal fail_after_denial
+        owner = retry_owner.create()
+        store = storage.PlannerStore(setup.hass)
+        store.data["production"] = setup.store.data["production"]
+        owner.store = owner.executor.store = store
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        control = runtime.ExportLimitControl(setup.hass, store, DATA, options=owner.options)
+        state = control.state
+        state["retry"] = {**state["retry"], "attempts": 2}
+        await control.save(state)
+        now = advance_clock(setup)
+
+        async def reject(*args, **kwargs):
+            nonlocal fail_after_denial
+            assert snapshots[-1]["ownership"][EXPORT_ASSET]["retry"]["attempts"] == 3
+            fail_after_denial = True
+            raise runtime.RetryWriteDeferred("export_tariff_changed")
+
+        retry_owner.upstream.async_apply_guarded.side_effect = reject
+        with pytest.raises(OSError, match="saving rollback"):
+            await owner._async_retry_export_limit()
+        fail_after_denial = False
+        restarted = storage.PlannerStore(setup.hass)
+        await restarted.async_load()
+        restored = runtime.ExportLimitControl(setup.hass, restarted, DATA, options=owner.options)
+        assert "pending" not in restored.state
+        assert restored.state["retry"]["state"] == "scheduled"
+        assert restored.state["retry"]["attempts"] == 2
+        assert restored.retry_deadline(now) == now + runtime.RETRY_INTERVAL
+        assert restored.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert action_budget(budget_history(restarted.data), {}, now, EXPORT_ASSET)["used"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stage", ["reservation_failure", "reservation_cancel", "claim_cancel", "ordinary_cancel"])
+def test_reservation_save_requires_acknowledgement_and_drains_on_cancel(
+    setup, retry_owner, monkeypatch, tmp_path, stage,
+):
+    import json
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from homeassistant.core import HomeAssistant
+    from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.helpers.storage import Store as HAStore
+    from homeassistant.util.file import WriteError
+
+    from custom_components.ha_energy_planner import storage
+
+    snapshots = []
+    write_data = HAStore._async_write_data
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return setup.clock["now"]
+
+    monkeypatch.setattr(storage, "datetime", Clock)
+
+    async def run():
+        owner = retry_owner.create()
+        hass = HomeAssistant(str(tmp_path))
+        store = storage.PlannerStore(hass, "export-retry")
+        store.data["production"] = setup.store.data["production"]
+        owner.store = owner.executor.store = store
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def intercept(backend, envelope):
+            owned = envelope["data"]["ownership"].get(EXPORT_ASSET, {})
+            saving_claim = owned.get("retry", {}).get("state") == "checking"
+            interrupt_save = saving_claim if stage == "claim_cancel" else bool(owned.get("pending"))
+            if interrupt_save:
+                if stage == "reservation_failure":
+                    raise WriteError("simulated file write failure")
+                entered.set()
+                await release.wait()
+            await write_data(backend, envelope)
+            snapshots.append(deepcopy(envelope["data"]))
+
+        try:
+            ordinary = stage == "ordinary_cancel"
+            if ordinary:
+                now = NOW
+                operation = owner.executor.async_execute_export_limit(action(setup), now)
+            else:
+                await owner.executor.async_execute_export_limit(action(setup), NOW)
+                store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+                now = advance_clock(setup)
+                operation = owner._async_retry_export_limit()
+            async with store.async_delay_save():
+                with patch.object(HAStore, "_async_write_data", intercept):
+                    if stage == "reservation_failure":
+                        with pytest.raises(HomeAssistantError, match="storage_write_failed"):
+                            await operation
+                    else:
+                        task = asyncio.create_task(operation)
+                        await asyncio.wait_for(entered.wait(), 1)
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        assert not task.done()
+                        release.set()
+                        with pytest.raises(asyncio.CancelledError):
+                            await task
+                        reserved = snapshots[-2]["ownership"][EXPORT_ASSET]
+                        if stage == "claim_cancel":
+                            assert reserved["retry"]["attempts"] == 3
+                            assert "pending" not in reserved
+                        else:
+                            assert reserved["pending"]["sent_at"] == now.timestamp()
+                retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+                assert len(setup.calls) == (0 if ordinary else 1)
+                rolled_back = json.loads(Path(store._store.path).read_text())["data"]
+                assert rolled_back == snapshots[-1]
+                owned = rolled_back["ownership"].get(EXPORT_ASSET, {})
+                assert "pending" not in owned
+                identity = runtime.target_identity(setup.hass, ENTITY)
+                timing = rolled_back["command_rate_limits"][runtime.control_key(identity)]
+                if ordinary:
+                    assert not owned
+                    assert timing["attempted_at"] is None
+                else:
+                    assert owned["retry"]["state"] == "scheduled"
+                    assert owned["retry"]["attempts"] == 2
+                    assert timing["attempted_at"] == NOW.timestamp()
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_guarded_attempt_uses_send_time_for_daily_expiry(setup, retry_owner, accepted):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        reserved_at = advance_clock(setup)
+        setup.mode["value"] = "confirm" if accepted else "temporary"
+        apply = retry_owner.upstream.async_apply_guarded.side_effect
+
+        async def send_after_connection(*args, **kwargs):
+            advance_clock(setup, 25)
+            return await apply(*args, **kwargs)
+
+        retry_owner.upstream.async_apply_guarded.side_effect = send_after_connection
+        await owner._async_retry_export_limit()
+        sent_at = setup.clock["now"]
+        assert len(setup.calls) == 2
+        assert setup.control.cooldown(sent_at)["last_dispatch_reserved_at"] == sent_at.timestamp()
+        history = budget_history(setup.store.data)
+        cap = {CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: 1}
+        assert action_budget(history, cap, reserved_at + timedelta(days=1), EXPORT_ASSET)["remaining"] == 0
+        assert action_budget(history, cap, sent_at + timedelta(days=1), EXPORT_ASSET)["remaining"] == 1
+
+    asyncio.run(run())
+
+
+def test_external_change_matching_tariff_settles_retry_during_reservation(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        flush = setup.store.async_flush
+
+        async def confirm_external_change():
+            await flush()
+            if setup.control.state.get("pending"):
+                setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+
+        setup.store.async_flush = confirm_external_change
+        await owner._async_retry_export_limit()
+        assert setup.control.state["expected"] == {"watts": 0, "slew_rate": 100.0}
+        assert not ({"retry", "pause", "pending", "baseline"} & setup.control.state.keys())
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert len(setup.calls) == 1
+        retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("matches_tariff,gateway", [(True, GATEWAY), (False, GATEWAY), (True, "b" * 64), (True, None)])
+def test_retry_provider_rejects_external_change_after_local_dispatch_guard(setup, retry_owner, matches_tariff, gateway):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        now = advance_clock(setup)
+        setup.mode["value"] = "confirm"
+        provider = retry_owner.upstream
+        waiting = asyncio.Event()
+        lock = asyncio.Lock()
+
+        async def apply(watts, *, expected, before_write):
+            waiting.set()
+            async with lock:
+                assert watts == 0 and not expected.enabled
+                assert setup.states[ENTITY].attributes["confirmed_watts"] == (0 if matches_tariff else 5000)
+                raise installer_rejection("export_limit_changed")
+
+        provider.async_apply_guarded.side_effect = apply
+        async with lock:
+            task = asyncio.create_task(owner._async_retry_export_limit())
+            await asyncio.wait_for(waiting.wait(), 1)
+            setup.states[ENTITY] = limit_state(0 if matches_tariff else 5000, readback=now.timestamp())
+            setup.states[ENTITY].attributes["gateway_identity"] = gateway
+        await task
+        assert len(setup.calls) == 1
+        assert not setup.control.state.get("pending")
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == NOW.timestamp()
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+        if gateway != GATEWAY:
+            issue = runtime.GATEWAY_CHANGED if gateway else runtime.GATEWAY_UNVERIFIED
+            assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+            assert setup.control.state["gateway_identity"] == GATEWAY
+            assert setup.control.state["pause"] == issue
+            assert setup.control.state["retry"]["state"] == "operator_required"
+            assert setup.control.state["retry"]["attempts"] == 2
+        elif matches_tariff:
+            assert "retry" not in setup.control.state and "pause" not in setup.control.state
+            assert "baseline" not in setup.control.state
+        else:
+            assert setup.control.state["retry"]["attempts"] == 2
+            assert setup.control.state["retry"]["state"] == "scheduled"
+
+    asyncio.run(run())
+
+
+def test_already_desired_retry_settles_after_external_baseline_is_adopted(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        claim = await setup.control.claim_retry(now)
+        setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+        await setup.control.reconcile(now)
+        assert setup.control.state["expected"]["watts"] == 0
+        assert setup.control.state["retry"] == claim
+        await setup.control.finish_unsent_retry(claim, "export_limit_already_desired", now.timestamp())
+        assert "retry" not in setup.control.state
+        assert "pause" not in setup.control.state
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_legacy_feedback_supports_normal_writes_without_binding_a_retry(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        setup.states[ENTITY].attributes.pop("gateway_identity")
+        assert (await owner.executor.async_execute_export_limit(action(setup), NOW))[2]
+        now = advance_clock(setup)
+        setup.states[ENTITY] = limit_state(3000, readback=now.timestamp())
+        setup.states[ENTITY].attributes.pop("gateway_identity")
+        await setup.control.reconcile(now)
+        assert "gateway_identity" not in setup.control.state
+        assert "baseline" not in setup.control.state
+        retry_owner.upstream.async_prepare.return_value = SimpleNamespace(
+            supported=True, enabled=True, watts=3000, slew=100,
+        )
+        retry_owner.upstream.async_prepare.side_effect = None
+        await owner._async_retry_export_limit()
+        assert setup.control.state["pause"] == runtime.GATEWAY_UNVERIFIED
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_startup_retry_rechecks_the_loaded_provider_after_arming(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owner._startup_auto_recovery_authorized = True
+        setup.store.data["production"]["armed"] = False
+        await owner._async_retry_export_limit()
+        assert setup.control.state["retry"]["state"] == "ready"
+        old = retry_owner.upstream
+        replacement = SimpleNamespace(
+            enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
+            async_apply_guarded=AsyncMock(side_effect=old.async_apply_guarded.side_effect),
+            verifies_export_limit_gateway=True,
+        )
+        retry_owner.entry.runtime_data.coordinator.export_limit_runtime = replacement
+        setup.mode["value"] = "confirm"
+        setup.store.data["production"]["armed"] = True
+        assert (await owner.executor.async_execute_export_limit(action(setup), now))[1] == (
+            "export_limit_retry_recheck_required"
+        )
+        replacement.async_apply_guarded.assert_not_called()
+        owner._startup_auto_recovery_authorized = False
+        await owner._async_retry_export_limit()
+        old.async_apply_guarded.assert_not_called()
+        replacement.async_prepare.assert_awaited_once()
+        replacement.async_apply_guarded.assert_awaited_once()
+        assert len(setup.calls) == 2 and "retry" not in setup.control.state
+
+    asyncio.run(run())
+
+
+def test_probe_finishing_during_startup_activation_waits_for_final_preflight(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owner._startup_auto_recovery_authorized = True
+        setup.store.data["production"]["armed"] = False
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def prepare():
+            entered.set()
+            await release.wait()
+            return await retry_owner.prepare()
+
+        retry_owner.upstream.async_prepare.side_effect = prepare
+        task = asyncio.create_task(owner._async_retry_export_limit())
+        await asyncio.wait_for(entered.wait(), 1)
+        await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        release.set()
+        await task
+        retry_owner.upstream.async_apply_guarded.assert_not_called()
+        saved = setup.control.state["retry"]
+        assert saved["state"] == "ready" and saved["attempts"] == 1
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+
+        # Finishing startup makes the held write eligible on the same attempt.
+        await owner._async_update_startup_auto_recovery("recovered", successful_runs=1, reason="test", completed=True)
+        owner._export_startup_activation_pending = False
+        owner._schedule_export_retry()
+        setup.mode["value"] = "confirm"
+        retry_owner.timers[-1].wake(now)
+        await asyncio.gather(*owner._listener_tasks)
+        retry_owner.upstream.async_apply_guarded.assert_awaited_once()
+        assert setup.control.state["expected"]["watts"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["unrelated", "different_target", "disabled", "exhausted"])
+def test_configuration_reload_preserves_only_same_enabled_export_retry(setup, retry_owner, change):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        if change == "exhausted":
+            terminal = setup.control.state
+            terminal["pause"] = "export_limit_retry_exhausted"
+            terminal["retry"].update(state="operator_required", attempts=3, next_attempt_at=None)
+            await setup.control.save(terminal)
+        saved = setup.control.state
+        owner._startup_auto_recovery_authorized = True
+        owner.entry.data = {**DATA, "household_load_entity": "sensor.replacement_load"}
+        if change == "different_target":
+            owner.entry.data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "sensor.different_export_limit"
+        elif change == "disabled":
+            owner.entry.options[CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED] = False
+        await owner.async_prepare_configuration_reload()
+        assert owner._configuration_reload_handoff
+        assert not owner.active_control
+        assert len([call for call in setup.calls if call[0] == "enphase_ev"]) == 1
+        if change in {"different_target", "disabled"}:
+            assert not setup.control.state
+            return
+        assert setup.control.state == saved
+        setup.store.data = deepcopy(setup.store.data)
+        restarted = retry_owner.create()
+        assert await restarted.async_reconcile_production_evidence_contract()
+        assert setup.control.state["retry"] == saved["retry"]
+        assert restarted._startup_auto_recovery_authorized
+        if change == "exhausted":
+            await restarted.async_restore_safe_state("startup_auto_recovery_replan_failed", refresh=False)
+            assert setup.control.state == saved
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_startup", [False, True])
+def test_provisional_startup_blocks_ordinary_export_after_noop_probe(setup, retry_owner, monkeypatch, cancel_startup):
+    from custom_components.ha_energy_planner import startup_recovery
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owner._startup_auto_recovery_authorized = True
+        setup.store.data["production"]["armed"] = False
+        owner.async_restore_safe_state = AsyncMock()
+        owner._async_compensate_ev_auto_start = AsyncMock()
+        report = {"safe_to_activate_now": True, "active_control_ready": True}
+        monkeypatch.setattr(startup_recovery, "build_preflight_report", lambda *_: report)
+        monkeypatch.setattr(startup_recovery, "_startup_auto_recovery_validation_ready", lambda *_: (True, "ready"))
+        entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def activation_refresh(_trigger):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+
+        owner._async_refresh_with_export_preflight = activation_refresh
+        startup = asyncio.create_task(owner._async_reactivate_after_startup_recovery(1))
+        owner._startup_auto_recovery_task = startup
+        await asyncio.wait_for(entered.wait(), 1)
+        setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+        await owner._async_retry_export_limit()
+        assert "retry" not in setup.control.state
+
+        cancellation = None
+        if cancel_startup:
+            cancellation = asyncio.create_task(owner.async_operator_disarm_production_control())
+            await asyncio.wait_for(cancelled.wait(), 1)
+            assert not owner.active_control
+        tariff = price_state((0.1, 0.1))
+        tariff.last_updated = now
+        setup.states[DATA[CONF_AMBER_EXPORT_PRICE]] = tariff
+        setup.mode["value"] = "confirm"
+        result = await owner.executor.async_execute_export_limit(action(setup), now)
+        assert result[1:] == ("export_limit_retry_interrupted", False)
+        assert len([call for call in setup.calls if call[0] == "enphase_ev"]) == 1
+        release.set()
+        if cancellation is not None:
+            await cancellation
+            assert await startup == (False, "startup_recovery_cancelled")
+            assert not owner.active_control
+        else:
+            assert (await startup)[0]
+        if cancel_startup:
+            await owner.async_arm_production_control("operator")
+        assert not owner._export_write_blocked()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("persisted", ["provisional", "legacy", "recovered", "disabled"])
+def test_restart_reconciles_provisional_export_arm_before_first_plan(setup, retry_owner, persisted):
+    async def run():
+        old_owner = retry_owner.create()
+        await old_owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+        await old_owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        if persisted == "legacy":
+            setup.store.data["production"].pop("startup_activation_pending")
+        elif persisted == "recovered":
+            await old_owner._async_update_startup_auto_recovery(
+                "recovered", successful_runs=1, reason="validated", completed=True,
+            )
+        setup.store.data = deepcopy(setup.store.data)
+        restarted = retry_owner.create({CONF_DRY_RUN: persisted == "disabled"})
+        assert restarted._export_write_blocked() == (persisted in {"provisional", "disabled"})
+        assert await restarted.async_reconcile_production_evidence_contract()
+        assert getattr(restarted, "_startup_auto_recovery_authorized", False) == (persisted != "disabled")
+        assert restarted.active_control == (persisted == "recovered")
+        setup.mode["value"] = "confirm"
+        _, _, sent = await restarted.executor.async_execute_export_limit(action(setup), NOW)
+        assert sent == (persisted == "recovered")
+        assert len(setup.calls) == int(persisted == "recovered")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_operator_disarm_revokes_armed_grace_while_startup_task_drains(setup, retry_owner, tmp_path, cleanup_fails):
+    from homeassistant.core import HomeAssistant
+
+    from custom_components.ha_energy_planner.storage import PlannerStore
+
+    async def run():
+        owner = retry_owner.create()
+        hass = HomeAssistant(str(tmp_path))
+        owner.store = owner.executor.store = PlannerStore(hass, "operator-disarm")
+        await owner.store.async_save_production(setup.store.data["production"])
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owner._startup_auto_recovery_authorized = True
+        owner._export_retry_startup_blocked = True
+        await owner._async_update_startup_auto_recovery("grace", successful_runs=0, reason="starting")
+        entered, draining, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def grace():
+            async with owner._command_lock:
+                entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    draining.set()
+                    await release.wait()
+                    if cleanup_fails:
+                        raise RuntimeError("startup cleanup failed")
+
+        owner._async_complete_startup_grace = grace
+        owner._startup_auto_recovery_task = asyncio.create_task(owner._async_run_startup_auto_recovery())
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            async with owner.store.async_delay_save():
+                disarm = asyncio.create_task(owner.async_operator_disarm_production_control())
+                try:
+                    await asyncio.wait_for(draining.wait(), 1)
+                    assert not disarm.done()
+                    assert not owner.active_control
+                    # Wait for the checked Store barrier to complete while the
+                    # unrelated batch and the startup task are still open.
+                    async with owner.store._save_lock:
+                        restarted = PlannerStore(hass, "operator-disarm")
+                        await restarted.async_load()
+                    production = restarted.data["production"]
+                    assert production["armed"] is False
+                    assert production["startup_auto_recovery"]["last_reason"] == "operator_disarmed"
+                    setup.mode["value"] = "confirm"
+                    assert owner._export_retry_control() is None
+                    assert not (await owner.executor.async_execute_export_limit(action(setup), now))[2]
+                    retry_owner.upstream.async_prepare.assert_not_awaited()
+                    assert len(setup.calls) == 1
+                finally:
+                    release.set()
+                    await disarm
+            assert owner._startup_auto_recovery_task is None
+            assert not owner.active_control
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stage", ["grace", "unsafe_restore", "validation", "restore", "evidence_save", "reactivation"])
+def test_operator_cancellation_cannot_be_overwritten_by_startup_progress(setup, retry_owner, monkeypatch, stage):
+    from custom_components.ha_energy_planner import startup_recovery
+
+    async def run():
+        owner = retry_owner.create()
+        owner._startup_auto_recovery_authorized = True
+        owner._startup_auto_recovery_deadline = 0
+        setup.store.data["production"]["armed"] = stage in {"grace", "unsafe_restore"}
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def drain():
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def validation():
+            await drain()
+            return stage == "grace", "validation_completed_after_cancel"
+
+        async def reactivation(_runs):
+            await drain()
+            return False, "activation_failed_after_cancel"
+
+        if stage in {"grace", "validation"}:
+            owner._async_run_startup_auto_recovery_validation = validation
+        elif stage == "unsafe_restore":
+            owner._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(False, "unsafe"))
+        else:
+            owner._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(True, "ready"))
+        if stage in {"restore", "unsafe_restore"}:
+            async def restore(*args, **kwargs):
+                await drain()
+                return None
+            owner.async_restore_safe_state = restore
+        elif stage == "evidence_save":
+            save = owner._async_save_production
+            restoring_saved = False
+
+            async def persist(production):
+                nonlocal restoring_saved
+                await save(production)
+                if production.get("startup_auto_recovery", {}).get("status") == "restoring":
+                    if restoring_saved:
+                        await drain()
+                    restoring_saved = True
+
+            owner.async_restore_safe_state = AsyncMock(return_value=None)
+            owner._async_save_production = persist
+        elif stage == "reactivation":
+            owner._async_reactivate_after_startup_recovery = reactivation
+        monkeypatch.setattr(startup_recovery, "_wait_for_load_recovery", AsyncMock())
+        owner._startup_auto_recovery_task = asyncio.create_task(owner._async_run_startup_auto_recovery())
+        await asyncio.wait_for(entered.wait(), 1)
+        disarm = asyncio.create_task(owner.async_operator_disarm_production_control())
+        await asyncio.sleep(0)
+        assert not owner.active_control
+        release.set()
+        await disarm
+        assert setup.store.data["production"]["startup_auto_recovery"]["last_reason"] == "operator_disarmed"
+        restarted = retry_owner.create()
+        await restarted.async_reconcile_production_evidence_contract()
+        assert not restarted.active_control
+        assert not getattr(restarted, "_startup_auto_recovery_authorized", False)
+        assert not any(call[0] == "enphase_ev" for call in setup.calls)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stage", ["cancel", "replan", "evidence_save", "handoff_save"])
+def test_option_handoff_preserves_concurrent_operator_disarm(setup, retry_owner, stage):
+    from custom_components.ha_energy_planner.const import CONF_EV_CONTROL_ENABLED
+
+    async def run():
+        owner = retry_owner.create({CONF_EV_CONTROL_ENABLED: True})
+        owner._startup_auto_recovery_authorized = True
+        await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+        await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        owner.async_start_startup_auto_recovery = Mock()
+        entered, draining, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def startup():
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    draining.set()
+
+        if stage == "cancel":
+            owner._startup_auto_recovery_task = asyncio.create_task(startup())
+            await asyncio.wait_for(entered.wait(), 1)
+        elif stage == "replan":
+            async def replan():
+                draining.set()
+                await release.wait()
+
+            owner.async_request_replan = replan
+        else:
+            save = owner._async_save_production
+            if stage == "evidence_save":
+                # Force the device-only handoff to refresh its saved evidence.
+                setup.store.data["production"]["dry_run_evidence_fingerprint"] = "previous-contract"
+            if stage == "handoff_save":
+                # Only a settled arm saves the final handoff after replanning.
+                setup.store.data["production"].pop("startup_activation_pending")
+                owner._export_startup_activation_pending = False
+
+            async def persist(production):
+                await save(production)
+                reason = production.get("startup_auto_recovery", {}).get("last_reason")
+                is_new_evidence = (
+                    reason == "startup_safe_recovery_pending"
+                    and production.get("dry_run_evidence_fingerprint") != "previous-contract"
+                )
+                if (stage == "evidence_save" and is_new_evidence
+                        or stage == "handoff_save" and reason == "configuration_changed"):
+                    draining.set()
+                    await release.wait()
+
+            owner._async_save_production = persist
+        owner.entry.options[CONF_EV_CONTROL_ENABLED] = False
+        update = asyncio.create_task(owner.async_handle_options_update())
+        await asyncio.wait_for(draining.wait(), 1)
+        disarm = asyncio.create_task(owner.async_operator_disarm_production_control())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(update, disarm)
+        owner.async_start_startup_auto_recovery.assert_not_called()
+        assert setup.store.data["production"]["startup_auto_recovery"]["last_reason"] == "operator_disarmed"
+        restarted = retry_owner.create()
+        await restarted.async_reconcile_production_evidence_contract()
+        assert not restarted.active_control
+        assert not getattr(restarted, "_startup_auto_recovery_authorized", False)
+
+    asyncio.run(run())
+
+
+def test_operator_disarm_supersedes_startup_cancellation_during_restoration(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        owner._startup_auto_recovery_authorized = True
+        await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+        restoring, release = asyncio.Event(), asyncio.Event()
+
+        async def restore(*args, **kwargs):
+            restoring.set()
+            await release.wait()
+
+        owner.async_restore_safe_state = restore
+        cancel = asyncio.create_task(owner.async_cancel_startup_auto_recovery("options_changed"))
+        await asyncio.wait_for(restoring.wait(), 1)
+        await owner.async_operator_disarm_production_control()
+        release.set()
+        await cancel
+        assert setup.store.data["production"]["startup_auto_recovery"]["last_reason"] == "operator_disarmed"
+
+    asyncio.run(run())
+
+
+def test_operator_disarm_restores_export_after_one_failed_store_save(setup, retry_owner, tmp_path):
+    from unittest.mock import patch
+
+    from homeassistant.core import HomeAssistant
+    from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.helpers.storage import Store as HAStore
+    from homeassistant.util.file import WriteError
+
+    from custom_components.ha_energy_planner.storage import PlannerStore
+
+    async def run():
+        owner = retry_owner.create()
+        hass = HomeAssistant(str(tmp_path))
+        owner.store = owner.executor.store = PlannerStore(hass, "disarm-export")
+        await owner.store.async_save_production(setup.store.data["production"])
+        setup.states[ENTITY] = limit_state(3000)
+        setup.mode["value"] = "confirm"
+        write = HAStore._async_write_data
+        failed = False
+
+        async def fail_once(backend, data):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise WriteError("first disarm save failed")
+            await write(backend, data)
+
+        try:
+            setup.store.flushes = 1
+            outcome = await owner.executor.async_execute_export_limit(action(setup), NOW)
+            assert outcome[2], outcome
+            assert setup.states[ENTITY].attributes["confirmed_watts"] == 0
+            advance_clock(setup)
+            with patch.object(HAStore, "_async_write_data", fail_once), pytest.raises(HomeAssistantError):
+                await owner.async_operator_disarm_production_control()
+            restarted = PlannerStore(hass, "disarm-export")
+            await restarted.async_load()
+            assert not restarted.data["production"]["armed"]
+            assert EXPORT_ASSET not in restarted.data["ownership"]
+            assert setup.states[ENTITY].attributes["confirmed_watts"] == 3000
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+def test_restart_finishes_export_restore_interrupted_by_operator_disarm(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        setup.states[ENTITY] = limit_state(3000)
+        setup.mode["value"] = "confirm"
+        assert (await owner.executor.async_execute_export_limit(action(setup), NOW))[2]
+        advance_clock(setup)
+        await owner._async_update_startup_auto_recovery(
+            "cancelled", successful_runs=0, reason="operator_disarmed", completed=True, disarm_reason="user_requested",
+        )
+        assert not setup.control.state.get("restoring")
+        assert setup.states[ENTITY].attributes["confirmed_watts"] == 0
+
+        restarted = retry_owner.create()
+        await restarted.async_reconcile_production_evidence_contract()
+        assert setup.control.state["restoring"]
+        assert not restarted.active_control
+        assert not getattr(restarted, "_startup_auto_recovery_authorized", False)
+        await restarted._async_reconcile_export_limit()
+        assert setup.states[ENTITY].attributes["confirmed_watts"] == 3000
+        assert not setup.control.state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_operator_disarm_stays_authoritative_across_restart(setup, retry_owner, legacy):
+    async def run():
+        owner = retry_owner.create()
+        await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+        await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        if legacy:
+            await owner.async_cancel_startup_auto_recovery("operator_disarmed", restore_owned_state=False)
+            assert setup.store.data["production"]["armed"]
+        else:
+            save = setup.store.async_save_production
+
+            async def cut_power_after_first_save(value):
+                await save(value)
+                raise OSError("interrupted after save")
+
+            setup.store.async_save_production = cut_power_after_first_save
+            with pytest.raises(OSError, match="interrupted after save"):
+                await owner.async_operator_disarm_production_control()
+            setup.store.async_save_production = save
+            assert not setup.store.data["production"]["armed"]
+        assert setup.store.data["production"]["startup_auto_recovery"]["last_reason"] == "operator_disarmed"
+
+        restarted = retry_owner.create()
+        await restarted.async_reconcile_production_evidence_contract()
+        assert not restarted.active_control
+        assert not getattr(restarted, "_startup_auto_recovery_authorized", False)
+        assert not (await restarted.executor.async_execute_export_limit(action(setup), NOW))[2]
+        await restarted.async_arm_production_control()
+        rearmed = retry_owner.create()
+        await rearmed.async_reconcile_production_evidence_contract()
+        assert rearmed.active_control
+
+    asyncio.run(run())
+
+
+def test_second_restart_after_interrupted_option_change_resumes_recovery(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+        await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        await owner.async_cancel_startup_auto_recovery("options_changed", restore_owned_state=False)
+
+        restarted = retry_owner.create()
+        save = setup.store.async_save_production
+
+        async def cut_power_after_first_save(value):
+            await save(value)
+            raise OSError("second interruption")
+
+        setup.store.async_save_production = cut_power_after_first_save
+        with pytest.raises(OSError, match="second interruption"):
+            await restarted.async_reconcile_production_evidence_contract()
+        setup.store.async_save_production = save
+        assert not setup.store.data["production"]["armed"]
+        restarted = retry_owner.create()
+        assert await restarted.async_reconcile_production_evidence_contract()
+        assert restarted._startup_auto_recovery_authorized
+        assert not restarted.active_control
+
+    asyncio.run(run())
+
+
+def test_overdue_export_retry_waits_for_home_assistant_and_startup_grace(setup, retry_owner, monkeypatch):
+    from custom_components.ha_energy_planner import startup_recovery
+
+    started_callbacks = []
+    grace_entered = asyncio.Event()
+    release_grace = asyncio.Event()
+
+    def at_started(hass, callback):
+        started_callbacks.append(callback)
+        return Mock()
+
+    async def wait_for_grace(owner, delay):
+        assert delay > 0
+        grace_entered.set()
+        await release_grace.wait()
+
+    monkeypatch.setattr(startup_recovery, "async_at_started", at_started)
+    monkeypatch.setattr(startup_recovery, "_wait_for_load_recovery", wait_for_grace)
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        setup.hass.is_running = False
+        await owner._async_reconcile_export_limit_locked()
+        assert not retry_owner.timers
+        assert await owner.async_reconcile_production_evidence_contract()
+        owner.async_start_startup_auto_recovery()
+        setup.hass.is_running = True
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_not_called()
+        owner._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(True, "validation_succeeded"))
+        await started_callbacks[0](setup.hass)
+        await asyncio.wait_for(grace_entered.wait(), 1)
+        await owner._async_reconcile_export_limit_locked()
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_not_called()
+        assert not retry_owner.timers
+        release_grace.set()
+        await owner._startup_auto_recovery_task
+        wakeup, = retry_owner.timers
+        assert wakeup.delay == 0
+        setup.mode["value"] = "confirm"
+        wakeup.wake(now)
+        await asyncio.gather(*owner._listener_tasks)
+        retry_owner.upstream.async_apply_guarded.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_failed_final_retry_claim_is_not_persisted_as_an_attempt(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        advance_clock(setup)
+        setup.store.fail = True
+        await owner._async_run_export_retry()
+        retry_owner.upstream.async_prepare.assert_not_called()
+        assert setup.control.state["retry"]["attempts"] == 2
+        setup.store.fail = False
+        await owner._async_reconcile_export_limit_locked()
+        setup.store.data = deepcopy(setup.store.data)
+        restarted = retry_owner.create()
+        setup.mode["value"] = "confirm"
+        await restarted._async_retry_export_limit()
+        retry_owner.upstream.async_apply_guarded.assert_awaited_once()
+        assert setup.control.state["expected"]["watts"] == 0
+
+    asyncio.run(run())
+
+
+def test_stale_export_action_cannot_charge_the_allowance_again(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        planned = action(setup)
+        await owner.executor.async_execute_export_limit(planned, NOW)
+        result, reason, sent = await owner.executor.async_execute_export_limit(planned, NOW)
+        assert (result, reason, sent) == (OutcomeResult.REJECTED, runtime.UNAVAILABLE_REJECTION, False)
+        assert len(setup.calls) == 1
+        assert action_budget(budget_history(setup.store.data), {}, NOW, EXPORT_ASSET)["used"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+def test_export_retry_wakeup_repairs_clock_rollback_without_a_main_refresh(setup, retry_owner, limit):
+    async def run():
+        owner = retry_owner.create({CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: limit})
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        await owner._async_reconcile_export_limit_locked()
+        timer = retry_owner.timers[-1]
+        rolled_back = advance_clock(setup, -30 * 86400)
+        timer.wake(rolled_back)
+        await asyncio.gather(*owner._listener_tasks)
+        repaired = retry_owner.timers[-1]
+        assert repaired.delay == 300
+        assert setup.control.state["retry"]["attempts"] == 0
+        assert setup.control.state["retry"]["next_attempt_at"] == (rolled_back + timedelta(minutes=5)).isoformat()
+        attempts = deepcopy(budget_history(setup.store.data))
+        assert attempts[0]["attempted_at"] == rolled_back.isoformat()
+        budget = action_budget(attempts, {}, rolled_back + timedelta(hours=24), EXPORT_ASSET)
+        assert budget["used"] == 0
+        now = advance_clock(setup)
+        setup.states["sensor.export_price"] = price_state(start=now.replace(minute=0))
+        setup.states["sensor.export_price"].last_updated = now
+        setup.mode["value"] = "confirm"
+        repaired.wake(now)
+        await asyncio.gather(*owner._listener_tasks)
+        if limit:
+            assert len(setup.calls) == 1
+            assert owner._export_retry_control().retry_deadline(now) == rolled_back + timedelta(hours=24)
+            assert setup.control.state["retry"]["attempts"] == 0
+        else:
+            assert len(setup.calls) == 2
+            assert "retry" not in setup.control.state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("restore", [
+    "baseline", "different", "stale", "active", "terminal", "terminal_pending", "terminal_wrong_target",
+])
+def test_export_retry_restoration_preserves_recovery_until_settled(setup, retry_owner, restore):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        owner = retry_owner.create()
+        if restore == "different":
+            setup.states[ENTITY] = limit_state(3500)
+            await setup.control.save({
+                "identity": runtime.target_identity(setup.hass, ENTITY),
+                "gateway_identity": GATEWAY,
+                "baseline": {"watts": None, "slew_rate": 100.0},
+                "expected": {"watts": 3500, "slew_rate": 100.0},
+            })
+            await setup.control.prepare_cooldown(NOW - timedelta(minutes=5))
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = NOW
+        if restore.startswith("terminal"):
+            now = advance_clock(setup)
+            retry_owner.upstream.async_prepare.side_effect = installer_rejection("export_limit_session_expired")
+            await owner._async_retry_export_limit()
+            assert setup.control.state["pause"] == "export_limit_service_rejected:installer_session_expired"
+        if restore != "active":
+            setup.store.data["production"]["armed"] = False
+        if restore == "stale":
+            setup.states[ENTITY].attributes["last_successful_readback"] = (NOW - timedelta(hours=1)).timestamp()
+        control = runtime.ExportLimitControl(setup.hass, setup.store, DATA, options=owner.planner_options)
+        if restore in {"terminal_pending", "terminal_wrong_target"}:
+            reconcile = control.reconcile
+
+            async def change_after_reconciliation(now):
+                issue = await reconcile(now)
+                if restore == "terminal_pending":
+                    setup.states[ENTITY] = limit_state(pending=True, readback=now.timestamp())
+                else:
+                    setup.registry[ENTITY].device_id = "replaced"
+                return issue
+
+            control.reconcile = change_after_reconciliation
+        result, _, sent = await control.restore(now)
+        assert not sent
+        if restore in {"baseline", "terminal"}:
+            assert result == OutcomeResult.RESTORED
+            assert not setup.control.state
+        else:
+            assert result == OutcomeResult.PENDING
+            retry = export_limit_status(owner)["retry"]
+            assert retry["attempts"] == int(restore.startswith("terminal"))
+            assert retry["state"] == "operator_required"
+            assert retry["next_attempt_at"] is None
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_export_retry_status_shows_suspension_without_a_timer(setup, retry_owner):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        await owner._async_reconcile_export_limit_locked()
+        assert export_limit_status(owner)["retry"]["state"] == "scheduled"
+        setup.registry[ENTITY].device_id = "replacement"
+        owner._schedule_export_retry()
+        retry = export_limit_status(owner)["retry"]
+        assert retry["state"] == "suspended"
+        assert retry["next_attempt_at"] is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", ["recovery", "last_attempt_interrupted", "disk_failure", "timed_pause"])
+def test_export_retry_wakeup_persists_and_respects_cooldown(setup, retry_owner, scenario):
+    from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+
+    async def run():
+        options = {CONF_COMMAND_RATE_LIMIT_SECONDS: 600}
+        owner = retry_owner.create(options)
+        setup.states["sensor.export_price"] = price_state((-0.1, -0.2, 0.2))
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        await owner._async_reconcile_export_limit_locked()
+        first_timer = retry_owner.timers[-1]
+        assert first_timer.delay == 600
+        assert export_limit_status(owner)["retry"]["next_attempt_at"] == (NOW + timedelta(seconds=600)).isoformat()
+        owner._schedule_export_retry()
+        assert len(retry_owner.timers) == 1
+        advance_clock(setup)
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_not_called()
+        owner._begin_shutdown()
+        first_timer.cancel.assert_called_once()
+        first_timer.wake(setup.clock["now"])
+
+        # A new coordinator receives only the persisted transaction state.
+        setup.store.data = deepcopy(setup.store.data)
+        owner = retry_owner.create(options)
+        if scenario == "last_attempt_interrupted":
+            setup.store.data["ownership"][EXPORT_ASSET]["retry"].update(
+                attempts=runtime.MAX_RETRY_ATTEMPTS, state="checking",
+            )
+        elif scenario == "timed_pause":
+            await owner.async_pause_control(15, "operator", asset=EXPORT_ASSET)
+        await owner._async_reconcile_export_limit_locked()
+        timer = retry_owner.timers[-1]
+        assert timer.delay == (900 if scenario == "timed_pause" else 300)
+        assert export_limit_status(owner)["retry"]["state"] == "scheduled"
+        if scenario == "disk_failure":
+            setup.store.fail = True
+        setup.mode["value"] = "confirm"
+        now = advance_clock(setup, timer.delay)
+        timer.wake(now)
+        timer.wake(now)
+        await asyncio.gather(*owner._listener_tasks)
+        if scenario in {"disk_failure", "last_attempt_interrupted"}:
+            assert len(setup.calls) == 1
+            retry_owner.upstream.async_prepare.assert_not_called()
+            if scenario == "disk_failure":
+                assert retry_owner.timers[-1].delay >= 300
+                setup.store.fail = False
+                advance_clock(setup, -30 * 86400)
+                owner._schedule_export_retry()
+                repaired = retry_owner.timers[-1]
+                assert repaired.delay == 300
+                repaired.wake(advance_clock(setup))
+                await asyncio.gather(*owner._listener_tasks)
+                assert retry_owner.timers[-1].delay == 600
+            else:
+                assert export_limit_status(owner)["retry"]["state"] == "operator_required"
+        else:
+            assert len(setup.calls) == 2
+            retry_owner.upstream.async_prepare.assert_awaited_once()
 
     asyncio.run(run())
 
@@ -1620,7 +4565,8 @@ def test_export_recovery_ignores_unrelated_recorder_requirement(setup):
 
 
 @pytest.mark.parametrize("disabled", [EXPORT_ASSET, "enphase"])
-def test_device_toggle_during_startup_grace_preserves_other_ownership(setup, disabled):
+@pytest.mark.parametrize("provisional", [False, True])
+def test_device_toggle_during_startup_grace_preserves_other_ownership(setup, disabled, provisional):
     from unittest.mock import AsyncMock
 
     from test_coordinator import _coordinator_for_runtime_services
@@ -1636,6 +4582,8 @@ def test_device_toggle_during_startup_grace_preserves_other_ownership(setup, dis
                                          "enphase_profile": "Full Backup"}
         owner._startup_auto_recovery_authorized = True
         owner.store.data["production"]["startup_auto_recovery"] = {"status": "grace"}
+        if provisional:
+            await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
         owner.async_start_startup_auto_recovery = lambda: None
         owner.async_restore_safe_state = AsyncMock()
         setup.hass.config_entries = SimpleNamespace(
@@ -1644,7 +4592,56 @@ def test_device_toggle_during_startup_grace_preserves_other_ownership(setup, dis
         await owner.async_set_device_control(option, False)
         owner.async_restore_safe_state.assert_not_awaited()
         assert owner.executor.device_restores == [(disabled, f"{disabled}_control_disabled")]
-        assert owner.store.data["production"]["armed"]
+        assert owner.store.data["production"]["armed"] is not provisional
+        if provisional:
+            assert owner.store.data["production"]["startup_auto_recovery"]["last_reason"] == (
+                "startup_safe_recovery_pending"
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provisional", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_device_toggle_preserves_disarmed_recovery_across_restart(setup, retry_owner, provisional, interrupted):
+    from test_coordinator import FakeExecutor
+
+    from custom_components.ha_energy_planner.const import CONF_ENPHASE_CONTROL_ENABLED
+
+    async def run():
+        owner = retry_owner.create({CONF_ENPHASE_CONTROL_ENABLED: True})
+        owner.executor = FakeExecutor()
+        owner._startup_auto_recovery_authorized = True
+        if provisional:
+            await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+            await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        else:
+            await owner._async_update_startup_auto_recovery(
+                "validating", successful_runs=0, reason="validation_in_progress", disarm_reason="startup_grace_unsafe",
+            )
+        owner.entry.options[CONF_ENPHASE_CONTROL_ENABLED] = False
+
+        async def lose_power_before_restoration():
+            raise OSError("interrupted option transition")
+
+        if interrupted:
+            owner.executor.async_persist_ev_grid_reservation = lose_power_before_restoration
+            with pytest.raises(OSError, match="interrupted option transition"):
+                await owner.async_handle_options_update()
+        else:
+            owner.async_start_startup_auto_recovery = Mock()
+            await owner.async_handle_options_update()
+            owner.async_start_startup_auto_recovery.assert_called_once()
+        setup.store.data = deepcopy(setup.store.data)
+        assert setup.store.data["production"]["armed"] is False
+        assert "startup_activation_pending" not in setup.store.data["production"]
+
+        restarted = retry_owner.create({CONF_ENPHASE_CONTROL_ENABLED: False})
+        assert await restarted.async_reconcile_production_evidence_contract()
+        assert restarted._startup_auto_recovery_authorized
+        assert not restarted.active_control
+        assert not (await restarted.executor.async_execute_export_limit(action(setup), NOW))[2]
+        assert not setup.calls
 
     asyncio.run(run())
 
@@ -1683,7 +4680,7 @@ def test_unsent_restoration_remains_outstanding_after_target_race(setup, monkeyp
         async def change_target():
             await original_flush()
             if race == "unavailable":
-                setup.states.pop(ENTITY)
+                setup.states.pop(ENTITY, None)
             elif race == "replacement":
                 setup.registry[ENTITY].device_id = "replacement"
 
@@ -1824,11 +4821,12 @@ def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, 
 
 
 def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setup):
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
     from test_coordinator import _coordinator_for_runtime_services
 
     async def run():
+        setup.hass.async_create_task = asyncio.create_task
         coordinator = _coordinator_for_runtime_services(
             entry_data=DATA, options={**OPTIONS, CONF_DRY_RUN: False}, hass=setup.hass,
         )
@@ -1838,9 +4836,11 @@ def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setu
                                   "pause": "external_export_limit_conflict"})
         plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
         coordinator._async_update_data_locked = AsyncMock(return_value=plan)
+        coordinator._schedule_debounced_refresh = Mock()
         coordinator.async_request_refresh = coordinator._async_update_data
         await asyncio.wait_for(coordinator.async_resume_control(asset=EXPORT_ASSET), 1)
         await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "operator"), 1)
+        await coordinator.async_wait_for_plan_execution()
         assert coordinator.last_refresh_metadata["succeeded"] is True
         assert "pause" not in coordinator.store.data["ownership"][EXPORT_ASSET]
         assert not setup.calls
@@ -1995,5 +4995,546 @@ def test_restoration_already_at_original_baseline_does_not_fabricate_calendar_ac
             OutcomeResult.RESTORED, "export_limit_restored", False)
         assert not setup.control.state and len(setup.calls) == 2
         assert setup.store.data["calendar_history"]["history"] == history
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["confirm", "manual", "restore", "unavailable", "stale", "target", "storage"])
+def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(setup, change):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import FakeStore, _coordinator_for_runtime_services, _plan
+
+    async def run():
+        # Start with a durable pending export request, as after a reload.
+        await setup.control.execute(action(setup), NOW)
+        owner = _coordinator_for_runtime_services(entry_data=dict(DATA), options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        owner.store.async_delay_save = FakeStore().async_delay_save
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("pending"))
+        owner._schedule_debounced_refresh = Mock()
+        owner.async_update_listeners = Mock()
+        owner.executor.async_resolve_restore_notifications = AsyncMock()
+        setup.hass.async_create_task = asyncio.create_task
+        await owner._command_lock.acquire()
+        for _ in range(5):
+            await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        await asyncio.sleep(0)
+        assert not worker.done()
+        assert owner.refresh_metrics["export_reconciliation_pending"] is True
+        original_calls = len(setup.calls)
+        if change == "manual":
+            setup.states[ENTITY] = limit_state(700, slew=55)
+            # Pending confirmation may not adopt conflicting readback until
+            # its original deadline; it must never restore over a manual change.
+        elif change == "restore":
+            setup.states[ENTITY] = limit_state(0)
+            state = setup.control.state
+            state["restoring"] = True
+            await setup.control.save(state)
+            setup.mode["value"] = "confirm"
+        elif change == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        elif change == "stale":
+            setup.states[ENTITY] = limit_state(0, readback=NOW.timestamp() - 900)
+        elif change == "target":
+            owner.entry.data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "sensor.replaced"
+        elif change == "storage":
+            setup.states[ENTITY] = limit_state(0)
+            setup.store.fail = True
+        else:
+            setup.states[ENTITY] = limit_state(0)
+        owner._command_lock.release()
+        await asyncio.wait_for(worker, 1)
+        assert owner._export_reconcile_task is None
+        if change == "storage":
+            assert owner._export_reconcile_pending is True
+            owner._schedule_debounced_refresh.assert_not_called()
+        else:
+            assert owner._export_reconcile_pending is False
+            owner._schedule_debounced_refresh.assert_called_once()
+        if change == "restore":
+            # Reconciliation confirms the original request first. Restoration
+            # still waits for main's mandatory observed-confirmation cooldown.
+            assert len(setup.calls) == original_calls
+            assert setup.control.state["restoring"] is True
+            advance_clock(setup)
+            await owner._async_update_data()
+            await owner._export_reconcile_task
+            assert len(setup.calls) == original_calls + 1
+            assert not setup.control.state
+            # An ordinary refresh after recovery must not duplicate restoration.
+            await owner._async_update_data()
+            await owner._export_reconcile_task
+            assert len(setup.calls) == original_calls + 1
+        else:
+            assert len(setup.calls) == original_calls
+        if change in {"manual", "unavailable", "stale", "target"}:
+            assert setup.control.state["pending"]
+            assert setup.control.state["baseline"]["watts"] is None
+        elif change == "confirm":
+            assert "pending" not in setup.control.state
+            assert setup.control.state["expected"]["watts"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("poll", ["later", "during_flush", "different_watts", "stale", "earlier", "gateway_pending",
+                                  "planner_pending", "mapping_removed"])
+def test_completed_export_reconciliation_reuses_only_fresh_settled_settings(setup, poll):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        if poll == "planner_pending":
+            await setup.control.execute(action(setup), NOW)
+            # The matching setting was read before dispatch. Only the next
+            # timestamp can confirm this command despite identical watts.
+            setup.states[ENTITY] = limit_state(0, readback=NOW.timestamp() - 1)
+        elif poll == "gateway_pending":
+            setup.states[ENTITY] = limit_state(pending=True)
+        owner = _coordinator_for_runtime_services(entry_data=dict(DATA), options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("poll"))
+
+        if poll == "during_flush":
+            async def flush():
+                advance_clock(setup, 1)
+
+            owner.store.async_flush = flush
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert not owner._export_reconcile_pending
+        if poll == "planner_pending":
+            assert setup.control.state["pending"]
+
+        if poll == "stale":
+            setup.clock["now"] += timedelta(minutes=11)
+        else:
+            advance_clock(setup, 60)
+        if poll == "different_watts":
+            setup.states[ENTITY] = limit_state(3000, readback=setup.clock["now"].timestamp())
+        elif poll == "earlier":
+            setup.states[ENTITY].attributes["last_successful_readback"] = NOW.timestamp() - 1
+        elif poll == "mapping_removed":
+            owner.entry.data.pop(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+
+        owner._mark_forced_refresh("state_change")
+        await owner._async_update_data()
+        if poll in {"later", "during_flush", "mapping_removed"}:
+            assert owner._export_reconcile_task is None
+            assert not owner._export_reconcile_pending
+        else:
+            assert owner._export_reconcile_pending
+            await owner._export_reconcile_task
+            if poll == "planner_pending":
+                assert "pending" not in setup.control.state
+                assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timer_fired,preflight", [(False, False), (True, False), (True, True)])
+def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypatch, timer_fired, preflight):
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    async def run():
+        await setup.control.execute(action(setup), NOW)
+        setup.states[ENTITY] = limit_state(0)
+        await setup.control.reconcile(NOW)
+        await setup.control.save({**setup.control.state, "restoring": True})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        refresh_lock = asyncio.Lock()
+        planning, finish_planning = asyncio.Event(), asyncio.Event()
+
+        async def plan(*, defer_execution):
+            if preflight and not planning.is_set():
+                planning.set()
+                await finish_planning.wait()
+            return _plan("cooldown")
+
+        async def refresh():
+            async with refresh_lock:
+                await owner._async_update_data()
+
+        async def request_refresh():
+            # Model Home Assistant dropping the debounced callback when its
+            # timer expires while the explicit refresh still holds the lock.
+            if not refresh_lock.locked():
+                await refresh()
+
+        owner._async_update_data_locked = plan
+        owner.async_refresh = refresh
+        owner.async_request_refresh = request_refresh
+        owner._listener_tasks = set()
+        owner._export_boundary_cancel = None
+        setup.hass.async_create_task = asyncio.create_task
+        timers = []
+        monkeypatch.setattr(module, "async_call_later", lambda hass, delay, callback: (
+            timers.append((delay, callback)) or (lambda: None)))
+        first_flush, finish = asyncio.Event(), asyncio.Event()
+
+        async def flush():
+            if not first_flush.is_set():
+                first_flush.set()
+                await finish.wait()
+            await setup.store.async_flush()
+
+        owner.store.async_flush = flush
+        boundary = NOW + timedelta(seconds=300)
+        owner._schedule_export_boundary({"deferred": True, "next_eligible_change_at": boundary.isoformat()})
+        initial_refresh = None
+        if preflight:
+            initial_refresh = asyncio.create_task(owner._async_refresh_with_export_preflight("test_preflight"))
+        else:
+            await refresh()
+        await asyncio.wait_for(first_flush.wait(), 1)
+        worker = owner._export_reconcile_task
+        assert len(setup.calls) == 1
+
+        setup.clock["now"] = boundary  # The original gateway readback is still fresh.
+        if timer_fired:
+            timers.pop()[1](None)
+            await asyncio.gather(*owner._listener_tasks)
+            assert owner._export_reconcile_task is worker
+        else:
+            # Input collection can replace a timer before its callback runs.
+            owner._schedule_export_boundary({})
+            timers.clear()
+        owner._last_non_manual_refresh_requested_at = module.monotonic()
+        finish.set()
+        await worker
+        assert owner._export_reconcile_pending
+        assert len(timers) == 1
+
+        if timer_fired:
+            assert timers[-1][0] == 0
+            owner._schedule_debounced_refresh("state_change")
+            assert timers[-1][0] == 0
+        else:
+            assert timers[-1][0] > 0
+        setup.mode["value"] = "confirm"
+        timers.pop()[1](None)
+        if initial_refresh is not None:
+            await asyncio.wait_for(planning.wait(), 1)
+            await asyncio.sleep(0)
+            assert owner._listener_tasks  # The urgent request waits for the refresh lock.
+            finish_planning.set()
+            await initial_refresh
+        await asyncio.gather(*owner._listener_tasks)
+        if owner._export_reconcile_task is not None:
+            await owner._export_reconcile_task
+        assert len(setup.calls) == 2
+        assert not setup.control.state
+        owner._schedule_debounced_refresh("state_change")
+        assert timers[-1][0] > 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    ("pause", "export_limit_retry_interrupted"),
+    ("disarm", "export_limit_retry_interrupted"),
+    ("tariff", "export_tariff_changed"),
+    ("nested_tariff", "export_tariff_changed"),
+    ("rollover", "export_tariff_expired"),
+    ("unavailable", "export_limit_entity_unavailable"),
+    ("startup", "export_limit_retry_interrupted"),
+    ("replace", "export_limit_target_changed"),
+    ("gateway", runtime.GATEWAY_CHANGED),
+    ("future_readback", "export_limit_retry_readback_changed"),
+    ("changed_feedback", "export_limit_retry_readback_changed"),
+    ("cooldown_rollback", "export_limit_change_rate_limited"),
+    ("production_evidence", "export_limit_retry_interrupted"),
+])
+def test_retry_rechecks_planner_authority_at_provider_write(setup, retry_owner, change, reason):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        owned_identity = setup.control.state["identity"]
+        timing_key = runtime.control_key(owned_identity)
+        now = advance_clock(setup)
+        setup.mode["value"] = "confirm"
+        if change == "nested_tariff":
+            entity = DATA[CONF_AMBER_EXPORT_PRICE]
+            raw = setup.states[entity]
+            setup.states[entity] = State(entity, raw.state, raw.attributes, last_updated=now)
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+        original = retry_owner.upstream.async_apply_guarded.side_effect
+
+        async def apply(watts, *, expected, before_write):
+            waiting.set()
+            await release.wait()
+            await original(watts, expected=expected, before_write=before_write)
+
+        retry_owner.upstream.async_apply_guarded.side_effect = apply
+        task = asyncio.create_task(owner._async_retry_export_limit())
+        await asyncio.wait_for(waiting.wait(), 1)
+        if change == "pause":
+            setup.store.data["control_pause"] = {
+                "asset": EXPORT_ASSET, "until": (now + timedelta(minutes=10)).isoformat(), "reason": "operator",
+            }
+        elif change == "disarm":
+            setup.store.data["production"]["armed"] = False
+        elif change == "future_readback":
+            setup.states[ENTITY].attributes["last_successful_readback"] = now.timestamp() + 1
+        elif change == "changed_feedback":
+            setup.states[ENTITY] = limit_state(5000, readback=now.timestamp())
+        elif change == "cooldown_rollback":
+            setup.clock["now"] = now - timedelta(seconds=1)
+            setup.states[DATA[CONF_AMBER_EXPORT_PRICE]].last_updated = setup.clock["now"]
+            setup.states[ENTITY].attributes["last_successful_readback"] = setup.clock["now"].timestamp()
+        elif change == "startup":
+            owner._startup_auto_recovery_authorized = True
+        elif change == "replace":
+            setup.registry[ENTITY].device_id = "replacement"
+        elif change == "gateway":
+            setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+        elif change == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        elif change == "production_evidence":
+            setup.store.data["production"]["dry_run_evidence_fingerprint"] = "changed"
+        elif change == "rollover":
+            now = advance_clock(setup, 15 * 60)
+        elif change == "nested_tariff":
+            setup.states[DATA[CONF_AMBER_EXPORT_PRICE]].attributes["forecasts"][0]["per_kwh"] = 0.15
+        else:
+            setup.states[DATA[CONF_AMBER_EXPORT_PRICE]] = price_state((0.15, 0.15))
+            setup.states[DATA[CONF_AMBER_EXPORT_PRICE]].last_updated = now
+        release.set()
+        await task
+        assert len(setup.calls) == 1
+        assert not setup.control.state.get("pending")
+        assert setup.control.state["retry"]["state"] == ("operator_required" if change == "gateway" else "scheduled")
+        assert setup.control.state["retry"]["attempts"] == 2
+        assert setup.control.state["retry"]["reason"] == reason
+        if change == "replace":
+            setup.registry[ENTITY].device_id = "gateway-a"
+        assert setup.store.data["command_rate_limits"][timing_key]["attempted_at"] == NOW.timestamp()
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_control_switch_off_revokes_retry_before_startup_cleanup(setup, retry_owner):
+    from custom_components.ha_energy_planner.switch import SWITCHES, PlannerSwitch
+
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        timing_key = runtime.control_key(setup.control.state["identity"])
+        now = advance_clock(setup)
+        setup.mode["value"] = "confirm"
+        setup.hass.config_entries.async_update_entry = lambda entry, *, options: setattr(entry, "options", options)
+        switch = PlannerSwitch(owner, next(description for description in SWITCHES if description.active_control))
+        switch.async_write_ha_state = Mock()
+        at_write, allow_write, cleaning_up, finish_cleanup = (asyncio.Event() for _ in range(4))
+        original = retry_owner.upstream.async_apply_guarded.side_effect
+
+        async def apply(watts, *, expected, before_write):
+            at_write.set()
+            await allow_write.wait()
+            await original(watts, expected=expected, before_write=before_write)
+
+        async def dismiss_notification():
+            cleaning_up.set()
+            await finish_cleanup.wait()
+
+        retry_owner.upstream.async_apply_guarded.side_effect = apply
+        owner.executor.async_dismiss_startup_recovery_notification = dismiss_notification
+        retry = asyncio.create_task(owner._async_retry_export_limit())
+        await asyncio.wait_for(at_write.wait(), 1)
+        stop = asyncio.create_task(switch.async_turn_off())
+        try:
+            await asyncio.wait_for(cleaning_up.wait(), 1)
+            allow_write.set()
+            await asyncio.wait_for(retry, 1)
+            assert len(setup.calls) == 1
+            assert owner._export_retry_control() is None
+            assert not setup.control.state.get("pending")
+            assert setup.control.state["retry"]["attempts"] == 0
+            assert setup.control.state["retry"]["reason"] == "export_limit_retry_interrupted"
+            assert setup.store.data["command_rate_limits"][timing_key]["attempted_at"] == NOW.timestamp()
+            assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1
+        finally:
+            allow_write.set()
+            finish_cleanup.set()
+            await asyncio.wait_for(stop, 1)
+        assert owner.dry_run
+        assert not owner.active_control
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("episode", [
+    "settled", "scheduled", "checking", "ready", "terminal", "exhausted", "wrong_target", "invalid_attempts",
+])
+def test_startup_failure_only_preserves_eligible_export_retry(setup, retry_owner, episode):
+    async def run():
+        owner = retry_owner.create()
+        setup.states[ENTITY] = limit_state(0)
+        setup.store.data["production"]["armed"] = False
+        setup.mode["value"] = "confirm"
+        ownership = {
+            "identity": runtime.target_identity(setup.hass, ENTITY),
+            "gateway_identity": GATEWAY,
+            "baseline": {"watts": None, "slew_rate": 100.0},
+            "expected": {"watts": 0, "slew_rate": 100.0},
+        }
+        if episode != "settled":
+            ownership["retry"] = {
+                "state": "operator_required" if episode == "terminal" else
+                "scheduled" if episode in {"exhausted", "wrong_target", "invalid_attempts"} else episode,
+                "attempts": runtime.MAX_RETRY_ATTEMPTS if episode == "exhausted" else 1,
+                "next_attempt_at": (NOW + timedelta(minutes=5)).isoformat(),
+            }
+            if episode != "ready":
+                ownership["pause"] = runtime.UNAVAILABLE_REJECTION
+            if episode == "invalid_attempts":
+                ownership["retry"]["attempts"] = "invalid"
+        if episode == "wrong_target":
+            ownership["identity"]["device_id"] = "old-gateway"
+        await setup.control.prepare_cooldown(NOW)
+        await setup.control.save(ownership)
+        await owner.executor.async_restore_safe_state("startup_auto_recovery_replan_failed")
+        writes = [call for call in setup.calls if call[0] == "enphase_ev"]
+
+        if episode in {"scheduled", "checking", "ready", "terminal"}:
+            assert setup.control.state == ownership
+            assert not writes
+        elif episode == "settled":
+            assert not setup.control.state
+            assert writes[0][1] == "disable_export_limit"
+        else:
+            assert setup.control.state["restoring"]
+            assert setup.control.state["retry"]["state"] == "operator_required"
+            assert not writes
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [
+    "before_timeout", "after_timeout", "denial_cleanup", "startup_ready", "disabled", "cancelled", "provider_noop",
+])
+def test_retry_accounts_only_for_writes_that_reach_dispatch(setup, retry_owner, failure):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        state = setup.control.state
+        state["retry"]["attempts"] = 3 if failure == "startup_ready" else 2
+        if failure == "startup_ready":
+            state["retry"].update(state="ready", next_attempt_at=None)
+            state.pop("pause")
+        await setup.control.save(state)
+        now = advance_clock(setup)
+
+        async def apply(watts, *, expected, before_write):
+            if failure == "disabled":
+                raise installer_rejection("export_limit_disabled")
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            if failure == "provider_noop":
+                setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+                return {}
+            if failure in {"startup_ready", "denial_cleanup"}:
+                setup.store.data["production"]["armed"] = False
+                if failure == "denial_cleanup":
+                    try:
+                        before_write()
+                    finally:
+                        raise OSError("failed to clear pending intent")
+                before_write()
+            if failure == "after_timeout":
+                before_write()
+            raise TimeoutError
+
+        retry_owner.upstream.async_apply_guarded.side_effect = apply
+        if failure == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await owner._async_retry_export_limit()
+        else:
+            await owner._async_retry_export_limit()
+
+        state = setup.control.state
+        sent = failure == "after_timeout"
+        assert bool(state.get("pending")) is sent
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == 1 + sent
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == (now if sent else NOW).timestamp()
+        if failure == "provider_noop":
+            assert "retry" not in state
+        elif failure == "disabled":
+            assert state["retry"]["attempts"] == 2
+            assert state["retry"]["state"] == "operator_required"
+        elif not sent:
+            assert state["retry"]["attempts"] == (3 if failure == "startup_ready" else 2)
+            assert state["retry"]["state"] == ("ready" if failure == "startup_ready" else "scheduled")
+            assert state["retry"]["next_attempt_at"] == (now + timedelta(minutes=5)).isoformat()
+
+    asyncio.run(run())
+
+
+def test_startup_ready_retry_waits_for_competing_readback_after_restart(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+        owned = setup.control.state
+        owned["retry"].update(state="ready", attempts=3, next_attempt_at=None)
+        owned.pop("pause")
+        await setup.control.save(owned)
+        claim = await setup.control.claim_retry(now)
+        assert claim["rechecking_ready"]
+        now = advance_clock(setup)
+        setup.states[ENTITY] = limit_state(pending=True, readback=now.timestamp())
+        restarted = retry_owner.create()
+        await restarted._async_retry_export_limit()
+        retry = setup.control.state["retry"]
+        assert retry["state"] == "ready"
+        assert retry["attempts"] == 3
+        assert retry["reason"] == "export_limit_pending"
+        assert not setup.control.state.get("pause")
+        assert "rechecking_ready" not in retry
+        retry_owner.upstream.async_prepare.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+
+def test_interrupted_startup_ready_claim_preserves_budget_while_provider_is_pending(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        state = setup.control.state
+        state["retry"].update(state="ready", attempts=3, next_attempt_at=None)
+        state.pop("pause")
+        await setup.control.save(state)
+
+        now = advance_clock(setup)
+        claim = await setup.control.claim_retry(now)
+        assert claim["attempts"] == 3
+        assert claim["state"] == "checking"
+
+        # The persisted claim survives restart, but an upstream pending write
+        # still blocks the resumed installer check.
+        now = advance_clock(setup)
+        assert await setup.control.claim_retry(now, pending=True) is None
+        state = setup.control.state
+        assert "pause" not in state
+        assert state["retry"]["state"] == "ready"
+        assert state["retry"]["attempts"] == 3
+        assert state["retry"]["next_attempt_at"] == (now + timedelta(minutes=5)).isoformat()
+        assert len(setup.calls) == 1
 
     asyncio.run(run())

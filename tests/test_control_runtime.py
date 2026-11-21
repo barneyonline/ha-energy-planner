@@ -14,6 +14,7 @@ from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry
 from homeassistant.core import Context, CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
 
@@ -28,10 +29,12 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     DEFAULT_OPTIONS,
     DOMAIN,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
 from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter, EVCommandResult
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.models import (
@@ -136,6 +139,69 @@ def _arm(store: PlannerStore, executor: Executor) -> None:
         "armed": True, "dry_run_ready_cycles": 3,
         "dry_run_evidence_fingerprint": production_evidence_fingerprint(executor.entry_data, executor.options),
     }
+
+
+def test_oversized_zone_feedback_preserves_automation_recovery_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        zone = "climate.zone"
+        hass.states.async_set(zone, "heat", {"zone_id": 0, "temperature": 22})
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        entry = ConfigEntry(
+            domain=DOMAIN, title="HVAC feedback",
+            data={**configured.entry_data, CONF_CLIMATE_ZONES: [zone]},
+            options={**configured.options, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+            source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        save_ownership = store.async_save_ownership
+        injected = False
+
+        async def inject_feedback(ownership: dict[str, Any]) -> None:
+            nonlocal injected
+            await save_ownership(ownership)
+            confirmation = ownership.get("hvac_control", {}).get("command_confirmation", {})
+            if not injected and confirmation.get("entity_id") == zone:
+                injected = True
+                hass.states.async_set(zone, "heat", {"zone_id": 0, "temperature": 10**400})
+                await asyncio.sleep(0)
+
+        monkeypatch.setattr(store, "async_save_ownership", inject_feedback)
+        coordinator.async_start_listeners()
+        try:
+            plan, context = _command("hvac")
+            plan.actions[0].desired_state.update(target_temperature=20, configured_zones_only=True)
+            async with coordinator._command_lock:
+                await coordinator.executor.async_evaluate(plan, context)
+            await hass.async_block_till_done()
+            assert injected
+            assert [(domain, service) for domain, service, _ in calls] == [
+                ("automation", "turn_off"), ("automation", "turn_on"),
+            ]
+            hvac = CapabilityDiscovery(hass, coordinator.entry_data, coordinator.options).inspect().hvac
+            assert hvac.issues == ["climate_zone_target_unavailable"]
+            await store.async_flush()
+            reloaded = PlannerStore(hass, "runtime")
+            await reloaded.async_load()
+            event = next(item for item in reloaded.data["climate_audit"] if item["stage"] == "unmatched_feedback")
+            assert event["expected"]["temperature"] == 22
+            assert event["observed"]["temperature"] is None
+            assert {"hvac_control", "climate_automations"}.isdisjoint(reloaded.data["ownership"])
+            assert f"required_evidence_missing issue=climate_zone_target_unavailable entities={zone}" in caplog.text
+            assert "OverflowError" not in caplog.text
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("area", ["ev", "hvac", "enphase"])
@@ -1813,10 +1879,14 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
                   CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.operator_hold"}
         hass.states.async_set("input_boolean.operator_hold", "off")
         monkeypatch.setattr(
-            daikin_memory, "provider", lambda *args: (vendor, {MAIN_CLIMATE: 0, BED_CLIMATE: 1}, "core-daikin")
+            daikin_memory, "provider",
+            lambda *args, **kwargs: (vendor, {MAIN_CLIMATE: 0, BED_CLIMATE: 1}, "core-daikin"),
         )
         monkeypatch.setattr(daikin_memory, "read_topology", lambda *args: zone_control.topology(config))
         monkeypatch.setattr(zone_control, "read_topology", lambda *args: zone_control.topology(config))
+        registration = SimpleNamespace(platform="daikin", config_entry_id="core-daikin", device_id="controller")
+        registered = dict.fromkeys(["climate.head", *PAIRS.values()], registration)
+        monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registered.get))
 
         def publish():
             mode = {"1": "heat", "2": "cool", "7": "dry"}[control["mode"]] if control["pow"] == "1" else "off"
@@ -1843,7 +1913,10 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
                 hass.states.async_set(
                     entity,
                     mode if power == "1" else "off",
-                    {"temperature": value, "min_temp": target - 2, "max_temp": target + 2, "target_temp_step": 1},
+                    {
+                        "zone_id": index, "temperature": value, "min_temp": target - 2,
+                        "max_temp": target + 2, "target_temp_step": 1,
+                    },
                 )
 
         publish()

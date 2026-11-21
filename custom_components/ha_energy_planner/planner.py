@@ -31,6 +31,9 @@ from .const import (
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRIORITY_WEIGHTS,
+    HVAC_CAPABILITY_ISSUES,
+    HVAC_DRY_RELEASE_DURING_OFF_START,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
 from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
 from .ev_optimization import optimise_ev
@@ -132,10 +135,14 @@ class DryRunPlanner:
             device_plans.setdefault("climate", {}).update({"economics": context.climate_decision})
         confidence_breakdown = _confidence_breakdown(context, actions)
         decision_audit = _decision_audit(context, actions, self.options)
-        rejected_actions = _rejected_actions(context, actions, self.options)
-        device_plans.setdefault("climate", {})["preconditioning"] = planning_status(
-            context, actions, mode, _rejected_climate_decision(context, self.options)["reason"], self.options
-        )
+        climate_rejection = _rejected_climate_decision(context, self.options)
+        preconditioning = planning_status(context, actions, mode, climate_rejection["reason"], self.options)
+        if HVAC_DRY_ZONE_TARGETS_ABSENT in context.input_issues:
+            climate_rejection["reason"] = preconditioning["summary"]
+        rejected_actions = _rejected_actions(context, actions, self.options, climate_rejection)
+        device_plans.setdefault("climate", {})["preconditioning"] = preconditioning
+        if context.weather_evidence:
+            device_plans.setdefault("climate", {})["weather"] = dict(context.weather_evidence)
         timeline_card = _timeline_card_rows(device_plans)
 
         summary = "Planner disabled"
@@ -246,7 +253,23 @@ class DryRunPlanner:
             self.options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False),
             default=False,
         )
-        if context.occupancy_state == OccupancyState.AWAY and away_control_active and away_off_release_reason is None:
+        dry_mode_blocked = HVAC_DRY_ZONE_TARGETS_ABSENT in context.input_issues
+        if dry_mode_blocked:
+            # Reject before either HVAC policy can reserve load for a takeover.
+            context.climate_engine.pop("scheduled", None)
+            if context.hvac_control.keys() - {"released_until", "required_evidence_lost"}:
+                release = self.hvac_policy._hvac_release_action(
+                    context, execute_not_before, execute_not_after,
+                    away_off_release_reason or "hvac_required_evidence_lost",
+                )
+                hvac_issues = HVAC_CAPABILITY_ISSUES.intersection(context.input_issues)
+                if (away_off_release_reason is None and context.dry_during_provisional_off_start
+                        and hvac_issues == {HVAC_DRY_ZONE_TARGETS_ABSENT}):
+                    # Off-start confirmation can finish before execution gets
+                    # the command lock. Recheck this Dry-only release then.
+                    release.desired_state[HVAC_DRY_RELEASE_DURING_OFF_START] = True
+                actions.append(release)
+        elif context.occupancy_state == OccupancyState.AWAY and away_control_active and away_off_release_reason is None:
             if away_preconditioning_enabled:
                 actions.extend(
                     self.hvac_policy._hvac_lifecycle_actions(
@@ -322,7 +345,9 @@ class DryRunPlanner:
             context.climate_legacy_decision.update(
                 reason="hvac_min_cycle_active", summary="HVAC minimum cycle/rest period has not elapsed.")
         legacy_hvac_loads = [slot.projected_hvac_load_kw for slot in context.slots]
-        if context.climate_inputs and self.options.get("hvac_decision_policy", "automatic") != "legacy":
+        if not dry_mode_blocked and context.climate_inputs and self.options.get(
+            "hvac_decision_policy", "automatic",
+        ) != "legacy":
             for slot in context.slots:
                 slot.projected_hvac_load_kw = 0.0
         if (
@@ -593,9 +618,10 @@ class DryRunPlanner:
             )
         for slot, power in zip(context.slots, legacy_hvac_loads, strict=True):
             slot.projected_hvac_load_kw = power
-        legacy_climate = [action for action in actions if action.asset == ActionAsset.DAIKIN]
-        actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
-        actions.extend(economic_actions(context, dict(self.options), legacy_climate))
+        if not dry_mode_blocked:
+            legacy_climate = [action for action in actions if action.asset == ActionAsset.DAIKIN]
+            actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
+            actions.extend(economic_actions(context, dict(self.options), legacy_climate))
         blocked = [action for action in actions if action.asset == ActionAsset.DAIKIN
                    and action.kind != ActionKind.RELEASE_HVAC
                    and cycle_active(context.hvac_cycle, action.execute_not_before,
@@ -976,6 +1002,7 @@ def _rejected_actions(
     context: DecisionContext,
     actions: list[PlanAction],
     options: Mapping[str, Any],
+    climate_rejection: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Return plain-English decisions that were considered but not selected."""
     rejected: list[dict[str, Any]] = []
@@ -983,7 +1010,7 @@ def _rejected_actions(
     if ActionAsset.EV not in assets:
         rejected.append(_rejected_ev_decision(context, options))
     if ActionAsset.DAIKIN not in assets:
-        rejected.append(_rejected_climate_decision(context, options))
+        rejected.append(climate_rejection)
     if ActionAsset.ENPHASE not in assets:
         rejected.append(_rejected_enphase_decision(context, options))
     return [item for item in rejected if item]

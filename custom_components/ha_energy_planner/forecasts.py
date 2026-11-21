@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from operator import itemgetter
@@ -23,6 +24,65 @@ _FORECAST_CONTAINER_KEYS = (
 _TIME_KEYS = ("valid_at", "datetime", "start_time", "period_start", "from", "time", "date", "nem_time")
 FORECAST_HEALTHY_HOURS = 12.0
 FORECAST_DEGRADED_HOURS = 8.0
+MAX_FORECAST_SOURCE_ROWS = 2048
+_TARIFF_VALUE_KEYS = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
+_FORECAST_CADENCE_KEYS = ("forecast_interval_minutes", "interval_minutes", "resolution_minutes")
+_LATEST_FORECAST_END = datetime.max.replace(tzinfo=UTC)
+_MAX_FORECAST_INTERVAL_MINUTES = (_LATEST_FORECAST_END - datetime.min.replace(tzinfo=UTC)).total_seconds() / 60
+
+
+@dataclass(slots=True)
+class ForecastSource:
+    """Validated source rows independent of the requested planning grid."""
+
+    declared: tuple[list[tuple[datetime, datetime, float]], int] | None
+    points: list[tuple[datetime, float]]
+    ordered: list[float | None]
+    cadence: timedelta
+    ordered_interval: float
+
+
+def parse_forecast_source(
+    state: Any, interval_minutes: int, value_keys: tuple[str, ...], value_kind: str, *,
+    unit_key_only: bool = False,
+) -> ForecastSource:
+    """Normalize once before sampling on one or more grids."""
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    default_unit = str(attributes.get("unit_of_measurement", "" if unit_key_only else
+                                     attributes.get("unit", attributes.get("temperature_unit", ""))))
+    explicit_interval = _explicit_interval_minutes(attributes)
+    declared = (_declared_tariff_intervals(raw_items, value_keys, default_unit, maximum_minutes=explicit_interval)
+                if value_kind == "price" and raw_items else None)
+    if declared is not None:
+        return ForecastSource(declared, [], [], timedelta(), float(interval_minutes))
+    if value_kind == "power":
+        raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
+    parsed = [_parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit)
+              for item in raw_items]
+    points = sorted(
+        [(at, item[1]) for item in parsed if item is not None and item[0] is not None
+         and (at := _utc_forecast_time(item[0])) is not None],
+        key=itemgetter(0),
+    )
+    if explicit_interval is not None and explicit_interval >= _MAX_FORECAST_INTERVAL_MINUTES:
+        explicit_interval = None
+    cadence = timedelta()
+    if points:
+        explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+        cadence = _conservative_cadence(
+            points, explicit_cadence or timedelta(minutes=interval_minutes), maximum=explicit_cadence,
+        )
+    ordered = (
+        [item[1] if item is not None and item[0] is None else None for item in parsed]
+        if not points and any(parsed) else []
+    )
+    return ForecastSource(None, points, ordered, cadence, explicit_interval or float(interval_minutes))
+
+
+def parse_tariff_source(state: Any, interval_minutes: int) -> ForecastSource:
+    """Normalize source intervals using the planning grid's price key precedence."""
+    return parse_forecast_source(state, interval_minutes, _TARIFF_VALUE_KEYS, "price", unit_key_only=True)
 
 
 def constant_forecast(
@@ -51,27 +111,38 @@ def constant_forecast(
     ]
 
 
-def tariff_source_intervals(state: Any, interval_minutes: int) -> list[dict[str, Any]]:
+def tariff_source_intervals(
+    state: Any, interval_minutes: int, *, details: dict[str, Any] | None = None,
+    slot_starts: list[datetime] | None = None,
+    source: ForecastSource | None = None,
+) -> list[dict[str, Any]]:
     """Expose sanitized source boundaries used to identify tariff lifecycles."""
-    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
-    keys = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
-    parsed = [
-        _parse_item(
-            item, value_keys=keys, value_kind="price", default_unit=str(attributes.get("unit_of_measurement", ""))
-        )
-        for item in _forecast_items(attributes, keys)
-    ]
-    points = sorted(
-        {(_as_aware_utc(at), value) for item in parsed if item is not None for at, value in [item] if at is not None}
-    )
-    explicit_interval = _explicit_interval_minutes(attributes)
-    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
-    cadence = _conservative_cadence(
-        points,
-        explicit_cadence or timedelta(minutes=interval_minutes),
-        maximum=explicit_cadence,
-    )
-    return [{"start": at.isoformat(), "end": (at + cadence).isoformat(), "price": price} for at, price in points[:576]]
+    source = source if source is not None else parse_tariff_source(state, interval_minutes)
+    declared = source.declared
+    if declared is not None:
+        intervals, normalized = declared
+        if details is not None:
+            details.update(source_validity="declared_intervals" if intervals else "invalid_intervals",
+                           normalized_intervals=normalized)
+        return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
+                for start, end, price in _tariff_window(intervals, slot_starts)]
+    if details is not None:
+        details.update(source_validity="inferred_intervals", normalized_intervals=0)
+    intervals = [(at, at + min(source.cadence, _LATEST_FORECAST_END - at), price)
+                 for at, price in sorted(set(source.points))]
+    return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
+            for start, end, price in _tariff_window(intervals, slot_starts)]
+
+
+def _tariff_window(
+    intervals: list[tuple[datetime, datetime, float]], starts: list[datetime] | None,
+) -> list[tuple[datetime, datetime, float]]:
+    """Bound published boundaries after validating the complete source evidence."""
+    if starts and len(intervals) > 576:
+        window_start = min(_as_aware_utc(start) for start in starts)
+        window_end = max(_as_aware_utc(start) for start in starts)
+        intervals = [row for row in intervals if row[1] > window_start and row[0] <= window_end]
+    return intervals[:576]
 
 
 def forecast_series_from_state(
@@ -84,6 +155,7 @@ def forecast_series_from_state(
     value_kind: str,
     require_timestamped: bool = False,
     slot_starts: list[datetime] | None = None,
+    source: ForecastSource | None = None,
 ) -> list[float | None] | None:
     """Return a slot-aligned numeric forecast series from common HA attributes.
 
@@ -94,59 +166,94 @@ def forecast_series_from_state(
     Set ``require_timestamped`` for freshness evidence: ordered values have no
     source interval and must not be treated as proof of current coverage.
     """
-    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
-    raw_items = _forecast_items(attributes, value_keys)
-    default_unit = str(
-        attributes.get(
-            "unit_of_measurement",
-            attributes.get("unit", attributes.get("temperature_unit", "")),
-        )
-    )
-    slot_count = len(slot_starts) if slot_starts is not None else int((horizon_hours * 60) / interval_minutes)
-    if not raw_items:
+    source = source if source is not None else parse_forecast_source(state, interval_minutes, value_keys, value_kind)
+    if source.declared is None and not source.points and not source.ordered:
         return None
-    if value_kind == "power":
-        raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
-
-    parsed_items = [
-        _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit) for item in raw_items
+    issued_at = _as_aware_utc(issued_at)
+    starts = slot_starts if slot_starts is not None else [
+        issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
-    parsed = [item for item in parsed_items if item is not None]
-    if not parsed:
-        return None
-
-    if all(valid_at is None for valid_at, _value in parsed):
+    if source.declared is not None:
+        intervals, _normalized = source.declared
+        return [_value_for_tariff_slot(at, intervals) for at in starts]
+    if not source.points:
         if require_timestamped:
             return None
         # Ordered payloads have no temporal metadata. Treat each source position as
         # exactly one planner interval and retain invalid positions as gaps. This is
         # deliberately conservative: inventing a longer cadence would silently
         # extend a short forecast across the rest of the planning horizon.
-        source_interval = _explicit_interval_minutes(attributes) or float(interval_minutes)
-        if slot_starts is not None:
-            values = [item[1] if item is not None else None for item in parsed_items]
-            return [
-                values[index] if 0 <= (index := int((at - issued_at).total_seconds() / 60 / source_interval))
-                < len(values) else None for at in slot_starts
-            ]
-        return _align_ordered_values(parsed_items, slot_count, interval_minutes, source_interval)
+        source_interval = source.ordered_interval
+        if slot_starts is None:
+            return _align_ordered_values(source.ordered, len(starts), interval_minutes, source_interval)
+        return [
+            source.ordered[index] if 0 <= (index := int((at - issued_at).total_seconds() / 60 / source_interval))
+            < len(source.ordered) else None for at in starts
+        ]
+    return [_value_for_slot(at, source.points, final_cadence=source.cadence) for at in starts]
 
-    timestamped = sorted(
-        [(_as_aware_utc(valid_at), value) for valid_at, value in parsed if valid_at is not None],
-        key=lambda item: item[0],
-    )
-    explicit_interval = _explicit_interval_minutes(attributes)
-    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
-    cadence = _conservative_cadence(
-        timestamped,
-        explicit_cadence or timedelta(minutes=interval_minutes),
-        maximum=explicit_cadence,
-    )
-    issued_at = _as_aware_utc(issued_at)
-    starts = slot_starts if slot_starts is not None else [
-        issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
-    ]
-    return [_value_for_slot(at, timestamped, final_cadence=cadence) for at in starts]
+
+def _amber_half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]) -> datetime:
+    """Translate only Amber's documented, duration-backed first-second convention."""
+    # public-api/swagger.json: duration=30, startTime=02:00:01Z, endTime=02:30:00Z.
+    # This is schema evidence, not permission to round arbitrary timestamps.
+    if (
+        end is not None
+        and type(item.get("duration")) in (int, float)
+        and item["duration"] == 30
+        and (end.minute % 30, end.second, end.microsecond) == (0, 0, 0)
+        and end - start == timedelta(minutes=30, seconds=-1)
+    ):
+        return start - timedelta(seconds=1)
+    return start
+
+
+def _declared_tariff_intervals(
+    raw_items: list[Any], value_keys: tuple[str, ...], default_unit: str, *, maximum_minutes: float | None,
+) -> tuple[list[tuple[datetime, datetime, float]], int] | None:
+    """Honor Amber interval metadata; reject broken native evidence without fallback.
+
+    Timestamp-only and other provider schemas retain their existing parser. Once
+    an Amber per_kwh source declares interval metadata, every row must validate.
+    Real gaps remain gaps and explicit ends cannot be extended by inferred cadence.
+    """
+    items = [_flatten_item(item) if isinstance(item, dict) else {} for item in raw_items]
+    if not any("per_kwh" in item and ("duration" in item or "end_time" in item) for item in items):
+        return None
+    intervals: list[tuple[datetime, datetime, float]] = []
+    normalized = 0
+    for item in items:
+        start = _parse_datetime_or_none(item.get("start_time"))
+        end = _parse_datetime_or_none(item.get("end_time"))
+        duration = item.get("duration")
+        parsed = _parse_item(item, value_keys=value_keys, value_kind="price", default_unit=default_unit)
+        if (
+            start is None or end is None or start.utcoffset() is None or end.utcoffset() is None
+            or type(duration) not in (int, float) or duration not in (5, 15, 30)
+            or type(item.get("per_kwh")) not in (int, float) or parsed is None or parsed[0] != start
+        ):
+            return [], 0
+        start, end = _utc_forecast_time(start), _utc_forecast_time(end)
+        if start is None or end is None:
+            return [], 0
+        canonical_start = _amber_half_hour_start(start, end, item)
+        if (end - canonical_start != timedelta(minutes=duration)
+                or (maximum_minutes is not None and duration > maximum_minutes)):
+            return [], 0
+        normalized += canonical_start != start
+        intervals.append((canonical_start, end, parsed[1]))
+    intervals.sort(key=itemgetter(0))
+    if any(right[0] < left[1] for left, right in zip(intervals, intervals[1:], strict=False)):
+        return [], 0
+    return intervals, normalized
+
+
+def _value_for_tariff_slot(at: datetime, intervals: list[tuple[datetime, datetime, float]]) -> float | None:
+    """Sample half-open declared intervals without bridging their gaps or tail."""
+    position = bisect_right(intervals, at, key=itemgetter(0)) - 1
+    if position < 0 or at >= intervals[position][1]:
+        return None
+    return intervals[position][2]
 
 
 def forecast_coverage_ratio(series: list[float | None] | None) -> float:
@@ -234,13 +341,13 @@ def forecast_coverage_details(
 
 def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
     """Return a valid explicitly declared forecast cadence in minutes."""
-    for key in ("forecast_interval_minutes", "interval_minutes", "resolution_minutes"):
+    for key in _FORECAST_CADENCE_KEYS:
         raw_value = attributes.get(key)
         if raw_value is None:
             continue
         try:
             value = float(raw_value)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             continue
         if isfinite(value) and value > 0:
             return value
@@ -248,7 +355,7 @@ def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
 
 
 def _align_ordered_values(
-    parsed_items: list[tuple[datetime | None, float] | None],
+    values: list[float | None],
     slot_count: int,
     planner_interval_minutes: int,
     source_interval_minutes: float,
@@ -258,11 +365,10 @@ def _align_ordered_values(
     for index in range(slot_count):
         elapsed = index * planner_interval_minutes
         source_index = int(elapsed // source_interval_minutes)
-        if source_index >= len(parsed_items):
+        if source_index >= len(values):
             series.append(None)
             continue
-        item = parsed_items[source_index]
-        series.append(item[1] if item is not None else None)
+        series.append(values[source_index])
     return series
 
 
@@ -288,8 +394,8 @@ def latest_forecast_valid_at_from_state(
                 break
         if valid_at is None:
             continue
-        valid_at = _as_aware_utc(valid_at)
-        if latest is None or valid_at > latest:
+        valid_at = _utc_forecast_time(valid_at)
+        if valid_at is not None and (latest is None or valid_at > latest):
             latest = valid_at
     return latest
 
@@ -318,9 +424,9 @@ def forecast_timestamp_status_from_state(
             valid_at = _parse_datetime_or_none(flattened[key])
             if valid_at is None:
                 continue
-            found = True
             if valid_at.tzinfo is None or valid_at.utcoffset() is None:
                 return "naive_timestamps"
+            found = found or _utc_forecast_time(valid_at) is not None
             break
     return "aware_timestamps" if found else "untimestamped"
 
@@ -623,7 +729,7 @@ def _value_for_slot(
     if position < 0:
         return None
     selected_at, selected = timestamped[position]
-    if slot_time >= selected_at + final_cadence:
+    if slot_time - selected_at >= final_cadence:
         return None
     return selected
 
@@ -655,3 +761,11 @@ def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _utc_forecast_time(value: datetime) -> datetime | None:
+    """Treat forecast timestamps outside the representable UTC range as missing."""
+    try:
+        return _as_aware_utc(value)
+    except OverflowError:
+        return None

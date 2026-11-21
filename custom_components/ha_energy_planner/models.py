@@ -163,8 +163,10 @@ class DecisionContext:
     climate_engine: dict[str, Any] = field(default_factory=dict)
     climate_decision: dict[str, Any] = field(default_factory=dict)
     climate_legacy_decision: dict[str, Any] = field(default_factory=dict)
+    weather_evidence: dict[str, Any] = field(default_factory=dict)
     ev_evidence: dict[str, Any] = field(default_factory=dict)
     export_limit: dict[str, Any] = field(default_factory=dict)
+    dry_during_provisional_off_start: bool = False
 
 
 @dataclass(slots=True)
@@ -200,6 +202,7 @@ class ActionOutcome:
     service_target: str | None = None
     desired_state: dict[str, Any] | None = None
     command_sent: bool | None = None
+    capability_issues: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

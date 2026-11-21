@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _module():
     path = Path(__file__).resolve().parents[2] / "scripts" / "select_ci_checks.py"
@@ -46,6 +48,15 @@ def test_smoke_script_changes_only_run_validation_extras() -> None:
         validation_extras=True,
         dedicated_quality_scale=False,
     )
+
+
+@pytest.mark.parametrize("path", [
+    "scripts/ha-dev.sh", "scripts/docker-pytest-fast.sh", "Dockerfile.dev", ".dockerignore", "docker-compose.yml",
+])
+def test_dev_environment_changes_run_lifecycle_tests_and_validation(path: str) -> None:
+    selection = _module().select_checks([path])
+    assert selection.pytest
+    assert selection.validation_extras
 
 
 def test_mypy_runner_changes_run_dedicated_quality_checks() -> None:

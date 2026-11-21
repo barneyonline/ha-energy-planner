@@ -38,7 +38,9 @@ CONTROL_KEYS = (
 MEMORY_KEY = "off_start_memory"
 
 
-def provider(hass: Any, data: dict[str, Any]) -> tuple[Any, dict[str, int], str] | None:
+def provider(
+    hass: Any, data: dict[str, Any], *, require_available: bool = True,
+) -> tuple[Any, dict[str, int], str] | None:
     """Resolve exact registered zone indices; names cannot establish identity."""
     topology = read_topology(hass, data)
     if not topology.get("supported"):
@@ -54,7 +56,7 @@ def provider(hass: Any, data: dict[str, Any]) -> tuple[Any, dict[str, int], str]
         type(device).__module__ != "pydaikin.daikin_airbase"
         or type(device).__name__ != "DaikinAirBase"
         or coordinator is None
-        or not coordinator.last_update_success
+        or (require_available and not coordinator.last_update_success)
     ):
         return None
     indices = {}

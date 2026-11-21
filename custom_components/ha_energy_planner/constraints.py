@@ -261,6 +261,13 @@ class ConstraintValidator:
     ) -> list[ConstraintViolation]:
         violations: list[ConstraintViolation] = []
         desired_mode = action.desired_state.get("hvac_mode")
+        if action.desired_state.get("weather_continuation"):
+            from .weather_control import continuation_rejection, intent_rejection
+            reason = continuation_rejection(context, now) or intent_rejection(
+                action.desired_state, context.hvac_control.get("weather_safe_intent", {}), now,
+                context.current_hvac_mode)
+            if reason is not None:
+                violations.append(_action_violation(action, reason, "Weather continuation authority was lost."))
         if desired_mode in {"heat", "cool"} and not mode_allowed(self.options, desired_mode):
             violations.append(_action_violation(
                 action, "preconditioning_mode_not_allowed",

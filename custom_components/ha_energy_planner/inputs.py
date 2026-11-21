@@ -57,16 +57,20 @@ from .const import (
 from .ev import ev_charging_state, ev_vehicle_suspended
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
+    ForecastSource,
     forecast_coverage_details,
     forecast_series_from_state,
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
+    parse_forecast_source,
+    parse_tariff_source,
     tariff_source_intervals,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
 from .planning_grid import planning_starts
+from .weather import WEATHER_TEMPERATURE_KEYS, weather_issued_at
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -187,6 +191,8 @@ class InputManager:
         self._forecast_source_issued_at: dict[str, datetime] = {}
         self._forecast_confidence_scores: list[float] = []
         self._state_cache: dict[str, State | None] = {}
+        self._forecast_sources: dict[tuple[str, tuple[str, ...], str], ForecastSource] = {}
+        self._tariff_sources: dict[str, ForecastSource] = {}
 
     def build_context(self, overrides: list[Override] | None = None) -> DecisionContext:
         """Extend EV forecasts without weakening the configured control-health horizon."""
@@ -194,6 +200,9 @@ class InputManager:
 
         from .planner_ev import _next_ready_by
 
+        self._state_cache.clear()
+        self._forecast_sources.clear()
+        self._tariff_sources.clear()
         context = self._build_context(overrides)
         if (not self.entry_data.get(CONF_EV_SOC) or context.ev_target_soc_percent is None
                 or context.ev_connected is False):
@@ -209,7 +218,10 @@ class InputManager:
             load_forecast_update_reason=self.load_forecast_update_reason, load_source_outage=self.load_source_outage,
             weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
         )
-        extended = extended_manager._build_context(overrides, now=context.created_at)
+        extended_manager._state_cache = self._state_cache
+        extended_manager._forecast_sources = self._forecast_sources
+        extended_manager._tariff_sources = self._tariff_sources
+        extended = extended_manager._build_context(overrides, now=context.created_at, ev_extension=True)
         context.slots[-1] = extended.slots[len(context.slots) - 1]
         context.slots.extend(extended.slots[len(context.slots):])
         context.daylight_windows = extended.daylight_windows
@@ -218,7 +230,7 @@ class InputManager:
         return context
 
     def _build_context(
-        self, overrides: list[Override] | None = None, *, now: datetime | None = None
+        self, overrides: list[Override] | None = None, *, now: datetime | None = None, ev_extension: bool = False,
     ) -> DecisionContext:
         """Build one detached context at an explicit shared forecast origin."""
         now = now or dt_util.utcnow()
@@ -228,10 +240,38 @@ class InputManager:
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
         tariffs = []
+        import_intervals = None
+        self._tariff_source_details: dict[str, dict[str, Any]] = {}
         for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
-            state = self._state(self.entry_data.get(key))
+            entity = self.entry_data.get(key)
+            state = self._state(entity)
             if state is not None:
-                tariffs.extend(tariff_source_intervals(state, interval))
+                source_key = str(entity)
+                if (source := self._tariff_sources.get(source_key)) is None:
+                    source = self._tariff_sources[source_key] = parse_tariff_source(state, interval)
+                details: dict[str, Any] = {}
+                intervals = tariff_source_intervals(
+                    state, interval, details=details,
+                    slot_starts=[now, now + timedelta(hours=horizon)],
+                    source=source,
+                )
+                if key == CONF_AMBER_IMPORT_PRICE:
+                    import_intervals = intervals
+                age = now - state.last_updated
+                fresh = timedelta() <= age <= timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
+                details.update(source_freshness="fresh" if fresh else "stale", next_retry_at=None)
+                # Retry only a known, imminent validity boundary, never poll for
+                # missing data. Coverage remains unsafe until that instant.
+                if fresh and intervals and not any(
+                    datetime.fromisoformat(row["start"]) <= now < datetime.fromisoformat(row["end"])
+                    for row in intervals
+                ):
+                    upcoming = [datetime.fromisoformat(row["start"]) for row in intervals
+                                if now < datetime.fromisoformat(row["start"]) <= now + timedelta(seconds=2)]
+                    if upcoming:
+                        details["next_retry_at"] = min(upcoming).isoformat()
+                self._tariff_source_details[key] = details
+                tariffs.extend(intervals)
         self._slot_starts = planning_starts(now, horizon, interval, tariffs)
         import_prices, import_issue = self._required_series(
             CONF_AMBER_IMPORT_PRICE,
@@ -386,7 +426,8 @@ class InputManager:
         from .enphase_export_limit import evidence
 
         export_limit = (evidence(self.hass, dict(self.entry_data), dict(self.options), now)
-                        if self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True else {})
+                        if not ev_extension and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+                        else {})
         return DecisionContext(
             export_limit=export_limit,
             created_at=now,
@@ -436,10 +477,13 @@ class InputManager:
             forecast_confidence_by_source=forecast_confidence_by_source,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
             daylight_windows=daylight_windows,
-            climate_inputs=read_climate_inputs(
+            weather_evidence=dict(self.weather_forecast_details),
+            climate_inputs={} if ev_extension else read_climate_inputs(
                 self.hass, dict(self.entry_data), dict(self.options), now, now + timedelta(hours=horizon),
                 {**self.load_forecast_details,
                  "hvac_power_subtracted": self.load_forecast_model.get("cleaning", {}).get("hvac_power_subtracted")},
+                tariff_intervals=import_intervals if import_intervals is not None else [],
+                read_state=self._state,
             ),
         )
 
@@ -553,8 +597,14 @@ class InputManager:
         if calibration_field:
             self._forecast_source_issued_at[calibration_field] = source_issued_at
 
-        source_forecasts = [
-            forecast_series_from_state(
+        source_forecasts = []
+        for _, source_entity, source_state in source_states:
+            cache_key = (source_entity, value_keys, value_kind)
+            if (source := self._forecast_sources.get(cache_key)) is None:
+                source = self._forecast_sources[cache_key] = parse_forecast_source(
+                    source_state, interval, value_keys, value_kind,
+                )
+            source_forecasts.append(forecast_series_from_state(
                 source_state,
                 issued_at=now,
                 horizon_hours=horizon,
@@ -562,9 +612,8 @@ class InputManager:
                 value_keys=value_keys,
                 value_kind=value_kind,
                 slot_starts=getattr(self, "_slot_starts", None),
-            )
-            for _source_key, _source_entity, source_state in source_states
-        ]
+                source=source,
+            ))
         forecasts = [item for item in source_forecasts if item]
         forecast = _stitch_forecast_series(forecasts, slot_count) if forecasts else None
         if forecast:
@@ -572,6 +621,7 @@ class InputManager:
             raw_forecast = list(primary_forecast or [None] * slot_count)
             coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval,
                 slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
+            coverage_details.update(getattr(self, "_tariff_source_details", {}).get(config_key, {}))
             coverage = float(coverage_details["coverage_ratio"])
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
@@ -1058,7 +1108,50 @@ class InputManager:
         if not entity_id:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
-        if not self._valid_state(state):
+        details = self.weather_forecast_details
+        good_at = dt_util.parse_datetime(str(details.get("last_good_at", "")))
+        expires = dt_util.parse_datetime(str(details.get("grace_expires_at", "")))
+        if good_at is not None and expires is not None:
+            details["cache_age_seconds"] = max((now - good_at).total_seconds(), 0.0)
+            details["grace_remaining_seconds"] = max((expires - now).total_seconds(), 0.0)
+            if not self._valid_state(state):
+                details["availability"] = "cached"
+            if (details.get("entity_id") != entity_id or good_at > now
+                    or (details.get("availability") == "cached" and now >= expires)):
+                self.weather_forecast = {}
+                details["availability"] = "unavailable"
+        legacy_forecast = None
+        if details.get("availability") == "unavailable" and self._valid_state(state):
+            attributes = getattr(state, "attributes", {}) or {}
+            try:
+                provider_issued = weather_issued_at(attributes, now)
+                legacy_at = provider_issued or _forecast_source_issued_at(state, now)
+            except ValueError:
+                legacy_at = None
+            if legacy_at is not None and timedelta(0) <= now - legacy_at <= timedelta(
+                minutes=int(self.options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120))
+            ):
+                candidate = forecast_series_from_state(
+                    state, issued_at=legacy_at, horizon_hours=horizon, interval_minutes=interval,
+                    value_keys=WEATHER_TEMPERATURE_KEYS, value_kind="temperature",
+                    slot_starts=getattr(self, "_slot_starts", None) or [
+                        now + timedelta(minutes=i * interval) for i in range(slot_count)],
+                )
+                if candidate and any(value is not None for value in candidate):
+                    legacy_forecast = candidate
+                    self.weather_forecast = {}
+                    details.update(
+                        availability="live", last_good_at=legacy_at.isoformat(),
+                        observation_at=getattr(state, "last_updated", legacy_at).isoformat(),
+                        provider_issued_at=provider_issued.isoformat() if provider_issued is not None else None,
+                        original_fetched_at=None, last_successful_fetch_at=None,
+                        cache_age_seconds=max((now - legacy_at).total_seconds(), 0.0),
+                        grace_expires_at=None, grace_remaining_seconds=None,
+                    )
+        cached_weather = details.get("availability") == "cached"
+        service_forecast = self.weather_forecast.get("forecast")
+        if (not self._valid_state(state) and not (cached_weather and service_forecast)
+                or details.get("availability") == "unavailable"):
             self.weather_forecast_details = {
                 **self.weather_forecast_details,
                 "source_type": "unavailable_state",
@@ -1078,10 +1171,11 @@ class InputManager:
                 details=self.weather_forecast_details,
             )
             return None, [None] * slot_count, f"{config_key}_unavailable"
-        attributes = getattr(state, "attributes", {}) or {}
+        attributes = (self.weather_forecast_details.get("forecast_attributes", {}) if cached_weather else
+                      getattr(state, "attributes", {}) or {})
         value = _attribute_value(attributes, "temperature", "native_temperature", "current_temperature", "temp")
         if value is None:
-            value = state.state
+            value = state.state if state is not None and not cached_weather else None
         current_temperature = _finite_float_or_none(value)
         if current_temperature is not None:
             unit = str(_attribute_value(attributes, "unit_of_measurement", "unit", "temperature_unit") or "")
@@ -1091,14 +1185,14 @@ class InputManager:
         service_forecast = self.weather_forecast.get("forecast")
         if isinstance(service_forecast, list) and service_forecast:
             forecast_state = SimpleNamespace(
-                attributes={**attributes, "forecast": service_forecast},
+                attributes={**attributes, "forecast_interval_minutes": 60, "forecast": service_forecast},
             )
-        forecast = forecast_series_from_state(
+        forecast = legacy_forecast if legacy_forecast is not None else forecast_series_from_state(
             forecast_state,
             issued_at=now,
             horizon_hours=horizon,
             interval_minutes=interval,
-            value_keys=("outdoor_temperature_forecast_c", "temperature", "native_temperature", "temp", "value"),
+            value_keys=WEATHER_TEMPERATURE_KEYS,
             value_kind="temperature",
             slot_starts=getattr(self, "_slot_starts", None),
         )
@@ -1111,6 +1205,7 @@ class InputManager:
             )
             coverage = float(coverage_details["coverage_ratio"])
             source = (
+                "weather_service_hourly_cache" if cached_weather else
                 "weather_service_hourly"
                 if forecast_state is not state and coverage == 1.0
                 else "weather_service_hourly_partial"
@@ -1141,14 +1236,22 @@ class InputManager:
                 "coverage_end": coverage_details.get("last_timestamp"),
             }
             self._record_forecast_confidence(
-                _state_confidence(state, default=1.0) * coverage,
+                0.0 if cached_weather or state is None else _state_confidence(state, default=1.0) * coverage,
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source=source,
                 details=self.weather_forecast_details,
             )
             padded = list(forecast[:slot_count])
-            issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
+            self.weather_forecast_details["values_start_at"] = now.isoformat()
+            continuous_slots = next((i for i, value in enumerate(padded) if value is None), len(padded))
+            starts = getattr(self, "_slot_starts", [])
+            continuous_until = (starts[continuous_slots] if starts and continuous_slots < len(starts) else
+                                min(now + timedelta(minutes=continuous_slots * interval),
+                                    now + timedelta(hours=horizon)))
+            self.weather_forecast_details["continuous_until"] = continuous_until.isoformat()
+            issue = (f"{config_key}_cached_outage" if cached_weather else
+                     None if coverage == 1.0 else f"{config_key}_incomplete_horizon")
             return current_temperature, padded, issue
         if current_temperature is not None:
             self.weather_forecast_details = {
@@ -1218,9 +1321,7 @@ class InputManager:
             ):
                 issue = f"{key}_stale"
                 if key == CONF_CARBON_INTENSITY_FORECAST:
-                    advisory_issue = _advisory_issue(issue)
-                    if advisory_issue is not None:
-                        issues.append(advisory_issue)
+                    issues.append(f"advisory_{issue}")
                 else:
                     issues.append(issue)
         load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)

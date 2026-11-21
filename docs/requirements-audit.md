@@ -9,6 +9,91 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Current state publishes Home Assistant's reported temperature unit alongside
+  live climate readings and targets, including low/high targets. The unit is
+  omitted when the source lacks a valid unit or supplies no temperature details.
+  The summary uses the live reading when the head reports a non-Celsius unit.
+  `tests/test_sensor.py` checks Celsius, Fahrenheit, and omission cases through
+  the Recorder-bounded sensor attributes and replays the data shape in
+  `tests/fixtures/live_schema/climate_zone_temperatures.json`.
+  See [planning and control](planning-and-control.md#feature-reference).
+- The Climate control active entity opts into Home Assistant 2026.11's in-place
+  entity ID changes. Its store and coordinator subscriptions continue publishing
+  under the new entity ID and are cleaned up on unload. `tests/test_ha_runtime.py`
+  exercises rename and unload through the actual entity registry and platform.
+- Operator guides explain how [Home Assistant Action history](stable-release.md#example-setup)
+  complements verified Planner activity, when to use [ABRP SoC](ev-scheduling.md#charging-observations),
+  and how to interpret optional [Enphase radio diagnostics](export-limit-timing.md).
+
+- Local integration branding ships all eight Home Assistant PNG variants under
+  `custom_components/ha_energy_planner/brand/`: transparent light/dark icons at
+  256×256 and 512×512, and light/dark wordmark logos at 548×256 and 1096×512.
+  SVG sources preserve the approved calendar geometry and exact banner colour
+  samples. Legacy component-root and GitHub asset copies use the same mark.
+  `docs/branding.md` documents the specification and regeneration; design
+  concepts live outside the packaged component. Acceptance includes PNG
+  dimensions, alpha bounds, palette and package-content inspection, plus the
+  full `scripts/docker-validate.sh` gate.
+
+- Calendar publication selects reconciled records before constructing returned
+  Home Assistant `CalendarEvent` objects; current-plan window expansion remains
+  before filtering. Confirmed history participates in reconciliation within a
+  365-day and 1,000-record retention ceiling; load normalization also compacts
+  legacy Store data so repeated calendar reads and saves remain bounded.
+  Legacy records are validated and filtered by age before chronological selection
+  of the newest 1,000 confirmations, regardless of saved list order. Unsorted
+  history and persisted reload regressions are covered by
+  `tests/test_calendar_history.py` and `tests/test_storage.py`.
+  `tests/test_entity_publication.py` exercises HA's repeated property sequence,
+  historical ranges, archived UID suppression, offset-aware ordering, expiration,
+  replans, options, live feedback and ownership changes without replanning, plus
+  repeated Next actions compaction and nonmutation. `entity.py` combines Store
+  conversion and normalization in one walk; `sensor.py` shares the current AI
+  fingerprint only within one getter call. `tests/test_entity.py` preserves
+  dataclass, datetime, enum and tuple/set behavior; full-shape Next actions
+  profiles and freshness tests are in `tests/test_next_actions_publication.py`.
+  Synthetic measurements and the unresolved live latency are documented in
+  `docs/entity-publication.md`.
+
+- Reproducible cloud development: `Dockerfile.dev` and `scripts/ha-dev.sh`
+  build pinned HA/Python/test tooling, preserve proxy and session CA trust, and
+  recreate an owned development container without running tests at startup.
+  `scripts/docker-pytest-fast.sh` reuses that container. The pinned manual
+  `ha-runtime` Compose profile is opt-in. `tests/scripts/test_ha_dev.py` covers
+  lifecycle, stale-image rejection, checkout isolation and command failures;
+  `docs/cloud-development.md` documents saved setup/start commands. Full acceptance
+  remains `scripts/docker-validate.sh`; saved cloud-template updates are external.
+
+- Amber tariff coverage uses declared native interval ends and durations in both
+  price sampling and the planning/lifecycle grid. Only the documented aligned
+  30-minute `per_kwh` interval starting at second 1 is translated to a half-open
+  interval starting at second 0. Malformed, inconsistent, ambiguous or overlapping
+  native intervals fail closed; real gaps and insufficient horizons remain unsafe.
+  Freshness checks, negative prices, high-resolution boundaries and export-setting
+  cooldowns retain their safety rules. Bounded forecast diagnostics report source
+  validity/freshness, normalization count, leading/internal/tail gap counts and
+  `next_retry_at`. Known validity boundaries within two seconds of collection
+  share one refresh after both sources are valid, including when context building
+  crosses the deadline. A fixed pending window bounds rescheduling; monotonic
+  elapsed time limits actual retries to once per 30 seconds. Recovery or teardown
+  cancels the pending timer; cancellation without execution permits replacement.
+  Evidence: `tests/test_forecasts.py`, `tests/test_inputs.py`,
+  `tests/test_coordinator.py`, existing export/cooldown tests and the sanitized
+  `tests/fixtures/tariffs/amber_boundary_2026_11_04.json` import/export replay.
+  [Tariff coverage notes](tariff-coverage.md) record schema provenance and the
+  limits of the historical evidence. Full validation remains
+  `scripts/docker-validate.sh`; no live improvement is claimed from replay.
+
+- CI hang recovery: real registry, vehicle-options, conditional-options and
+  upgrade tests initialize config entries before loading the entity registry,
+  satisfying HA 2026.11's startup dependency. Empty registry loads have ten-second
+  bounds; upgrade and repair tests initialize the frame helper. The existing
+  runtime cases reproduce the original stall without these prerequisites.
+  Coverage and runtime-compatibility jobs time out after 15 minutes, and pytest
+  dumps blocked-thread stacks after 60 seconds. The required summary continues
+  to reject failures and cancellations. See `docs/validation-warnings.md`;
+  the complete acceptance gate remains `scripts/docker-validate.sh`.
+
 - The approved Planning Hub artwork supplies a 1280 × 640 social preview,
   light/dark 1200 × 400 README banners and 18 page-specific wiki banners.
   `scripts/generate-doc-banners.cjs` renders editable SVG headings over shared
@@ -18,7 +103,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   This changes documentation presentation only. Full validation remains
   `scripts/docker-validate.sh`.
 
-- The README presents concise features before a compact light/dark screenshot gallery, links directly to this repository in HACS, and keeps project badges visible outside expandable sections. `docs/planning-and-control.md` preserves the previous README's detailed behavior, compatibility requirements and safety limits, with corrected relative links. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. This is a documentation change; runtime behavior, configuration and quality-scale claims are unchanged. Full validation remains `scripts/docker-validate.sh`.
+- The README presents concise features before a compact light/dark screenshot gallery and keeps project badges visible outside expandable sections. Its installation guide links to the Marketplace listing, documents the Home Assistant 2026.11.0 minimum and explains how to add the repository from a link. The bug report form accepts both Marketplace and HACS as installation methods. `docs/planning-and-control.md` describes behavior, compatibility requirements and safety limits. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. Full validation remains `scripts/docker-validate.sh`.
 
 - UI-only configuration is declared by `CONFIG_SCHEMA` delegating to `cv.config_entry_only_config_schema(DOMAIN)` in `__init__.py`, as required by hassfest for integrations with `async_setup`. The helper is imported when validation runs so standalone planner tools remain usable without Home Assistant installed. `tests/test_ha_runtime.py` covers normal configuration and unsupported domain YAML. Integration services remain registered in `async_setup`; service tests and the Docker smoke gate cover service registration.
 
@@ -82,14 +167,24 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Configuration recovery follow-up: `__init__.py:_async_update_listener` treats changed mappings/subentries as topology changes; `coordinator.py:async_prepare_configuration_reload` restores owned assets before the reload handoff. Most non-hot-policy options also disarm and restore through `async_handle_options_update`; individual device-control toggles already restore only the disabled area. Thus an HVAC-only mapping or safety-option change can restore an unchanged export target. Preserving unaffected export ownership would require an asset-specific safety/evidence contract across option changes, unload, reload and re-arming, while retaining restoration on disarm/disable/target replacement. This history patch leaves those safety paths intact. The audit does not establish which exact changes caused each observed restore/reapply cycle.
 
-- Independent Enphase Export Limit control defaults off, preserves existing profile identities, supports export-only configuration and shares production arming with three area-qualified dry-run cycles. Tariff source intervals retain aware UTC boundaries and normalized prices; a dedicated boundary timer rebuilds plans through existing locks. Stale prices hold the confirmed setting. Export Limit uses distinct asset/action kinds, budgets, cooldown, pauses and restoration (`export_limit_policy.py`, `enphase_export_limit.py`, `coordinator.py`, `executor.py`, `preflight.py`). Normal writes explicitly target the mapped upstream Export Limit Select (or a previously mapped sensor) and omit slew; Select readback resolves to the sensor with matching unique ID, gateway and config entry, and sensor attribute changes trigger reconciliation. Readback observation follows sensor registration, removal and renaming without a reload, with subscriptions cleaned up on shutdown. Duplicate-control validation compares the upstream config entry and unique ID so separate planners cannot own the same Export Limit via sensor/Select aliases. Profile mapping is optional and Profile control can stay off for export-only operation. General safe-state restoration skips the configured profile fallback when Profile control is off and there is no saved profile ownership; unavailable unowned profiles cannot block startup recovery or produce restore-failure notifications. Saved profile baselines remain restorable after control is disabled. Regressions cover configuration changes, startup re-arming, unload, enabled fallback and disabled owned-baseline success/failure (`tests/test_executor.py`, `tests/test_coordinator.py`, `tests/test_export_limit.py`); baseline/request persistence is flushed before dispatch. Pending requests resolve only on matching fresh gateway readback; timeout and rejection require explicit resume. External changes automatically retire superseded ownership and reconcile tariff intent after fresh, settled readback. Restoration retains exact original watts and slew until confirmed, including restart and unavailable feedback. Presentation distinguishes desired, pending, unconfirmed and confirmed states and preserves raw PV in assumed-curtailment previews. Deterministic regressions in `tests/test_export_limit.py`, public sensor/tariff live-schema fixtures, negative/zero/positive replay fixtures and the isolated Enphase HA smoke scenario cover these paths. The [Export Limit wiki guide](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) documents upstream installer/opt-in prerequisites and control ownership.
+- Independent Enphase Export Limit control defaults off, preserves existing profile identities, supports export-only configuration and shares production arming with three area-qualified dry-run cycles. Tariff source intervals retain aware UTC boundaries and normalized prices; a dedicated boundary timer rebuilds plans through existing locks. Stale prices hold the confirmed setting. Export Limit uses distinct asset/action kinds, budgets, cooldown, pauses and restoration (`export_limit_policy.py`, `enphase_export_limit.py`, `coordinator.py`, `executor.py`, `preflight.py`). Normal writes explicitly target the mapped upstream Export Limit Select (or a previously mapped sensor) and omit slew; Select readback resolves to the sensor with matching unique ID, gateway and config entry, and sensor attribute changes trigger reconciliation. Readback observation follows sensor registration, removal and renaming without a reload, with subscriptions cleaned up on shutdown. Duplicate-control validation compares the upstream config entry and unique ID so separate planners cannot own the same Export Limit via sensor/Select aliases. Profile mapping is optional and Profile control can stay off for export-only operation. General safe-state restoration skips the configured profile fallback when Profile control is off and there is no saved profile ownership; unavailable unowned profiles cannot block startup recovery or produce restore-failure notifications. Saved profile baselines remain restorable after control is disabled. Regressions cover configuration changes, startup re-arming, unload, enabled fallback and disabled owned-baseline success/failure (`tests/test_executor.py`, `tests/test_coordinator.py`, `tests/test_export_limit.py`); baseline/request persistence is flushed before dispatch. Pending requests resolve only on matching fresh gateway readback. Explicitly classified temporary pre-write rejections can enter bounded recovery; other rejections require operator recovery. External changes automatically retire superseded ownership and reconcile tariff intent after fresh, settled readback. Restoration retains exact original watts and slew until confirmed, including restart and unavailable feedback. Presentation distinguishes desired, pending, unconfirmed and confirmed states and preserves raw PV in assumed-curtailment previews. Deterministic regressions in `tests/test_export_limit.py`, public sensor/tariff live-schema fixtures, negative/zero/positive replay fixtures and the isolated Enphase HA smoke scenario cover these paths. The [Export Limit wiki guide](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) documents upstream installer/opt-in prerequisites and control ownership.
 
 - Export setting mutations share a dedicated 300-second minimum across normal policy, restoration and resumed retries. `export_limit_cooldown.py` keys durable reservations by upstream config entry, control unique ID and device ID, excluding entity aliases; `enphase_export_limit.py` persists reservations before dispatch and starts a separate full 300-second wait at the first fresh matching confirmation observed by Planner. Upstream `last_successful_readback` is a settings-read completion timestamp, not physical-change time. Repeated reads do not extend that observation deadline. Pending/uncertain commands retain ownership and block retries, while rejection retains its reservation across resume/restart. Exact restoration baselines survive cooldown deferral, and clearing restored ownership does not erase timing. Known unsent requests and no-ops do not consume budget or create successful control/savings evidence. An external intervention that retires an uncertain request starts a separate safety wait without recording Planner confirmation or applied control; repeated settlement observations retain the first deadline. Old timing schemas, present null legacy timestamps and invalid/future/backward clocks receive a persisted bounded conservative wait. Clock repair freezes the original restoration audit identity separately from reconciliation time, preserving idempotent confirmed calendar history across repeated rollback/restart replay. The existing stricter general interval also applies to restoration and cannot be shortened by editing options after a reservation. `coordinator.py` schedules one refresh at the earlier tariff boundary or eligible-change time (or immediately if input collection crosses eligibility), using current valid tariff/device evidence without queueing obsolete intent; diagnostics, next actions and calendar previews expose the cooldown reason and deadline. `tests/test_export_limit_cooldown.py` and updated `tests/test_export_limit.py` exercise latency, rapid sign changes, no-op cancellation, failures, persistence, aliases, recovery, exact 299/300-second boundaries, clock recovery, evidence blockers and presentation. See [export timing](export-limit-timing.md). Fresh, settled feedback readiness is retained independently of mutation readiness. `export_limit_policy.py` projects the confirmed zero/finite/disabled limit during deferral and valid eligible future intent only when no other blocker or restoration has authority. `planner.py` uses the same export cap for estimated costs while preserving raw production and on-site solar use. Regressions in `tests/test_export_limit_cooldown.py` cover tariff signs, above/below-cap surplus, exact eligibility, service blockers, pending/uncertain/stale readback, restoration priority and import costs, with no new commands or successful-control outcomes. These tests establish simulated requests and observed confirmations, not live physical timing.
 
 - Export Limit accepts Amber's declared 30-minute first-second timestamp convention (e.g. 02:00:01Z–02:30:00Z) as the half-open control window [02:00:00Z, 02:30:00Z). `export_limit_policy.py` normalizes only an explicit numeric duration of 30 with exactly 29m59s between aware UTC timestamps and an exact half-hour end; it does not change prices, infer missing ends or relax other duration/gap/overlap checks. The detailed forecast retains precedence over convenience forecasts. `tests/test_export_limit.py` covers exact boundary sign transitions, both key styles, mixed timestamp conventions, DST, missing/invalid duration evidence, subsecond/other offsets, true gaps/overlaps and confirmed command deduplication; `tests/fixtures/live_schema/export_tariff_amber_first_second.json` preserves the sanitized observed payload shape in the full schema gate. The convention matches [Amber's API schema](https://github.com/amberelectric/public-api/blob/main/swagger.json). No live-device execution is claimed by these regressions.
+- Export Limit rejects conflicting cadence aliases, inconsistent row durations, and UTC timestamps or inferred ends outside the supported range. Generic tariff sampling preserves a gap when a timestamp cannot be represented. The cache reuses unchanged source rows and revalidates a nested change on the same Home Assistant State before either ordinary or guarded retry dispatch. `tests/test_export_limit_cooldown.py` verifies cache reuse, structure changes, and price type changes that compare equal in Python. `tests/test_forecasts.py`, `tests/test_export_limit.py` and the export tariff live-schema fixtures cover parsing and dispatch offline.
 
 - Export Limit lifecycle review regressions cover upstream Unconfirmed with retained pending intent, external slew changes during confirmation, rollback of unsent requests on persistence failure/cancellation, conflicting declared tariff cadence, startup recovery without unrelated Recorder evidence, independent toggles during startup grace, off-selector restoration presentation/timer cancellation, deferred unload while restoration is pending, preservation of other areas' failed restoration results, target races before restore dispatch, target-specific rejected-restore audit evidence, and immediate confirmed-restoration outcomes (`tests/test_export_limit.py`, `tests/test_lifecycle.py`).
 
+- Temporary Export Limit rejection recovery persists up to three installer readiness checks for the mapped Enphase site. Only known pre-write availability failures qualify. A separate timer waits at least five minutes after an unsuccessful check and observes the durable cooldown and daily allowance. The checks validate installer form access, current tariff and fresh settled settings. Recovery uses guarded apply on the same Enphase runtime, with snapshot comparison under its write lock and a final Planner authority and tariff check after provider persistence and HTTP connection acquisition. It then uses the normal Planner confirmation path. Older runtimes require operator recovery. Failed startup activation and evidence-contract changes preserve only a resumable retry on the same gateway, otherwise the normal restoration path applies. After Home Assistant starts and startup grace completes, authorized startup recovery can verify readiness while disarmed. It rechecks the installer snapshot using the same attempt after production re-arms and activation preflight succeeds. Unrelated configuration reloads retain retry state and terminal pauses for the same enabled export control. Both dispatch paths stay closed across provisional activation, cancellation and restart. Replacement recovery after a device-only change validates from a disarmed state. Terminal pauses survive failed post-reload activation. Unsent rollback and refund persist together, and missing readback timestamps preserve the claim. A repeat rejection after startup sets a new deadline. Operator pauses, pending gateway requests, replaced Enphase runtimes and changed tariff intent can defer recovery before dispatch without consuming the affected attempt. A competing pending request or timeout before dispatch releases the reservation without charging the daily allowance or cooldown. The final guard runs after HTTP connection acquisition. A deferred startup-ready recheck preserves the already-counted attempt. No-ops and local pre-dispatch blocks consume no dispatch budget. Definitive rejections persist with the allowance charge in the same Store generation. An uncertain reservation recovered after a crash charges the allowance once. Clock repair persists bounded accounting timestamps for future-dated export attempts and bounds storage-error delay. Unknown, terminal and unresolved writes keep their existing operator or confirmation gates. Deterministic regressions in `tests/test_export_limit.py` cover changed intent and ownership, pending writes, restoration, exhaustion, stale inputs, restart, startup grace and activation preflight, unrelated reloads, clock correction, target replacement, operator stop, tariff changes at the provider write boundary and unavailable hooks. `tests/test_storage.py` verifies allowance expiry after reloading a repaired timestamp. See [export timing](export-limit-timing.md).
+
+- Export Limit review regressions preserve the restart-resumable handoff before a provisional disarm, verify confirmed gateway settings and the previous cooldown at the final HTTP guard, and stop automatic retries on definitive pre-write installer or gateway rejections without charging a command. The companion Enphase test exercises an entry reload while the retiring guarded request still owns its durable reservation. Additional regressions exercise atomic operator cancellation and startup handoff, acknowledged and cancellation-drained Store saves, pre-send retirement, atomic reservation rollback, and rolling allowance expiry from actual guarded dispatch. The Export Limit retry regression injects Home Assistant Store write failures and cancellation while a reservation save is in flight. Further tests exercise operator disarm while startup cleanup holds the command lock, validation and reactivation returning after cancellation, durable rollback in an open save batch, the final retry during Enphase reload, and definitive rejection when cleanup fails or times out.
+
+- Export Limit regressions also cover operator disarm during an options handoff, restoration after a transient disarm Store failure, bounded installer rejections before dispatch, and a same-site replacement gateway with matching settings. The companion verifies the supplied gateway identity on a fresh read and classifies definitive HTTP rejections from response headers.
+- `tests/test_export_limit.py` exercises Automatic Control switch-off during a guarded write and verifies that the retry and reservation are refunded while startup cleanup waits. It also covers explicit Resume after a verified same-control gateway replacement, including an uncertain dispatch whose receipt was never saved, and checks that a replacement or missing gateway identity during an alias save leaves the original restoration baseline intact.
+- Export Limit replacement regressions verify that matching replacement feedback preserves retry and restoration ownership, and that pending commands expire without recording success. Explicit Resume keeps the original attempt accounting. The Enphase companion exercises stale single-row settings against current inventory and retries a failed durable confirmation clear before reload.
+- Resume can retire an expired upstream intent under the companion's write lock after a fresh verified gateway replacement. Planner requires settled feedback for the same replacement before releasing ownership and retains the unconfirmed audit and existing attempt. Both repositories test the boundary, including failed clear persistence. Planner tests also verify that an identity-bound preparation rejection for a competing request or mismatched form refunds the reservation for ordinary writes and restores.
+- `tests/test_export_limit.py` covers a restart during an already-disarmed device-only options handoff, restoration after an interrupted operator disarm, same-control ownership checks on Resume, and fresh gateway verification after an entity alias save. Identity-bound Enphase rejections before a write release the reservation and preserve the existing allowance. The zero-export live-schema fixture exercises the companion's opaque identity field. A pending restoration across a Sensor-to-Select alias save can confirm only from fresh, settled feedback for the original gateway.
 - Selective Export Limit resume retains only effectively active pauses, preserving legacy string asset selectors without creating or reviving unrelated pauses. Export tariff confidence accepts the existing input layer's four confidence aliases and fraction/percentage encodings, rejects invalid or below-threshold evidence, and is rechecked before execution. Reproduced resume and low-confidence dispatch defects are covered in `tests/test_export_limit.py` (`coordinator.py`, `export_limit_policy.py`, `executor.py`).
 
 - Upgrades remove current and legacy separate EV start/stop mappings, retaining the configured charger switch and saved recovery snapshots and command identity. Missing original controls retain ownership. Explicit dispatch evidence is preserved in audit and rolling-attempt storage, so partial commands followed by target loss still consume allowance while local rejections do not. Regression coverage is in `tests/test_config_flow.py`, `tests/test_lifecycle.py`, `tests/test_executor.py`, `tests/test_action_limits.py`, and `tests/test_storage.py`.
@@ -136,18 +231,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   These supplement the existing constraint-only supplied-plan replay fixtures.
 - Custom integration scaffold, config flow, options flow, entities, services,
   diagnostics, and versioned Home Assistant `Store` persistence are present.
-  EV maximum import price and low-price charging threshold use conditional
-  `data_entry_flow.Required` markers when the HA 2026.11 API is available.
-  The fallback retains unconditional required fields and existing defaults;
-  omitted hidden thresholds retain stored values through the options merge.
-  `tests/test_config_flow.py` covers both marker paths, independent toggle
-  conditions, omitted values, repeated disable/enable edits, and new-API
-  serialization/validation (the latter requires a supporting HA runtime).
+  EV price settings use native `data_entry_flow.Required` visibility markers.
+  The import and low-price toggles control their own fields. Emergency price
+  and budget also require Departure priority. Hidden values are retained
+  through the options merge.
+  `tests/test_config_flow.py` covers section-local conditions, omitted values,
+  repeated disable/enable edits, and native serialization and validation.
   `tests/test_conditional_ev_options_runtime.py` exercises complete forms through
   HA's options manager, including default injection, stale hidden submissions,
-  persisted values on reopen, independent thresholds and the fallback schema.
-  These runtime checks await a permitted environment; source-contract checks
-  alone do not verify the options manager or browser behavior.
+  persisted values on reopen, independent thresholds, and changes to the
+  departure price policy. CI runs this contract on the pinned minimum and stable.
   The manifest classifies Energy Planner as a service integration so configured
   entries remain visible on the main Devices & services integration page rather
   than being routed to the Helpers-only experience.
@@ -219,6 +312,35 @@ use throughout; the Docker and pull-request gates enforce that result.
   records, range boundaries, deduplication, and storage reload;
   `tests/test_coordinator.py` and `tests/test_calendar.py` cover superseded
   confirmations and vehicle-swap generation safety.
+- Planner performance boundaries are deterministic: decision fingerprints retain
+  at most 2,048 entries per material container while Home Assistant state revisions
+  preserve change detection outside that compact payload. Forecast parsing validates
+  complete source evidence before applying the 576-interval publication ceiling,
+  selecting the requested horizon when that ceiling is needed, preserving malformed/overlapping tariff rejection, valid bucket
+  predecessors, global cadence, energy durations and legacy timestamp semantics.
+  Climate search retains its 500,000 slot-evaluation ceiling, covering every
+  near-term start/target pair for a 24-hour horizon with both modes ready, a
+  90-minute lead and seven temperature targets. Advisory
+  weather retrieval completes before planner-lock acquisition; configuration and
+  forced-refresh races release the lock and prepare again before planning.
+  Regression coverage lives in `tests/test_forecasts.py`,
+  `tests/test_coordinator.py`, `tests/test_climate_engine.py`, and
+  `tests/test_refresh_timing.py`. Additional regressions cover the 12-hour
+  dual-mode search with nine supported targets between 20–24°C and exercise the
+  locked weather consumer during selector, interval, freshness, force and
+  selector-addition races, asserting that weather requests stay outside the lock.
+- Planning boundaries retain their original deadlines under repeated state
+  changes while honoring the non-manual refresh floor. EV horizon extension shares
+  one set of forecast reads and parsed sources across both grids, including the
+  previous partial tail. The EV optimizer ranks the same bounded candidates and
+  builds allocation records for the selected schedule. Execution records new
+  calendar confirmations without normalizing history after each no-op evaluation.
+  Regressions are in `tests/test_coordinator.py`, `tests/test_refresh_timing.py`,
+  `tests/test_inputs.py`, and `tests/test_ev_optimization.py`.
+- Forecast parsing ignores explicit cadence beyond the representable date range
+  and constructs a duration only for timestamped rows. Empty and ordered payloads
+  are covered in `tests/test_forecasts.py`. The timestamped provider case is
+  covered by `tests/fixtures/live_schema/pv_oversized_cadence.json`.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
@@ -340,6 +462,17 @@ use throughout; the Docker and pull-request gates enforce that result.
   policy ends planner billing exposure without confirming a stop and therefore
   preserves failed-stop backoff. Regression evidence is in
   `tests/test_executor.py` and `tests/test_vehicles.py`.
+  `ev_adapter.py` dispatches the first stop before waiting for confirmation when
+  active charging feedback precedes the switch update. It rechecks the switch
+  and connection before retrying. For these stops, Off must be accompanied by
+  inactive charging or verified unplug feedback, including after compensation.
+  Stopped `Finishing` feedback is accepted with Off. Unknown connection values
+  cannot prove unplug, and confirmation allows time for the switch and charging
+  feedback to update separately.
+  `tests/test_ev_adapter.py` uses a virtual clock to cover the dispatch time
+  with one and zero retries, feedback settling, unavailable readings, service
+  failure, delayed compensation readback and session changes. `tests/test_executor.py` verifies that the
+  auto-start compensation records the command and retains backoff on failure.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while
@@ -584,8 +717,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   full failure timeout. Pull-request CI classifies changed paths with
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
   fails safe to the full CI set for an unclassified trigger path.
-  Behavioral changes also run real runtime contracts and smoke tests on the HACS
-  minimum/pinned HA 2026.10.0 and current stable. Documentation-only
+  Behavioral changes also run real runtime contracts and smoke tests on the Marketplace
+  minimum/pinned HA 2026.11.0 and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
   complete local gate including minimum/pinned runtime contracts and package smoke.
   CI pins Ubuntu 26.04 and Node 24 artifact uploads. Smoke runs export synthetic
@@ -595,7 +728,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   evidence. Pytest treats warnings as errors, with exact test-only exceptions for
   two upstream Home Assistant HTTP/aiohttp messages. Codecov uploads the generated
   coverage and test-result reports without automatic collection plugins or host
-  report searching. [Validation warnings](validation-warnings.md) records the
+  report searching. Reporting checks out its trusted workflow revision with
+  credential persistence disabled, then fetches and indexes the producer's paths
+  without checking out producer code. This preserves exact tracked-file network
+  matching while test execution remains uncredentialed. The inline report
+  validator uses isolated Python imports to prevent producer-module execution.
+  Coverage paths remain relative across Docker and reporting checkouts, verified by
+  `tests/test_ci_coverage_paths.py`.
+  [Validation warnings](validation-warnings.md) records the
   remaining upstream/environment ownership and removal criteria.
   `scripts/report-smoke-warnings.py` and `tests/scripts/test_smoke_warnings.py`
   verify exact known-message classification, new diagnostic rejection, failure
@@ -606,8 +746,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   `tests/test_calendar.py`, `tests/test_calendar_history.py` and
   `tests/test_sensor.py` cover fragmented full-horizon schedules, metadata
   freshness, retained history and discarded evidence branches.
-  Coverage instruments branches, enforces exactly 100% statement coverage with
-  `scripts/check_coverage.py`, and rejects per-module branch regressions against the reviewed baseline. The smoke test
+  Coverage instruments branches by default and enforces exactly 100% statement
+  and branch coverage with `scripts/check_coverage.py`, comparing raw counts without
+  rounding or a branch gap allowance. Codecov project and patch checks require 100%
+  with zero threshold. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
@@ -655,6 +797,9 @@ use throughout; the Docker and pull-request gates enforce that result.
   price and W/kW/MW power normalization, plus weather forecast temperature attributes, with
   point-sensor fallback. Optional point-sensor power inputs used for forecast
   calibration and the HVAC thermal model use the same W/kW/MW normalization.
+  Complete source evidence is normalized before selecting the published tariff
+  horizon; historical prefixes cannot hide current intervals or invalid native
+  interval metadata. Slot sampling uses binary searches on normalized points.
   Representative integration-specific Amber, external PV, and weather schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
 - Compact external-PV forecast calibration is implemented. It records due PV
@@ -841,12 +986,139 @@ use throughout; the Docker and pull-request gates enforce that result.
   target, and failed acquisition restores the captured main mode and target before reporting
   rollback success. Options-aware discovery always validates the finite main
   rollback target and additionally validates configured-zone targets when
-  synchronisation is enabled. Off zones with entirely absent target attributes are
+  synchronisation is enabled. Discovery validates the target fields chosen by
+  rollback and rejects boolean setpoints, values outside the supported numeric
+  range, and malformed selected ranges, including reversed finite bounds.
+  Oversized setpoints remain reportable faults through discovery, state listeners,
+  and context construction. `tests/test_control_runtime.py` verifies that such
+  feedback still allows automation restoration and successful on-disk recovery.
+  A late Dry transition after a head or damper write also withholds further takeover
+  commands and retains the capability reason through restoration, manual overrides,
+  failures while saving or retiring an unsent intent, and transient Dry during
+  command readback. This includes generic zone switch and helper feedback. If
+  Dry interrupts an accepted write, Planner checks its feedback before
+  compensating. Dispatched zone and automation failures retain that check when
+  Dry or a manual override arrives during recovery preparation. A malformed zone
+  bound retains that zone's restoration baseline while other settings recover.
+  Verified Off starts can continue through a matching Dry recall only when dispatch
+  observed the head Off, subsequent feedback matches that recall, and concurrent
+  capability checks pass.
+  A same-interval refresh reports zone rollback faults when registry verification
+  enables independent synchronization without a change in entity state.
+  Off zones with entirely absent target attributes are
   deferred for that takeover, including provisional ownership persistence, retries,
   confirmation, and rollback; the planner never invents a rollback temperature.
   Main control, switch/helper takeover, and other zones remain eligible.
   `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
-  recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
+  recovered zones. Unavailable or malformed-target zones retain safety checks.
+  When a registered native Daikin head and zone on the same controller both
+  report Dry and the zone exposes no targets, `climate_zone_targets_absent_in_dry_mode`
+  blocks synchronized takeover, including verified independent-zone control with
+  the general synchronization option off. It is reported at INFO, including brief blocks discovered
+  by queued commands between refreshes. Concurrent faults still follow the
+  normal warning and notification paths. An otherwise healthy HVAC-only startup
+  waits and retries when Dry is the sole blocker without a persistent startup
+  fault notification. The sanitized Dry-mode replay covers
+  restoration of owned settings, Off recovery, and escalation when a target
+  stays missing in Cool. Planner excludes blocked takeover load from grid
+  projections and preserves independent EV confidence during load fallback
+  when the concurrent faults are limited to HVAC. The executor
+  and adapter recheck Dry after storing provisional ownership, during
+  automation suppression, and at the first head or zone write. Tests cover real
+  scheduler guard calls, a guard that fails as Dry starts, compensation after
+  the last automation is confirmed off, and supported Off starts that recall
+  Dry after activation. The audit distinguishes refusals after automation
+  suppression from refusals before dispatch. Successful actions count material
+  suppression only when the suppression call was dispatched. Planned and
+  queued refusals use the same explanation and surface concurrent rollback-target
+  faults first, including faults first observed during a late capability check.
+  A queued coast refusal reaches preconditioning status through the execution
+  audit without adding an outcome to preparation history.
+  The Dry explanation remains visible after a compensated automation failure,
+  which remains in the action audit.
+  The live queue checks for Dry before cycle and action validation and records
+  Dry refusals when an already-blocked continuation releases earlier ownership.
+  The execution audit retains concurrent faults and dispatch evidence if
+  automation suppression or restoration fails, including faults first observed
+  after automation restoration.
+  The adapter rechecks Dry after scheduler setup, at failed confirmation
+  persistence, and during readback before the first actuator write. Planner
+  saves only pending automation recovery before compensating a Dry-blocked
+  takeover, including when that compensation is interrupted.
+  For an unsent head command, confirmation and minimum-cycle intent are
+  retired in the same write as the narrowed recovery ownership.
+  An interrupted provisional ownership write in verified Dry retires the
+  unmodified climate snapshots. Unused Off-start metadata from the aborted
+  attempt cannot block automation recovery if AirBase becomes unavailable.
+  Queued Dry refusals stay visible while prior preconditioning is still
+  owned, and concurrent availability warnings name only faulted zones.
+  A local dispatch refusal creates no automation restoration ownership, and
+  a failed synchronized suppression retains only automation recovery before
+  compensation. A Dry transition during that compensation reaches the audit.
+  Cancelling acquisition in verified Dry before actuator dispatch retains only
+  prior ownership and attempted automation suppression. If an accepted suppression
+  is still awaiting feedback, Planner waits for Off after saving recovery so the
+  release retry can restore On. If readback times out or recovery is interrupted,
+  the saved suppression evidence makes release explicitly re-enable the automation
+  despite cached On, including while zone target restoration remains deferred.
+  A queued takeover after Dry ends resolves pending suppression before writing
+  to the HVAC, including when no thermostat baseline remains in ownership.
+  Post-dispatch compensation also rechecks Dry and concurrent
+  faults after restoring the automations. A manual override before any HVAC
+  dispatch uses the same automation-only recovery, including when Off feedback
+  times out or Dry begins during compensation. Emergency shutdown
+  remains available for an Off baseline when dispatch is uncertain or Dry is
+  unverified. Queued refusals also retain Dry and other capability evidence
+  when a concurrent manual override supersedes saved climate settings. Planner
+  rechecks Dry after saving and reconciling the supersession, including a failed
+  save before the first actuator write. It rechecks after the failed guard's
+  supersession save and after final readback while the HVAC is still untouched.
+  Rollback settles accepted automation and generic zone writes before compensating
+  for a head or sibling override. If Dry first appears while a supersession is
+  saved, a dispatched thermostat write settles under its original confirmation
+  deadline before compensation.
+  A scheduler guard failure before the first synchronized actuator dispatch
+  retires untouched snapshots and retains only outstanding automation recovery.
+  Synchronized takeover, including actions that explicitly request zone
+  synchronization, revalidates availability and live rollback targets
+  after the provisional ownership save and through the first actuator's
+  dispatch checks, including active zones with a previously saved baseline and
+  zones excluded while Off that report Heat or Cool before dispatch.
+  The audit records both Dry transitions observed by live checks. An episode
+  observed only by execution invalidates plan reuse after Dry ends. If recovery
+  observes the exit, INFO records it immediately and the audit retains the
+  earlier Dry refusal alongside any genuine target fault observed after the
+  exit. Current state keeps both zone classifications visible
+  even when a malformed target exceeds Recorder's numeric range.
+  A planning refresh during verified Off-start recall cannot produce a false
+  Dry exit while the head is still in Dry. A release queued solely from that
+  provisional Dry evidence is rechecked after the start confirms Heat or Cool,
+  including when confirmation finishes during the refresh. A recovery fault
+  saved before or after planning still triggers release.
+  Dry that starts while retiring an unsent confirmation blocks climate rollback
+  even if retirement fails. A superseded or already confirmed command is
+  excluded when preserving earlier readback uncertainty, including a head target
+  confirmed before the first zone write was prepared.
+  Recovery and ownership completion clear superseded climate baselines and
+  confirmations for overrides that arrive during either save, including when
+  cancellation interrupts ownership or accounting persistence after the adapter
+  returns. An interrupted provisional save also honors user changes with healthy
+  live capability. Errors retiring an unsent intent, releasing prior ownership,
+  or saving recovery preserve the original cancellation and attach the recovery
+  failure as its cause. A failed replacement before actuator dispatch restores suspended
+  automations and retains an earlier pending confirmation with its original
+  context, subject to manual supersession.
+  Audit marks a command as issued only after local service preflight, preserving
+  feedback evidence from earlier dispatches when a new target is rejected.
+  A locally rejected first actuator in a
+  synchronized takeover retires its untouched snapshots, even if the Dry
+  feedback arrives after the local rejection. Per-zone outage identity warns
+  on a new missing Cool target even when another zone was already faulted.
+  The notification checks live rollback-target faults before notifying, and both
+  state and action sensors list unavailable zones separately from Dry zones.
+  Discovery retains legacy head target validation when synchronization is disabled.
+  Changes to the verified zone set invalidate the plan fingerprint in Dry even
+  when the climate states and attributes are unchanged.
   Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
   frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution and compatible restored targets. Main-unit turn-on may restore the remembered mode before the requested mode is applied; zone-switch feedback must match the command-time head mode, or the requested mode when the head is off. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only compatible recovered targets within the bounded command settling period. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction, including a cooling request that first restores remembered heating; attributed changes, unrelated zones, inactive modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping
@@ -982,8 +1254,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   production score is capped by required tariff, PV, and household-load
   sources, while tariff, solar, load, climate, EV, and Enphase action gates use
   only their relevant source and device evidence. A low optional carbon source
-  therefore cannot suppress climate control, but low weather confidence still
-  blocks climate preconditioning at its configured threshold. Degraded input
+  therefore cannot suppress climate control. Low weather confidence blocks new
+  climate acquisition at its configured threshold. A confirmed owned lifecycle
+  may continue through a bounded advisory-weather grace without inflating weather
+  or climate confidence; it must retain fresh non-weather safety evidence. Degraded input
   issues, capability failures, and scoped pauses are isolated to their control
   area, including startup reconciliation and command-authority reporting;
   occupancy availability is scoped to climate. Unsafe or unrecognized shared
@@ -1176,22 +1450,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
-- Migration repair ownership and refresh: `migration_recovery.py` passes
-  `config_entry_id` when the HA 2026.11 issue refresh API is available. Integration
-  startup reconciles only existing `legacy_vehicle_target_` issue IDs, including
-  ownerless records restored from older versions. It recreates pending repairs
-  in place, preserving ignored state and creation time even after a target was
-  saved but migration retry failed; only removed or migrated entries lose their
-  notices. The synchronous refresh ends before storage or platform setup, and
-  exceptions cancel native stale-issue cleanup. No repairs are deleted on unload.
-  Explicit removal cleanup remains for HA 2026.10 and legacy ownerless records;
-  that version also reconciles stale notices without calling the new APIs.
-  `tests/test_repairs.py` covers these paths with inline config-entry/registry
-  fixtures and saved restart records, plus native 2026.11 ownership, disabled-entry
-  visibility, removal isolation and refresh cancellation tests when supported.
-  The advertised minimum remains 2026.10.0; this draft must not merge until the
-  owner handles the separate HA 2026.11 minimum-version bump.
-- The minimum and pinned baseline are HA 2026.10.0. Migration recovery uses the
+- Vehicle target migration repairs use Home Assistant's issue registry ownership
+  and refresh APIs. At startup `migration_recovery.py` reconciles only existing
+  `legacy_vehicle_target_` issue IDs, including saved ownerless records. It
+  adopts pending repairs in place and preserves their creation time and ignored
+  status, including repairs with a saved target and a failed migration retry.
+  Native refresh removes notices for removed or migrated entries and cancels
+  that cleanup if an update raises. Removal also clears any ownerless record for
+  the entry. `tests/test_repairs.py` covers startup, restart, disabled-entry
+  visibility, removal isolation, and interrupted refresh with the real registry.
+- The 1.4.0 minimum and pinned baseline were HA 2026.10.0. Migration recovery uses the
   public retry API directly; obsolete restart branches, strings and tests are
   removed. Schemas import Probatio directly; binary-sensor device classes use
   the current constant module. Tests still initialize HA before collection to
@@ -1449,8 +1717,24 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 
 ### Export conflict recovery and planner lock reliability
 
-- `coordinator.py` reconciles export feedback before acquiring the planner lock. Climate override mutations use command then planner ordering, release both locks before requesting refresh, and keep helper failures actionable. Shutdown rechecks teardown after command acquisition and reconciliation; `task_lifecycle.py` drains command then planner work before final unload restoration. `tests/test_coordinator.py` covers queued/in-flight shutdown, concurrent refresh/command ownership and completion of manual override plus Export Limit Resume control.
-- `enphase_export_limit.py` automatically adopts fresh, settled external feedback and retires a superseded baseline. Existing `external_export_limit_conflict` pauses migrate on reconciliation; service-rejection, unsupported-control and Unconfirmed pauses survive external changes until explicit resume. New tariff commands capture the new baseline; in-flight upstream requests, stale feedback, replaced targets and unconfirmed planner commands still block unsafe duplicate writes. `tests/test_export_limit.py` covers these transitions, late confirmation with and without slew changes, failure pause preservation and external changes during restoration.
+- Gateway identity mismatches block Export Limit planning, live preflight and
+  readiness for new commands. The companion verifies active
+  inventory for each settings read, so a stale row cannot confirm pending
+  ownership or a no-write settlement. Automatic retry checks the companion
+  capability and reports an upgrade requirement without spending an installer
+  check. Coverage is in `tests/test_export_limit.py` and the companion's
+  `tests/components/enphase_ev/test_export_limit.py`.
+
+- Fresh, unchanged Export Limit feedback can corroborate a previous settled
+  reconciliation across planning intervals. Changed or stale feedback, pending
+  ownership and invalid timing re-enter reconciliation. Ordinary observations
+  leave durable cooldown records untouched. Export policy revalidates time and
+  confidence at dispatch while reusing the parsed rows of the current Home
+  Assistant state. `tests/test_export_limit_cooldown.py` covers reuse, invalidation
+  and retention of active or owned timing across remaps.
+
+- `coordinator.py` admits one entry-owned export reconciliation job without awaiting it during routine refreshes, even when the command lock is idle. Freshness, authority, durable reservations and cooldown still apply. A stable completion opens readiness and requests one fresh plan. Cancellation, failure or changed feedback leaves readiness closed. A pending export check does not veto an already-planned HVAC release. `storage.py` avoids queuing a no-op flush during batched input collection while retaining the final durability barrier. `tests/test_coordinator.py` and `tests/test_storage.py` exercise slow work, coalescing, stale configuration, cancellation and teardown. Climate override mutations use command then planner ordering, release both locks before requesting refresh, and keep helper failures actionable. `task_lifecycle.py` drains command then planner work before final unload restoration.
+- `enphase_export_limit.py` automatically adopts fresh, settled external feedback and retires a superseded baseline. Existing `external_export_limit_conflict` pauses migrate on reconciliation; unsupported-control and Unconfirmed pauses survive external changes until explicit resume, along with service rejections that cannot be recovered automatically. New tariff commands capture the new baseline; in-flight upstream requests, stale feedback, replaced targets and unconfirmed planner commands still block unsafe duplicate writes. `tests/test_export_limit.py` covers these transitions, late confirmation with and without slew changes, failure pause preservation and external changes during restoration.
 - `plan_presentation.py`, `sensor.py` and `diagnostics.py` expose stale planning and current export blockers independently of input health. Planning boundary callbacks publish clock-dependent status without waiting for a refresh. `tests/test_sensor.py` covers exact freshness limits and blocked intent; the full `scripts/docker-validate.sh` gate includes all regressions.
 
 - Docker test and environment-report runners bootstrap pinned pytest/coverage tools with `scripts/install-test-dependencies.sh` and `tests/requirements.txt`. Both quality-scale workflows and coverage jobs use the same bootstrap; stable and minimum-version compatibility remain required. `tests/scripts/test_select_ci_checks.py` verifies that test-tool changes select all dependent CI checks. Fresh stable-image reproduction and the full Docker gate verify the missing-pytest regression without relying on a cached development image.
@@ -1519,6 +1803,7 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 - Review regressions prove that synchronous and queued main changes during an intent flush prevent on/mode/scalar/range dispatch and create no false issued/confirmed audit evidence. Restoration distinguishes a main change, a sibling-zone change and the restored zone's own supersession; a zone override cannot count an unapplied main shutdown as confirmed. Multi-zone acquisition retains the first uncertain target until readback, and zone-triggered manual rollback reconciles an accepted mode write before restoring its original baseline (`tests/test_hvac_adapter.py::test_review_manual_change_during_intent_flush_prevents_dispatch`, `test_review_zone_override_cannot_confirm_an_unapplied_main_shutdown`, `test_review_zone_restoration_respects_only_its_own_supersession`, `test_review_multiple_zones_never_replace_an_unconfirmed_command`, `test_review_manual_zone_change_settles_main_intent_before_rollback`).
 
 - Pending HVAC ownership reconciliation copies command uncertainty from the current durable control state when acquisition rollback or release fails, including exceptions and per-device safe-state restoration. It preserves original main/zone baselines while preventing both loss of a new intent and resurrection of a retired one (`tests/test_executor.py::test_review_failed_acquisition_uses_current_command_uncertainty`, `test_review_failed_release_uses_current_command_uncertainty`). Reload restores the original transaction identity, captured zone targets and a bounded activation history with parsed source timestamps. JSON round-trip regressions preserve exact delayed coupled feedback with missing prior targets while rejecting user attribution, unrelated parents, wrong targets, expired deadlines and superseding off commands (`tests/test_coordinator.py::test_review_pending_feedback_survives_json_reload_with_activation_proof`). Malformed activation history grants no authority.
+- The interrupted AirBase Off handoff replay in `tests/test_daikin_memory.py` preserves the full owned zone verification set after feedback loss, retains one mode-aware attempt across serialization, skips writes while unavailable, permits shutdown after active feedback returns, and confirms matching inactive memories and zone power without rearming the scheduler guard or waking the head. See [HVAC restoration recovery](hvac-restoration-recovery.md).
 
 - Scheduler guard expiry (18 October 2026): `hvac_adapter.py` checks finite timer
   and scheduler-flag coverage before climate, configured zone and automation
@@ -1703,3 +1988,124 @@ Valid charging evidence at or after the refusal remains an allowed reset.
   from PR #149 mode-specific restoration-baseline reversibility. The full gate
   remains `scripts/docker-validate.sh`. Repository simulation does not establish
   deployed behavior, physical actuation, blocked cooling duration or savings.
+
+
+### Refresh lifecycle timing and command contention
+
+- `refresh_timing.py` owns one bounded elapsed-time context per refresh. `coordinator.py` partitions lock waits, export reconciliation, inputs/fingerprint preparation, executor planning, post-plan work, final delayed-save flush, post-refresh work and residual time. Compatibility aliases are separate from the exclusive accounting. Attributable request/debounce age is outside the refresh total; planner executor queue/work details are reported only when the worker completes. Exceptions and cancellation close the current phase without borrowing another task's data. Successful refresh accounting occurs after storage flush and execution admission.
+- Busy command authority creates at most one deferred export reconciliation job. Planning bypasses only the wait, never device command serialization or durable ownership/readback. Pending reconciliation disables export readiness and fingerprint skips; execution admission fails closed under the command lock. Completion invalidates pending-era plans and requests coalesced fresh planning; errors retain the runtime gate until a normal refresh retries. Target changes are reread after command acquisition; shutdown drains the entry-owned job without cancelling an in-flight transaction. There is no retry loop or interval increase.
+- `tests/test_refresh_timing.py` covers controlled phase durations, flush failure, cancellation, teardown, concurrent refresh attribution, child-task isolation, command wait versus work, coalescing, failed/cancelled recovery, changed targets, shutdown draining, blocked execution, both competing queue orders and the just-released lock with an older admitted waiter. `tests/test_export_limit.py` exercises deferred confirmation, manual intervention, restoration without duplicate dispatch, unavailable/stale feedback, target replacement and storage failure using the real export controller. Existing lifecycle, manual override, generation, uncertain-command and durability regressions remain required.
+- The next refresh can use a settled result once while export inputs match, including when unrelated telemetry replaces the scheduled completion refresh (`tests/test_refresh_timing.py`). Export-only startup recovery waits for reconciliation before both validation and activation and can join an existing worker. `tests/test_export_limit.py` exercises both phases with real planning and preflight checks.
+- The Automatic Control switch and Arm Production Control button and service recheck a provisional Export Limit plan in a refresh that waits for reconciliation after weather collection. `tests/test_export_limit.py` covers competing refreshes, feedback changes during weather or a planner lock wait, pending and just-completed workers, unavailable feedback, and retained restoration after disabling export control. `tests/test_coordinator.py` verifies unchanged plans still use the fingerprint shortcut with an unused export mapping.
+- `tests/test_export_limit.py` verifies that Disable and Disarm supersede an earlier operator request during export preflight. `tests/test_coordinator.py` verifies that a later disarm still wins while startup recovery cancellation or the arming save is pending.
+- A newer fresh poll with unchanged settings can corroborate export reconciliation while no command or restoration is unresolved. `tests/test_export_limit.py` exercises unchanged, changed, stale and backward readbacks, pending confirmation and deferred restoration. `tests/test_coordinator.py` verifies that a due HVAC release survives export completion on either side of command-lock acquisition and that a newer planning input still supersedes it.
+- A future export dispatch in the shared attempt ledger invalidates settled
+  reconciliation reuse. `tests/test_export_limit_cooldown.py` verifies that a
+  clock correction after remapping reopens the allowance after 24 hours and
+  leaves the mapped control's valid cooldown and the original audit intact.
+- The export feedback listener preserves a queued HVAC release across a newer fresh poll with unchanged, settled settings. `tests/test_export_limit.py` delivers the actual listener event during reconciliation and verifies invalidation for changes to settings, stale feedback recovery, backward timestamps, pending commands and restoration.
+- Pending export work blocks only export commands and leaves the executor's owned EV safety stop eligible. `tests/test_coordinator.py` covers mixed plans and a disconnected charger with planner ownership. `tests/test_export_limit.py` verifies that an in-flight reconciliation cannot consume a cooldown wakeup or defer the due restore until unrelated telemetry arrives.
+- `tests/test_coordinator.py` verifies that a queued EV start is dropped when the selector changes before or after export completion publishes, including while execution prepares under the command lock. `tests/test_export_limit.py` covers an already-due cooldown follow-up bypassing the normal cadence and retaining priority when telemetry coalesces with it.
+- `tests/test_export_limit.py` also covers a cooldown deadline that expires during explicit preflight. The overdue retry waits for the coordinator lock and proceeds even if Home Assistant coalesced the original deadline refresh.
+- Synthetic contention comparison: on base `92b4694`, a refresh does not complete while an unrelated transaction holds the command lock; the regression now completes planning before releasing that same blocker. A controlled 80-second command wait plus 3-second reconciliation is separately attributed as 80,000 ms wait and 3,000 ms work. This does not identify the cause of the observed live 81-second event or prove that it is fixed. See `docs/refresh-timing.md`. Full validation remains `scripts/docker-validate.sh` with unchanged statement/branch thresholds.
+
+- Review regressions in `tests/test_refresh_timing.py` verify one requested-counter increment per dispatched reconciliation follow-up, including coalesced triggers, and preserve durable export pauses, outstanding confirmation/restoration and scoped/global pause reasons while reporting reconciliation queueing separately. The generation invalidation still precedes reopening readiness.
+
+## Complete branch coverage gate (6 November 2026)
+
+The previous gate covered every statement but allowed reviewed branch gaps.
+The coverage work adds defensive payload, advice lifecycle, coordinator boundary
+and adapter restoration regressions in `tests/test_defensive_payloads.py`,
+`tests/test_advice_lifecycle_edges.py`, `tests/test_coordinator_boundaries.py` and
+`tests/test_adapter_restoration_edges.py`, plus variants in the existing
+coordinator/executor suites. Cases include stale/cancelled advice, absent optional
+callbacks, configuration handoff, deferred notification failure, command
+exceptions with and without manual supersession, zone-only rollback, retained
+legacy data and Recorder training failure. Redundant guards after established
+runtime/type invariants are simplified without changing their outcomes.
+
+`pyproject.toml` enables branch measurement for ordinary coverage runs.
+`scripts/check_coverage.py` rejects any missing statement or branch, including
+gaps whose percentage rounds to 100%; `tests/scripts/test_check_coverage.py`
+checks both count boundaries and malformed/missing CLI evidence. The branch
+baseline is removed. `codecov.yml` requires 100% project and patch coverage; the
+existing source attribution and credential-isolated reporting flow is retained.
+
+Verification: `scripts/docker-validate.sh` passed on Home Assistant 2026.10.0
+with 5,360 tests passing, five version-specific skips and 36 passing subtests.
+The fresh coverage report contains 20,632/20,632 statements and 8,324/8,324
+branches (100%, no partial branches) across 88 files. The generated Codecov XML
+has line-rate and branch-rate of 1 for every file. A full stable-image run also
+passed, followed by the final advice, Codecov path/gate and safety-stop checks.
+These are local validation results; hosted Codecov processing requires publishing
+the revision and completing its existing CI reporting workflow.
+
+### Completed-zone coast comfort handoff
+
+- `zone_temperature.py::comfort_breached` applies the opposite-boundary exception
+  only to canonical aliases returned by `zone_control.py::coast_isolated_rooms`.
+  Committed intent, actuator baselines, fresh mapped feedback, exact switch state
+  and safe airflow are required. All rooms retain the normal recovery boundary;
+  worsening opposite-boundary excursions during coast trigger ordinary handoff.
+- `zone_control.py::desired_fields` keeps head-off coast, frozen physical completion
+  intent and existing ownership, without changing original restoration baselines.
+  `live_rejection` rechecks retained coast immediately before I/O. The economic
+  subset gate still selects the existing fallback lifecycle and claims no savings.
+- `tests/test_zone_control.py` reproduces the preparation deadline failure in both
+  directions, paired aliases, real executor ownership across a reconstructed
+  executor/reload, schedule suppression, active-control sensor semantics, period-end
+  restoration and repeat release. Negative cases cover closure uncertainty,
+  reopening, missing ownership, active intent, sensor/topology/airflow loss,
+  participating-room breaches and worsening closed-room excursions.
+- Validation remains `scripts/docker-validate.sh`; see `docs/climate-decisions.md`
+  for the passive recovery and conservative sensor-noise tradeoff. This is local
+  deterministic evidence, not a deployment or a measured HVAC-performance claim.
+- Review regressions in `tests/test_zone_control.py::test_review_coast_*` cover
+  three-room safe physical airflow after preparation dwell expires, newer room
+  readings before/during execution, feedback loss or head restart after final
+  confirmation, and stale queued intent after a successful subset change.
+  `hvac_adapter.py` supplies the confirmed coast intent to `hvac_control.py`, which
+  persists it without replacing original restoration baselines.
+
+### Bounded advisory weather outage continuation
+
+- `weather.py` serializes prefetches and keys the in-memory hourly forecast cache
+  by weather source, interval, freshness policy and HA timezone. The fallback
+  ceiling is 15 minutes from the last confirmed live fetch before an outage,
+  capped by the immutable forecast evidence's configured freshness deadline.
+  Healthy identical polls update availability proof without renewing forecast
+  age. Outage deadlines survive retries, changed payloads and flapping; only
+  successful fetches across five uninterrupted recovery minutes permit a new
+  outage window. Restart/reload have no persisted forecast to revive.
+- `inputs.py` consumes cached hourly rows even when current conditions are
+  unavailable, preserving original unit/coverage metadata and recording zero
+  weather confidence. It recomputes age/expiry after prefetch lock waits and
+  derives an exact continuous-coverage deadline without extending gaps or tails.
+  Failed service requests still assess healthy, fresh legacy attribute forecasts
+  using their original issue/update time, including relative array positions;
+  invalid or stale evidence stays unavailable.
+- `weather_control.py`, `planner_hvac.py` and `climate_runtime.py` constrain both
+  climate policies to the existing confirmed lifecycle and last confirmed safe
+  intent. `hvac_control.py` stores that intent only after confirmed execution.
+  Cached evidence cannot acquire control, reverse/restart, extend a window,
+  reopen a zone or increase demand. Forward coast transitions still require the
+  PR175 isolation, recovery and airflow evidence.
+- `constraints.py`, `executor.py` and `hvac_adapter.py` recheck current ownership,
+  live device/room evidence and weather expiry before device writes. The existing
+  release transaction restores original settings and schedules. The coordinator
+  advances its existing boundary refresh timer to the weather grace deadline.
+- `tests/test_weather_outage.py` exercises the observed five-minute outage pattern,
+  confirmed isolated Bedrooms, preparation/coast/expiry schedule behavior,
+  recovery, non-renewing flaps, unavailable startup, no cache, partial/expired
+  coverage, identity changes, restart/reload, concurrent fetches, room/comfort/
+  tariff/manual/command failures, demand bounds and no-write live rejection.
+  `tests/test_coordinator.py` preserves timeout/cancellation and freshness checks.
+  `tests/fixtures/live_schema/weather_outage_provenance.json` supplies supported
+  weather response/state shapes and all five issuance aliases with valid, stale
+  and malformed values; fixture-backed regressions exercise the actual async
+  fetch and unit normalization rather than only the series parser. The long-lived
+  identical-poll, legacy fallback and sustained-recovery regressions protect
+  the three review findings.
+  Full validation remains `scripts/docker-validate.sh`. See
+  `docs/climate-decisions.md` for the operator policy and diagnostic semantics.
+  Offline evidence is not deployment or physical-performance verification.

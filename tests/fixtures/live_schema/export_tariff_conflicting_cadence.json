@@ -1,0 +1,20 @@
+{
+  "name": "export_tariff_conflicting_cadence",
+  "kind": "export_tariff",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "-0.1",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "unit_of_measurement": "$/kWh",
+      "forecast_interval_minutes": 1e15,
+      "interval_minutes": 30,
+      "forecasts": [
+        {"start_time": "2026-10-01T00:00:00+00:00", "per_kwh": -0.1},
+        {"start_time": "2026-10-01T00:30:00+00:00", "per_kwh": 0.2}
+      ]
+    }
+  },
+  "expected": [],
+  "expected_issue": "export_tariff_ambiguous_duration"
+}

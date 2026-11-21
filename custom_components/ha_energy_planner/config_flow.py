@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import probatio as vol
-from homeassistant import config_entries, data_entry_flow
+from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import SectionConfig, section
+from homeassistant.data_entry_flow import Required, SectionConfig, section
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     BooleanSelector,
@@ -28,6 +28,7 @@ from homeassistant.helpers.selector import (
 from probatio import Invalid
 
 if TYPE_CHECKING:
+    from homeassistant.helpers.field_visibility import FieldCondition
     from homeassistant.helpers.selector import EntityWithDeviceFilterSelectorConfig
 
 from .climate_inputs import validate_climate_config
@@ -490,6 +491,8 @@ _SETTINGS_SECTION_INPUT_TYPES = {
     POLICY_STEP_PRIORITIES: (),
 }
 
+_EV_DEPARTURE_POLICY_FIELDS = ("ev_price_policy", "ev_emergency_price", "ev_emergency_budget")
+
 _SETTINGS_SECTION_OPTION_FIELDS = {
     INPUT_STEP_ENERGY: (
         CONF_BATTERY_MIN_SOC_PERCENT,
@@ -515,10 +518,11 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
         CONF_DEFAULT_READY_BY,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
-        *EV_DEFAULTS,
+        *(field for field in EV_DEFAULTS if field not in _EV_DEPARTURE_POLICY_FIELDS),
         CONF_EV_EARLIEST_START,
         CONF_EV_PRICE_LIMIT_ENABLED,
         CONF_EV_MAX_IMPORT_PRICE,
+        *_EV_DEPARTURE_POLICY_FIELDS,
         CONF_EV_LOW_PRICE_CHARGING_ENABLED,
         CONF_EV_LOW_PRICE_THRESHOLD,
         CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
@@ -535,9 +539,17 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
 
 _SETTINGS_SECTION_ORDER = tuple(_SETTINGS_SECTION_INPUT_TYPES)
 
-_OPTION_VISIBLE_WHEN_ENABLED = {
-    CONF_EV_MAX_IMPORT_PRICE: CONF_EV_PRICE_LIMIT_ENABLED,
-    CONF_EV_LOW_PRICE_THRESHOLD: CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+_EV_PRICE_LIMIT_ON: FieldCondition = {"field": CONF_EV_PRICE_LIMIT_ENABLED, "value": True}
+_EV_DEPARTURE_PRIORITY: list[FieldCondition] = [
+    _EV_PRICE_LIMIT_ON,
+    {"field": "ev_price_policy", "value": "departure_priority"},
+]
+_OPTION_VISIBILITY: dict[str, FieldCondition | list[FieldCondition]] = {
+    CONF_EV_MAX_IMPORT_PRICE: _EV_PRICE_LIMIT_ON,
+    CONF_EV_LOW_PRICE_THRESHOLD: {"field": CONF_EV_LOW_PRICE_CHARGING_ENABLED, "value": True},
+    "ev_price_policy": _EV_PRICE_LIMIT_ON,
+    "ev_emergency_price": _EV_DEPARTURE_PRIORITY,
+    "ev_emergency_budget": _EV_DEPARTURE_PRIORITY,
 }
 
 
@@ -552,17 +564,11 @@ def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) ->
             index = _PRIORITY_FORM_FIELDS.index(field)
             schema[vol.Required(field, default=priority_values[index])] = _priority_selector()
             continue
-        marker = vol.Required(field, default=merged[field])
-        required = getattr(data_entry_flow, "Required", None)
-        # Before HA 2026.11 this name may be absent or refer to typing.Required.
-        if (field in _OPTION_VISIBLE_WHEN_ENABLED
-                and isinstance(required, type) and issubclass(required, vol.Required)):
-            # The feature-detected constructor extends the pinned baseline signature.
-            marker = cast(Any, required)(
-                field,
-                default=merged[field],
-                visible={"field": _OPTION_VISIBLE_WHEN_ENABLED[field], "value": True},
-            )
+        marker: vol.Required
+        if (visibility := _OPTION_VISIBILITY.get(field)) is not None:
+            marker = Required(field, default=merged[field], visible=visibility)
+        else:
+            marker = vol.Required(field, default=merged[field])
         schema[marker] = _option_selector(field)
     return vol.Schema(schema)
 

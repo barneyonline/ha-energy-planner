@@ -4,6 +4,35 @@
 
 ### 🚧 Breaking changes
 
+- Require Home Assistant 2026.11.0 or newer. Update Home Assistant before installing this Energy Planner release.
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes.
+- Keep forecast refreshes running when a provider reports an out-of-range forecast interval.
+- Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision.
+- Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean.
+- Pause synchronized HVAC takeover when native Daikin zones omit setpoints in Dry mode, and preserve safe restoration and reporting of genuine target faults.
+
+### 🔧 Improvements
+
+- Show the EV price policy when the import price limit is enabled. Show the emergency price and budget only with Departure priority. Saved values are retained when the controls are hidden.
+- Show Home Assistant's reported unit alongside live climate temperatures in Current state.
+- Rename the Climate control active entity in place so its ownership updates continue under the new entity ID.
+- Link vehicle target migration repairs to their config entry. Startup adopts older notices, preserves ignored repairs that still need migration, and removes stale notices.
+
+### 🔄 Other changes
+
+- None
+
+## 1.5.0 - 2026-11-14
+
+### 🚧 Breaking changes
+
 - None
 
 ### ✨ New features
@@ -12,15 +41,116 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard. ([#184](https://github.com/barneyonline/ha-energy-planner/pull/184))
+- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change. ([#185](https://github.com/barneyonline/ha-energy-planner/pull/185))
+- Let Resume retire an expired Export Limit request after a verified gateway replacement. Keep the original attempt on record, and refund identity-bound requests refused before sending. ([#185](https://github.com/barneyonline/ha-energy-planner/pull/185))
 
 ### 🔧 Improvements
 
-- Link migration Repairs to their config entry and refresh existing notices on Home Assistant 2026.11+, preserving ignored pending repairs and clearing stale records. Retain explicit cleanup on the unchanged 2026.10 minimum. Draft implementation is blocked from merge until the owner handles the separate HA 2026.11 minimum-version bump.
+- Keep scheduled refreshes on time during frequent input changes and reduce repeated tariff, EV forecast, and calendar processing. ([#186](https://github.com/barneyonline/ha-energy-planner/pull/186))
 
 ### 🔄 Other changes
 
-- Add maintenance workflows and merge checks for HAL-managed issues and PR feedback, with shared operating instructions and changelog/release templates maintained in the central HAL plugin. Keep unattended activation gated by verification.
+- None
+
+## 1.4.14 - 2026-11-11
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Send EV stops promptly when charging feedback shows active charging and the charger switch still reports Off. ([#181](https://github.com/barneyonline/ha-energy-planner/pull/181))
+- Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Let planning continue while Export Limit reconciliation runs. Keep other device actions and EV safety stops eligible, and retry export restoration when its cooldown expires during reconciliation. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Check a reconciled Export Limit plan when turning on Automatic Control or arming production control. Skip export reconciliation for disabled mappings with no retained ownership. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Keep production control stopped when an older Enable or Arm request finishes after a newer Disable or Disarm request. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.13 - 2026-11-09
+
+### 🚧 Breaking changes
+
+- Confirmed calendar history is limited to 365 days and the newest 1,000 records. Older or excess records are removed during history normalization, including on load.
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Preserve outage grace after healthy unchanged forecast polls, keep grace fixed through flapping until sustained recovery, and retain fresh legacy attribute forecasts when the hourly service fails.
+- Retain confirmed, otherwise-safe climate ownership during brief advisory weather outages using in-memory last-good forecasts during an outage grace of at most 15 minutes, capped by the original evidence's freshness deadline. Keep schedules suppressed through safe coast transitions, preserve degraded weather confidence and original evidence age, and restore control on expiry or safety/ownership loss. Cached weather cannot acquire control, restart or reverse HVAC, extend a run, reopen a closed zone or increase demand.
+- Retain the newest confirmed calendar history by timestamp when loading unsorted legacy records, so delayed older outcomes cannot evict newer confirmations.
+
+### 🔧 Improvements
+
+- Bound decision fingerprints and confirmed calendar history (365 days / 1,000 records), select published tariff boundaries after complete source validation, and fetch advisory weather outside the planner lock even when configuration changes. Preserve climate search coverage for 24-hour heating and cooling horizons.
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.12 - 2026-11-07
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Keep shared HVAC coast ownership and schedule suppression when an owned, confirmed closed completed zone is beyond the opposite comfort boundary and recovering passively. Continue room monitoring and hand off on worsening excursions, recovery demand or lost isolation evidence; preserve original restoration baselines.
+
+### 🔧 Improvements
+
+- Replace the integration branding with the cleaner planning calendar, using the banner colours for solar, battery and EV charging. Include light/dark and high-resolution icon and logo variants.
+- Complete and enforce exact 100% statement and branch coverage across the integration, with additional boundary and failure-path tests.
+
+### 🔄 Other changes
+
+- Correct Codecov source matching across reporting jobs while keeping producer code out of the credentialed reporting checkout.
+
+## 1.4.11 - 2026-11-06
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Prevent false incomplete-horizon failures at Amber half-hour tariff boundaries by normalizing only the exact duration/end-backed first-second convention and honoring declared interval ends. Retain fail-closed handling for real gaps, stale sources and invalid metadata; add bounded validity retries and compact source/gap diagnostics.
+
+### 🔧 Improvements
+
+- Reduce entity publication work: avoid constructing unrelated events from reconciled calendar history, normalize Recorder attributes in one pass, and hash pending AI advice once per read. Preserve complete calendar history, diagnostic contents, Recorder budgets and current-plan safety checks.
+- Account for the complete refresh lifecycle in elapsed-time diagnostics, including lock waits and final storage flush. Keep planning responsive behind busy control transactions with conservative deferred export reconciliation.
+
+### 🔄 Other changes
+
+- Simplify maintenance to source-repository workflows, add release-candidate packaging, and isolate coverage reporting from untrusted candidate checks.
+- Add a reproducible Docker development environment with pinned dependencies and reusable test containers.
+- Fix stalled Home Assistant 2026.11 runtime checks by initializing test config entries before registry loading; bound CI jobs and report blocked-thread stacks.
+- Remove cloud development and refresh timing details from the README; require an explicit user request for future README changes.
 
 ## 1.4.10 - 2026-11-01
 

@@ -18,8 +18,69 @@ behaviour. A tariff difference alone is not reported as a monetary saving.
 
 Automatic activation does not enable Automatic control, change Armed, or bypass
 manual overrides, confidence, minimum-cycle or rollback checks. After economic
-activation, degraded evidence returns control to normal climate automations.
+activation, degraded required evidence returns control to normal climate automations;
+a brief advisory weather outage has the bounded continuation exception below.
 Select Legacy explicitly to restore the old policy.
+
+### Brief weather outages
+
+A weather service failure or unavailable weather entity does not alone end an
+otherwise-safe, already-confirmed climate lifecycle. The coordinator keeps the
+last successful hourly forecast in memory and separates its immutable evidence
+age from successful live availability checks. The conservative **15-minute**
+outage grace starts from the last confirmed live fetch before the outage; it is
+also capped by the original forecast evidence's configured freshness deadline.
+Routine successful polls therefore preserve outage tolerance even when hourly
+forecast values stay unchanged. They do not relabel the forecast as newly issued.
+
+Once an outage starts, its deadline stays fixed across failed retries, cache hits,
+changed forecast payloads and brief availability flaps. A successful fetch is
+reassessed immediately as live evidence; a new outage window becomes eligible
+only after successful fetches confirm at least five uninterrupted minutes of
+recovery. A failure restarts that recovery check, not the existing grace. Explicit
+provider issuance metadata, original fetch/observation times and actual continuous
+coverage remain unchanged when a payload is unchanged. Missing values, gaps and
+out-of-horizon values stay unknown. The remaining lifecycle must fit inside that
+real coverage.
+
+A failed hourly service request also preserves the supported live entity-attribute
+forecast path. A healthy weather entity with fresh, valid attribute forecasts is
+assessed using its original issue/update time and actual coverage. Missing, stale,
+future-dated, malformed or unavailable attribute evidence cannot substitute for a
+successful source. A point temperature is not promoted to a forecast by this path.
+
+Grace authorizes only continuation of the existing confirmed ownership and
+intent. It permits existing safe preparation-to-coast transitions, including the
+confirmed isolated-room contract described below. It does not acquire ownership,
+reverse mode, restart an idle head, move back from coast to preparation, extend
+preparation or release deadlines, reopen a closed zone, or increase head/room
+target demand. The existing executor still confirms device commands and owns
+schedule suppression and restoration. A successful transaction can narrow the
+confirmed intent during grace; it cannot renew weather evidence.
+
+Fresh room and device evidence, comfort boundaries, actual isolation/airflow,
+manual actions, occupancy, tariffs, minimum-cycle rules and all other safety
+gates remain authoritative. A weather lease is rechecked at execution and before
+adapter writes, including after asynchronous persistence. Grace expiry schedules
+a refresh at the exact deadline and uses the existing release/restoration path.
+Source/policy changes invalidate incompatible caches. Restart and reload discard
+the in-memory forecast; persisted ownership alone cannot authorize grace.
+
+Weather diagnostics and the climate device plan expose live/cached/unavailable
+availability, original fetch and observation times, provider issue time when
+present, evidence age, last successful live fetch, outage/recovery times,
+original and effective coverage, grace expiry/remaining,
+retained ownership and its reason. Cached weather has **zero weather-source
+confidence**; the energy-planning confidence still describes its required energy
+sources. Continuation checks the previous qualified climate confidence and fresh
+non-weather confidence separately. This does not qualify acquisition or change
+reported climate confidence. Recovery with a successful forecast is reassessed
+through the usual policy and constraints, retaining compatible ownership without
+an intermediate restoration/reacquisition.
+
+Deterministic evidence is in `tests/test_weather_outage.py`, with cache and refresh
+regressions in `tests/test_coordinator.py` and `tests/test_refresh_timing.py`.
+These offline tests do not establish physical results on a deployed system.
 
 ### Direction permission and fallback evidence
 
@@ -736,3 +797,46 @@ Climate observation predictions persist each baseline interval's end, so measure
 Forecast confidence weights coverage by actual duration rather than interval count, including point-only inputs. Load coverage diagnostics use the same elapsed durations. Calendar label upgrades retain a confirmed climate phase's existing identity (UID, confirmed start and location), while separate phase UIDs and discrete actions remain distinct.
 
 Coverage classification sums elapsed durations before converting to hours. Exact eight- and twelve-hour windows qualify at their existing thresholds even when import/export tariff boundaries are a second apart; a window ending one second short still fails that threshold.
+
+## Completed isolated rooms during coast
+
+At the preparation deadline, the existing pre-peak/peak coast keeps the shared
+head off and retains climate ownership, managed schedule suppression and the
+Climate control active signal. A completed closed room below its cooling comfort
+low (or above its heating comfort high) no longer releases the whole unit by
+itself. This exception requires committed ownership, persisted paused/completed
+intent, original actuator ownership, registry-validated switch/thermostat pairs,
+fresh unambiguous room feedback, exact physical switch readback matching intent,
+and an installer-verified remaining open set. Thermostat aliases and a generic
+disabled flag cannot establish closure. No new timer or schedule is introduced.
+
+The closed room remains monitored against its ordinary bounds. During head-off
+coast it may recover passively from the opposite-boundary excursion. Worsening
+relative to the last persisted coast temperature triggers the existing whole-unit
+comfort handoff; there is no relaxed temperature threshold. Any participating
+room breach, or any room reaching the coast recovery boundary, still hands off.
+Missing isolation proof cannot grant an exception. The adapter repeats physical,
+sensor and comfort checks before execution, including after intervening awaits.
+Manual changes, stop/control disable, away policy and pending recovery retain their
+existing authority. The original targets, dampers and automation enablement remain
+owned until actual release and use the existing guarded restoration transaction.
+A necessary recovery handoff releases the shared unit and schedules together;
+the existing no-reacquisition hold does not claim continued suppression.
+
+Coast preserves the confirmed physical completion intent instead of recalculating
+preparation reopening requests. Reload reads that persisted intent plus current
+physical state. Independent subsets continue through the fallback policy; their
+economic savings model remains unqualified and no economic takeover is enabled.
+Non-independent economic and fallback comfort checks retain their existing rules.
+The conservative worsening check may hand back control on sensor noise; this
+patch does not prove physical recovery or guarantee every room reaches comfort.
+Regression evidence is in tests/test_zone_control.py; full validation is
+scripts/docker-validate.sh. No live-device observations are claimed by these tests.
+
+Coast airflow proof uses the actual retained open set, independently of hypothetical
+preparation reopening requests after dwell/hysteresis expiry. After final device
+confirmation the adapter rechecks room feedback, physical isolation, comfort and
+the stopped head, and returns a fresh coast intent to the ownership transaction.
+That confirmed observation establishes the next recovery-trend baseline; an older
+queued action cannot replace the latest physical completion intent or hide drift
+between execution and the following refresh.

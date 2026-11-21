@@ -63,6 +63,15 @@ forecast evidence supports it.
 
 ## Charging observations
 
+If your vehicle sends telemetry to A Better Routeplanner (ABRP), you can map its
+percentage **SoC** entity to **Vehicle SOC sensor** in the tracked vehicle profile.
+Verify the percentage updates during home charging before relying on it for
+automatic planning. ABRP can continue to show its last value while the vehicle is
+parked. Use charger-side connection and fresh charging feedback for control and
+delivery verification. Map the target-SOC input separately and use ABRP only
+for the vehicle's SoC, since its charging state comes from the same telemetry.
+[A Better Routeplanner telemetry and update behavior](https://www.home-assistant.io/integrations/abrp/#data-updates)
+
 Optional measured charging power accepts W or kW. Optional cumulative energy
 accepts Wh or kWh. Observations older than ten minutes are not used for learning.
 Measured energy takes precedence over integrated power. The existing configured
@@ -226,6 +235,21 @@ controls require a stateful control before EV operation can resume. Saved
 command identity remains recovery evidence, and a confirmed switch-off is
 required to release charging owned through an old command endpoint.
 
+
+## EV stop confirmation
+
+When the mapped charging sensor reports active charging and the vehicle has no
+confirmed disconnect, the planner sends a stop even if the charger switch still
+reports Off. Charging feedback can arrive before the switch update. The planner
+checks again before retrying and skips writes when the switch is Off and
+feedback shows charging has stopped or the vehicle is unplugged. A stop
+dispatched against active charging feedback requires both an Off switch and
+stopped or unplugged feedback for confirmation. The switch has its own
+confirmation window once stopped feedback arrives. Brief gaps in charging
+feedback can settle within the confirmation window, including after a
+compensating stop. `Finishing` is stopped feedback. A plug sensor state must
+explicitly report a disconnect to serve as unplugged evidence. Unconfirmed
+automatic stops retain the existing failure backoff.
 
 ## Vehicle suspension and waiting
 

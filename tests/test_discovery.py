@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
+from homeassistant.helpers import entity_registry
 
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
@@ -22,6 +26,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    DEFAULT_OPTIONS,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
 from custom_components.ha_energy_planner.discovery import (
     CapabilityDiscovery,
@@ -29,6 +35,7 @@ from custom_components.ha_energy_planner.discovery import (
     _service_evidence,
     _state_missing,
 )
+from custom_components.ha_energy_planner.inputs import InputManager
 from custom_components.ha_energy_planner.models import ActionAsset
 
 
@@ -102,6 +109,21 @@ def test_discovery_reports_supported_controls() -> None:
     assert report.hvac.supported is True
     assert report.enphase.supported is True
     assert report.ai.supported is True
+
+
+@pytest.mark.parametrize("synchronized", [False, True])
+def test_unusable_head_range_with_valid_scalar_blocks_only_synchronized_takeover(synchronized: bool) -> None:
+    hass = FakeHass({
+        "climate.main": FakeState("cool", {"temperature": 22, "target_temp_low": 20, "target_temp_high": "NaN"}),
+        "climate.zone": FakeState("cool", {"temperature": 22}),
+    }, set())
+    entry_data = {CONF_DAIKIN_CLIMATE: "climate.main", CONF_CLIMATE_ZONES: ["climate.zone"]}
+    report = CapabilityDiscovery(hass, entry_data, {
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: synchronized,
+    }).inspect().hvac
+
+    assert report.supported is not synchronized
+    assert report.issues == (["main_climate_target_unavailable"] if synchronized else [])
 
 
 def test_climate_target_discovery_is_options_aware_and_reports_entities() -> None:
@@ -431,3 +453,141 @@ def test_off_zone_without_target_defers_only_zone_synchronisation() -> None:
     assert "climate_zone_target_unavailable" in discovery.inspect().hvac.issues
     hass.states.values["climate.zone"] = FakeState("heat", {"temperature": 20})
     assert discovery.inspect().hvac.details["zone_targets_deferred"] == []
+
+
+def test_synchronized_live_check_distinguishes_off_from_missing_active_targets() -> None:
+    head, zone, switch = "climate.main", "climate.zone", "switch.zone"
+    hass = FakeHass({head: FakeState("off"), zone: FakeState("off"), switch: "unavailable"}, set())
+    discovery = CapabilityDiscovery(
+        hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone, switch]},
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+
+    # An Off start may have captured the head target from native mode memory.
+    assert discovery.synchronized_takeover_issues() == ["climate_zone_unavailable"]
+    hass.states.values[zone] = FakeState("heat")
+    assert discovery.synchronized_takeover_issues() == [
+        "climate_zone_unavailable", "climate_zone_target_unavailable",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("other_state", "other_registration", "fault"),
+    [
+        (FakeState("dry", {"zone_id": 1}), None, "climate_zone_target_unavailable"),
+        (FakeState("dry", {"zone_id": 1}), {"platform": "other"}, "climate_zone_target_unavailable"),
+        (FakeState("dry", {"zone_id": 1}), {"config_entry_id": "other"}, "climate_zone_target_unavailable"),
+        (FakeState("dry", {"zone_id": 1}), {"device_id": "other"}, "climate_zone_target_unavailable"),
+        (FakeState("dry", {"zone_id": 1, "temperature": "NaN"}), {}, "climate_zone_target_unavailable"),
+        (FakeState("dry", {"zone_id": 1, "temperature": False}), {}, "climate_zone_target_unavailable"),
+        pytest.param(
+            FakeState("dry", {"zone_id": 1, "temperature": 10**400}),
+            {},
+            "climate_zone_target_unavailable",
+            id="oversized-setpoint",
+        ),
+        (
+            FakeState("dry", {"zone_id": 1, "target_temp_low": 26, "target_temp_high": 18}),
+            {},
+            "climate_zone_target_unavailable",
+        ),
+        (
+            FakeState("dry", {"zone_id": 1, "temperature": 22, "target_temp_low": 20, "target_temp_high": "NaN"}),
+            {},
+            "climate_zone_target_unavailable",
+        ),
+        (FakeState("dry", {}), {}, "climate_zone_target_unavailable"),
+        (FakeState("cool", {"zone_id": 1}), {}, "climate_zone_target_unavailable"),
+        (FakeState("unavailable"), {}, "climate_zone_unavailable"),
+    ],
+)
+def test_dry_zone_target_classification_preserves_other_faults(
+    monkeypatch: pytest.MonkeyPatch,
+    other_state: FakeState,
+    other_registration: dict[str, str] | None,
+    fault: str,
+) -> None:
+    registration = {"platform": "daikin", "config_entry_id": "daikin", "device_id": "airbase"}
+    registry = {
+        "climate.head": SimpleNamespace(**registration),
+        "climate.zone": SimpleNamespace(**registration),
+        "climate.other": (
+            None if other_registration is None else SimpleNamespace(**(registration | other_registration))
+        ),
+    }
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    hass = FakeHass(
+        {
+            "climate.head": FakeState("dry", {"temperature": 17}),
+            "climate.zone": FakeState("dry", {"zone_id": 0}),
+            "climate.other": other_state,
+            "switch.zone": "on",
+        },
+        set(),
+    )
+    entry_data = {
+        CONF_DAIKIN_CLIMATE: "climate.head",
+        CONF_CLIMATE_ZONES: ["climate.zone", "climate.other", "switch.zone"],
+    }
+    options = {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}
+    report = CapabilityDiscovery(hass, entry_data, options).inspect().hvac
+
+    assert not report.supported
+    assert set(report.issues) == {HVAC_DRY_ZONE_TARGETS_ABSENT, fault}
+    assert report.details["zone_targets_absent_in_dry_mode"] == ["climate.zone"]
+    fault_detail = "unavailable_zones" if fault == "climate_zone_unavailable" else "zone_targets_unavailable"
+    assert report.details[fault_detail] == ["climate.other"]
+    disabled = CapabilityDiscovery(
+        hass, entry_data, {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False},
+    ).inspect().hvac
+    assert disabled.details["zone_targets_absent_in_dry_mode"] == []
+    assert disabled.issues == (["climate_zone_unavailable"] if fault == "climate_zone_unavailable" else [])
+
+    hass.states.values["climate.head"] = FakeState("cool", {"temperature": 17})
+    different_head_mode = CapabilityDiscovery(hass, entry_data, options).inspect().hvac
+    assert different_head_mode.details["zone_targets_absent_in_dry_mode"] == []
+    assert "climate.zone" in different_head_mode.details["zone_targets_unavailable"]
+
+
+@pytest.mark.parametrize("synchronize", [False, True])
+@pytest.mark.parametrize("target", [2**64, 10**400], ids=["storage_overflow", "float_overflow"])
+def test_oversized_head_target_preserves_dry_input_reporting(
+    monkeypatch: pytest.MonkeyPatch, synchronize: bool, target: int,
+) -> None:
+    head, zone = "climate.head", "climate.zone"
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": target}),
+        zone: FakeState("dry", {"zone_id": 0}),
+        "switch.ev": "off",
+    }, set())
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone], CONF_EV_CHARGER: "switch.ev"}
+    options = {**DEFAULT_OPTIONS, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: synchronize}
+
+    report = CapabilityDiscovery(hass, entry_data, options).inspect()
+    context = InputManager(hass, entry_data, options).build_context()
+
+    expected = ["main_climate_target_unavailable"]
+    if synchronize:
+        expected.append(HVAC_DRY_ZONE_TARGETS_ABSENT)
+    assert report.hvac.issues == expected
+    assert report.hvac.details["main_target_unavailable"] == [head]
+    assert report.hvac.details["zone_targets_absent_in_dry_mode"] == ([zone] if synchronize else [])
+    assert report.ev.supported
+    assert context.current_hvac_mode == "dry"
+    assert context.climate_inputs["target"] is None
+
+
+def test_dry_mode_never_classifies_the_head_as_a_zone() -> None:
+    head = "climate.head"
+    hass = FakeHass({head: FakeState("dry", {"zone_id": 0})}, set())
+    report = CapabilityDiscovery(
+        hass,
+        {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [head]},
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    ).inspect().hvac
+
+    assert report.issues == ["main_climate_target_unavailable", "climate_zone_target_unavailable"]
+    assert report.details["zone_targets_absent_in_dry_mode"] == []

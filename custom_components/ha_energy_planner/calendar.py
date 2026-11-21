@@ -68,7 +68,7 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
     def event(self) -> CalendarEvent | None:
         """Return the current or next controlled action."""
         now = dt_util.utcnow()
-        events = [event for event in _events_with_history(self.coordinator) if event.end > now]
+        events = _events_with_history(self.coordinator, start_date=now, next_only=True)
         return None if not events else events[0]
 
     async def async_get_events(
@@ -78,26 +78,37 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
         end_date: datetime,
     ) -> list[CalendarEvent]:
         """Return controlled actions that overlap the requested range."""
-        return [
-            event for event in _events_with_history(self.coordinator)
-            if event.end > start_date and event.start < end_date
-        ]
+        return _events_with_history(
+            self.coordinator, start_date=start_date, end_date=end_date,
+        )
 
 
-def _events_with_history(coordinator: EnergyPlannerCoordinator) -> list[CalendarEvent]:
+def _events_with_history(
+    coordinator: EnergyPlannerCoordinator, *, start_date: datetime | None = None,
+    end_date: datetime | None = None, next_only: bool = False,
+) -> list[CalendarEvent]:
     """Combine saved history with live events without changing storage on reads."""
     state = update_calendar_history(
         coordinator.store.data.get("calendar_history"),
         calendar_event_records(coordinator), dt_util.utcnow(),
     )
-    return sorted(
-        [CalendarEvent(
+    # Reconcile complete confirmed history before selecting records. Historical
+    # UIDs and running-window matches still participate in that reconciliation,
+    # but HA need not validate/deepcopy a CalendarEvent for every elapsed record
+    # on each of its state, attributes and alarm-scheduling property reads.
+    records = [
+        record for record in [*state["history"], *state["pending"]]
+        if (start_date is None or datetime.fromisoformat(record["end"]) > start_date)
+        and (end_date is None or datetime.fromisoformat(record["start"]) < end_date)
+    ]
+    records.sort(key=lambda record: datetime.fromisoformat(record["start"]))
+    if next_only:
+        records = records[:1]
+    return [CalendarEvent(
             start=datetime.fromisoformat(record["start"]), end=datetime.fromisoformat(record["end"]),
             summary=record["summary"], uid=record["uid"],
             description=record.get("description"), location=record.get("location"),
-        ) for record in [*state["history"], *state["pending"]]],
-        key=lambda event: event.start,
-    )
+        ) for record in records]
 
 
 class _CalendarPlanView:
@@ -113,7 +124,7 @@ class _CalendarPlanView:
 
 def calendar_event_records(
     coordinator: EnergyPlannerCoordinator, plan: EnergyPlan | None = None,
-    *, state_overrides: dict[str, Any] | None = None,
+    *, state_overrides: dict[str, Any] | None = None, confirmed_only: bool = False,
 ) -> list[dict[str, str]]:
     """Snapshot the same bounded event metadata that the calendar publishes."""
     if plan is not None:
@@ -121,7 +132,9 @@ def calendar_event_records(
         # update vehicle identity, overrides, and the planner safety generation.
         coordinator = cast(EnergyPlannerCoordinator, _CalendarPlanView(coordinator, plan))
     records = []
-    for event, confirmed_start in _calendar_windows(coordinator, state_overrides=state_overrides):
+    for event, confirmed_start in _calendar_windows(
+        coordinator, state_overrides=state_overrides, confirmed_only=confirmed_only,
+    ):
         record = {
             "start": event.start.isoformat(), "end": event.end.isoformat(),
             "summary": event.summary, "uid": event.uid or "",
@@ -140,23 +153,27 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
 
 def _calendar_windows(
     coordinator: EnergyPlannerCoordinator, *, state_overrides: dict[str, Any] | None = None,
+    confirmed_only: bool = False,
 ) -> list[tuple[CalendarEvent, datetime | None]]:
     """Pair each displayed window with independently confirmed start evidence."""
     plan = coordinator.data
     if plan is None:
         return []
     events: list[tuple[CalendarEvent, datetime | None]] = []
+    states = dict(state_overrides or {})
+    now = dt_util.utcnow()
     for action in plan.actions:
         if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
             continue  # Its tariff windows remain visible without redundant commands.
         if not _calendar_control_enabled(coordinator, action.asset):
             continue
+        actual_start = _actual_start(coordinator, action, now, state_overrides=states)
+        if confirmed_only and actual_start is None:
+            continue
         candidates = (
             _ev_charging_events(action, plan.interval_minutes)
             if action.kind == ActionKind.EV_SCHEDULE else [_calendar_event(action, coordinator)]
         )
-        now = dt_util.utcnow()
-        actual_start = _actual_start(coordinator, action, now, state_overrides=state_overrides)
         # Delayed feedback can prove that an elapsed allocation actually ran.
         # Prefer the current window; otherwise confirm one latest past window
         # covered by the same physical charging start, keeping its identity unique.
@@ -198,8 +215,9 @@ def _calendar_windows(
                         f"{coordinator.entry.entry_id}-{action.asset}-{actual_start.isoformat()}", max_bytes=255,
                     ),
                 )
-            events.append((event, confirmed_start))
-    if _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
+            if not confirmed_only or confirmed_start is not None:
+                events.append((event, confirmed_start))
+    if not confirmed_only and _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
         export = export_limit_status(coordinator)
         windows: list[list[dict[str, Any]]] = []
         for block in export.get("blocks", []):
@@ -246,9 +264,13 @@ def _actual_start(
     states = getattr(coordinator.hass, "states", None)
     if states is None:
         return None
+    if state_overrides is None:
+        state_overrides = {}
     if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_SCHEDULE, ActionKind.EV_START}:
         entity_id = mapping.get(CONF_EV_CHARGING)
-        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
+        if entity_id and entity_id not in state_overrides:
+            state_overrides[entity_id] = states.get(entity_id)
+        state = state_overrides.get(entity_id) if entity_id else None
         if state is None or ev_charging_state(state.state) is not True:
             return None
         start = getattr(state, "last_changed", None)
@@ -257,7 +279,9 @@ def _actual_start(
         if not isinstance(control, dict):
             return None
         entity_id = mapping.get(CONF_DAIKIN_CLIMATE)
-        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
+        if entity_id and entity_id not in state_overrides:
+            state_overrides[entity_id] = states.get(entity_id)
+        state = state_overrides.get(entity_id) if entity_id else None
         if (not control.get("main_state_committed") or control.get("required_evidence_lost")
                 or state is None or state.state not in {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"}
                 or (state.state == "off" and action.desired_state.get("hvac_mode") != "off")

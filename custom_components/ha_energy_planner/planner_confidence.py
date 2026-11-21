@@ -18,6 +18,9 @@ from .const import (
     CONF_PV_FORECAST,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
+    HVAC_CAPABILITY_ISSUES,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    HVAC_ROLLBACK_TARGET_FAULTS,
 )
 from .models import (
     ActionAsset,
@@ -53,11 +56,7 @@ def confidence_from_context(context: DecisionContext) -> float:
 def _hvac_rollback_capability_unavailable(context: DecisionContext) -> bool:
     """Return whether HVAC takeover lacks a required rollback target."""
     return any(
-        issue
-        in {
-            "main_climate_target_unavailable",
-            "climate_zone_target_unavailable",
-        }
+        issue in HVAC_ROLLBACK_TARGET_FAULTS or issue == HVAC_DRY_ZONE_TARGETS_ABSENT
         for issue in context.input_issues
     )
 
@@ -134,12 +133,29 @@ def _subsystem_confidence(base: float, issue_text: str, issue_markers: tuple[str
     return base
 
 
+def hvac_continuation_confidence(context: DecisionContext, options: Mapping[str, Any]) -> bool:
+    """Check non-weather confidence plus the last confirmed climate qualification."""
+    breakdown = _confidence_breakdown(context, [])
+    issues = " ".join(i for i in context.input_issues if not i.startswith("advisory_"))
+    safe = context.hvac_control.get("weather_safe_intent", {})
+    climate = _finite_number(safe.get("climate_confidence")) or 0.0
+    breakdown["climate"] = _subsystem_confidence(
+        min(confidence_from_health(context.input_health), climate), issues, ("daikin_", "climate_", "weather_"))
+    return _confidence_values_meet_threshold(ActionAsset.DAIKIN, breakdown, options)
+
+
 def _action_meets_confidence_threshold(
     action: PlanAction,
     context: DecisionContext,
     options: Mapping[str, Any],
 ) -> bool:
     """Return whether an action clears tariff and device confidence thresholds."""
+    if action.asset == ActionAsset.DAIKIN and action.desired_state.get("weather_continuation"):
+        from .weather_control import continuation_rejection, intent_rejection
+        return (continuation_rejection(context, context.created_at) is None
+                and intent_rejection(action.desired_state, context.hvac_control.get("weather_safe_intent", {}),
+                                     action.execute_not_before, context.current_hvac_mode) is None
+                and hvac_continuation_confidence(context, options))
     return asset_meets_confidence_threshold(action.asset, context, options)
 
 
@@ -247,6 +263,8 @@ def _confidence_rejection_reason(
 def _only_load_fallback(context: DecisionContext) -> bool:
     """Economic uncertainty alone must not invalidate fresh EV/tariff/solar evidence."""
     material = {i for i in context.input_issues if not i.startswith("advisory_")}
+    if HVAC_DRY_ZONE_TARGETS_ABSENT in material:
+        material.difference_update(HVAC_CAPABILITY_ISSUES)
     return (context.input_health == InputHealth.DEGRADED
             and material == {"household_load_model_fallback_active"}
             and context.ev_evidence.get("load_fallback", {}).get("fallback_applied") is True)
