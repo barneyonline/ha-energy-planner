@@ -15,6 +15,7 @@
 - Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes.
 - Keep forecast refreshes running when a provider reports an out-of-range forecast interval.
 - Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision.
+- Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean.
 
 ### 🔧 Improvements
 

@@ -7,6 +7,7 @@ import json
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from homeassistant.core import State
@@ -16,7 +17,11 @@ from test_export_limit import setup as export_setup
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
 from custom_components.ha_energy_planner import export_limit_policy
 from custom_components.ha_energy_planner.action_limits import action_budget, budget_history
-from custom_components.ha_energy_planner.const import CONF_COMMAND_RATE_LIMIT_SECONDS, CONF_DRY_RUN
+from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DRY_RUN,
+)
 from custom_components.ha_energy_planner.export_limit_cooldown import control_key, cooldown_status
 from custom_components.ha_energy_planner.export_limit_policy import EXPORT_ASSET, build_actions
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -342,8 +347,6 @@ def test_clock_repair_reopens_daily_allowance_after_remap_and_settled_refresh(se
 
 
 def test_export_tariff_reuses_validation_but_rechecks_time_confidence_and_replacement(setup, monkeypatch):
-    from unittest.mock import Mock
-
     s = setup
     parse = Mock(wraps=export_limit_policy._parse_blocks)
     monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
@@ -362,9 +365,42 @@ def test_export_tariff_reuses_validation_but_rechecks_time_confidence_and_replac
     assert current(NOW + timedelta(minutes=31))[1] == "export_tariff_stale"
     assert current(NOW, minimum_tariff_confidence=90)[1] == "export_tariff_confidence_low"
     parse.assert_called_once()
+    raw.attributes["forecasts"][0]["duration"] = 30
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 2
+    raw.attributes["forecasts"].pop()
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 3
     raw = price_state((0.2, -0.1))
     s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
     assert current(NOW)[0][0]["watts"] is None
+    assert parse.call_count == 4
+
+
+@pytest.mark.parametrize(("revised_price", "issue"), [(False, "export_tariff_invalid"), (0.0, None)])
+def test_export_tariff_cache_revalidates_a_nested_price_type_change(setup, monkeypatch, revised_price, issue):
+    entity_id = DATA[CONF_AMBER_EXPORT_PRICE]
+    raw = price_state((0, 0.2))
+    row = raw.attributes["forecasts"][0]
+    row["prediction"] = {"per_kwh": row.pop("per_kwh")}
+    state = State(entity_id, raw.state, raw.attributes, last_updated=NOW)
+    setup.states[entity_id] = state
+    parse = Mock(wraps=export_limit_policy._parse_blocks)
+    monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
+
+    def current():
+        return runtime.current_tariff_blocks(setup.hass, entity_id, OPTIONS, NOW)
+
+    original = current()
+    assert original[1] is None and original[0][0]["price"] == 0
+    assert current() == original
+    parse.assert_called_once()
+
+    row["prediction"]["per_kwh"] = revised_price
+    assert setup.states[entity_id] is state
+    blocks, reason = current()
+    assert reason == issue
+    assert blocks == (original[0] if issue is None else [])
     assert parse.call_count == 2
 
 
