@@ -22,6 +22,12 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 - Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.
 - Optional on-demand AI Task explanations that remain advisory.
 
+**Current state** includes the temperature unit reported by Home Assistant
+alongside live climate readings and setpoints. When the thermostat reports a
+non-Celsius unit, the summary uses the live reading and its unit. The **Climate
+control active** indicator continues receiving ownership updates if its entity
+ID is renamed in the entity registry.
+
 ## Load forecast publication
 
 **Current load forecast** keeps the committed plan's value and model evidence visible while the next refresh saves its replacement. The new plan and its forecast appear together, avoiding brief unknown-state pulses in Recorder. Missing or invalid forecast evidence remains explicit; refresh failures and stale-plan safety checks retain their normal behavior.
@@ -99,11 +105,11 @@ Coverage thresholds retain exact elapsed durations when tariff timestamps differ
 
 Energy Planner is configured through the UI; a `ha_energy_planner:` entry in `configuration.yaml` is unsupported.
 
-On Home Assistant 2026.11 or newer, EV maximum import price and low-price charging threshold appear only when their respective toggles are enabled. Disabling a toggle retains its saved threshold for later use. Older supported versions continue to show both thresholds.
+The EV import price limit toggle reveals the maximum import price and price policy. Selecting **Departure priority** also reveals the emergency price and budget. The low-price charging threshold appears when low-price charging is enabled. Hidden settings retain their saved values and restore them when shown again.
 
 ## Compatibility
 
-- Home Assistant **2026.10.0** or newer, using Python **3.14+**.
+- Home Assistant **2026.11.0** or newer, using Python **3.14+**.
 - Normal energy planning requires tariff and external PV forecasts, measured household consumption with Recorder history, and battery SOC. Each control area needs its mapped controls and feedback.
 - Export-only operation has narrower input requirements; see [Enphase Export Limit](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit).
 - Export Limit setting changes, including restoration, are separated by at least five minutes after Planner first observes fresh matching readback. Dispatch attempts are reserved durably by upstream control identity; delayed or uncertain feedback cannot authorize repeated writes. Stricter command intervals still apply. Deadlines crossed during input collection trigger an immediate fresh replan. Clock repair preserves restoration event identity. Projected grid export and costs use fresh confirmed limits during the hold, with raw solar production retained. Diagnostics, next actions and calendar previews show deferral and the next eligible time. See [export change timing](export-limit-timing.md).

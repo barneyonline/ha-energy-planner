@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULES = {
     "test_ha_runtime.py", "test_control_runtime.py", "test_device_registry_runtime.py",
     "test_storage_runtime.py", "test_upgrade_runtime.py", "test_config_flow.py",
+    "test_conditional_ev_options_runtime.py",
     "test_repairs.py", "test_lifecycle.py", "test_services.py", "test_calendar.py", "test_manifest.py",
 }
 
@@ -27,14 +28,14 @@ def test_combined_modules_preserve_test_and_crash_failures(tmp_path: Path, exit_
     docker.chmod(0o755)
     calls_file = tmp_path / "calls"
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts/docker-compatibility.sh"), "2026.10.0", "stable"],
+        ["bash", str(ROOT / "scripts/docker-compatibility.sh"), "2026.11.0", "stable"],
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
              "CALLS_FILE": str(calls_file), "DOCKER_TEST_EXIT": str(exit_code)},
         capture_output=True, text=True, check=False,
     )
     assert result.returncode == exit_code, result.stderr
     calls = calls_file.read_text().splitlines()
-    versions = ["2026.10.0", "stable"] if exit_code == 0 else ["2026.10.0"]
+    versions = ["2026.11.0", "stable"] if exit_code == 0 else ["2026.11.0"]
     assert len(calls) == len(versions)
     for version in versions:
         version_calls = [line for line in calls if f"home-assistant:{version} " in line]

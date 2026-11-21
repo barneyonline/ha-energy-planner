@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
+from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -12,13 +14,18 @@ from typing import Any
 import pytest
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.entity_platform import EntityPlatform
 from homeassistant.helpers.icon import async_get_icons
 from homeassistant.util import dt as dt_util
 
 from custom_components.ha_energy_planner import CONFIG_SCHEMA, async_setup_entry
+from custom_components.ha_energy_planner import binary_sensor as planner_binary_sensor
 from custom_components.ha_energy_planner.ai_advisor import LocalAIAdvisor
 from custom_components.ha_energy_planner.const import CONF_AI_TASK_ENTITY, DOMAIN
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
@@ -104,6 +111,80 @@ def test_real_config_entry_awaits_coordinator_unload_callbacks(tmp_path: Path) -
             assert coordinator._unsub_listeners == []
         finally:
             await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+def test_climate_ownership_sensor_is_renamed_in_place(tmp_path: Path) -> None:
+    """Keep live ownership and coordinator updates through a registry rename."""
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        loader.async_setup(hass)
+        hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Runtime rename", data={}, options={},
+            source="user", unique_id=None, version=5, minor_version=2,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        hass.config_entries._entries[entry.entry_id] = entry
+        dr.async_setup(hass)
+        await dr.async_load(hass, load_empty=True)
+        await asyncio.wait_for(er.async_load(hass, load_empty=True), timeout=10)
+
+        store = PlannerStore(hass, entry.entry_id)
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        entry.runtime_data = coordinator
+        platform = EntityPlatform(
+            hass=hass, logger=logging.getLogger(__name__), domain="binary_sensor",
+            platform_name=DOMAIN, platform=planner_binary_sensor,
+            scan_interval=timedelta(seconds=30), entity_namespace=None,
+        )
+        platform.async_prepare()
+        try:
+            assert await platform.async_setup_entry(entry)
+            registry = er.async_get(hass)
+            unique_id = f"{entry.entry_id}_climate_control_active"
+            original_id = registry.async_get_entity_id("binary_sensor", DOMAIN, unique_id)
+            assert original_id is not None
+            original_registration = registry.async_get(original_id)
+            assert original_registration is not None
+            entity = platform.entities[original_id]
+            removed = []
+            entity.async_on_remove(lambda: removed.append(True))
+
+            await store.async_save_ownership({"hvac_control": {"phase": "preconditioning"}})
+            assert hass.states.is_state(original_id, STATE_ON)
+            renamed_id = "binary_sensor.planner_climate_ownership"
+            renamed = registry.async_update_entity(original_id, new_entity_id=renamed_id)
+            await asyncio.wait_for(hass.async_block_till_done(), timeout=10)
+            assert not removed
+            assert renamed.id == original_registration.id
+            assert renamed.unique_id == unique_id
+            assert platform.entities[renamed_id] is entity
+            assert hass.states.get(original_id) is None
+            assert hass.states.is_state(renamed_id, STATE_ON)
+            assert hass.states.get(renamed_id).attributes["phase"] == "preconditioning"
+
+            await store.async_clear_ownership()
+            assert hass.states.is_state(renamed_id, STATE_OFF)
+            coordinator.last_update_success = False
+            coordinator.async_update_listeners()
+            assert hass.states.is_state(renamed_id, STATE_UNAVAILABLE)
+            coordinator.last_update_success = True
+            coordinator.async_update_listeners()
+            assert hass.states.is_state(renamed_id, STATE_OFF)
+
+            await platform.async_reset()
+            assert removed == [True]
+            assert not platform.entities
+            assert not store._ownership_listeners
+            assert not coordinator._listeners
+            await store.async_save_ownership({"hvac_control": {"phase": "peak_coast"}})
+            assert hass.states.is_state(renamed_id, STATE_UNAVAILABLE)
+        finally:
+            await platform.async_destroy()
             await hass.async_stop(force=True)
 
     asyncio.run(run())

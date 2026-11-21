@@ -9,6 +9,22 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Current state publishes Home Assistant's reported temperature unit alongside
+  live climate readings and targets, including low/high targets. The unit is
+  omitted when the source lacks a valid unit or supplies no temperature details.
+  The summary uses the live reading when the head reports a non-Celsius unit.
+  `tests/test_sensor.py` checks Celsius, Fahrenheit, and omission cases through
+  the Recorder-bounded sensor attributes and replays the data shape in
+  `tests/fixtures/live_schema/climate_zone_temperatures.json`.
+  See [planning and control](planning-and-control.md#feature-reference).
+- The Climate control active entity opts into Home Assistant 2026.11's in-place
+  entity ID changes. Its store and coordinator subscriptions continue publishing
+  under the new entity ID and are cleaned up on unload. `tests/test_ha_runtime.py`
+  exercises rename and unload through the actual entity registry and platform.
+- Operator guides explain how [Home Assistant Action history](stable-release.md#example-setup)
+  complements verified Planner activity, when to use [ABRP SoC](ev-scheduling.md#charging-observations),
+  and how to interpret optional [Enphase radio diagnostics](export-limit-timing.md).
+
 - Local integration branding ships all eight Home Assistant PNG variants under
   `custom_components/ha_energy_planner/brand/`: transparent light/dark icons at
   256×256 and 512×512, and light/dark wordmark logos at 548×256 and 1096×512.
@@ -87,7 +103,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   This changes documentation presentation only. Full validation remains
   `scripts/docker-validate.sh`.
 
-- The README presents concise features before a compact light/dark screenshot gallery, links directly to this repository in HACS, and keeps project badges visible outside expandable sections. `docs/planning-and-control.md` preserves the previous README's detailed behavior, compatibility requirements and safety limits, with corrected relative links. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. This is a documentation change; runtime behavior, configuration and quality-scale claims are unchanged. Full validation remains `scripts/docker-validate.sh`.
+- The README presents concise features before a compact light/dark screenshot gallery and keeps project badges visible outside expandable sections. Its installation guide links to the Marketplace listing, documents the Home Assistant 2026.11.0 minimum and explains how to add the repository from a link. The bug report form accepts both Marketplace and HACS as installation methods. `docs/planning-and-control.md` describes behavior, compatibility requirements and safety limits. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. Full validation remains `scripts/docker-validate.sh`.
 
 - UI-only configuration is declared by `CONFIG_SCHEMA` delegating to `cv.config_entry_only_config_schema(DOMAIN)` in `__init__.py`, as required by hassfest for integrations with `async_setup`. The helper is imported when validation runs so standalone planner tools remain usable without Home Assistant installed. `tests/test_ha_runtime.py` covers normal configuration and unsupported domain YAML. Integration services remain registered in `async_setup`; service tests and the Docker smoke gate cover service registration.
 
@@ -215,18 +231,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   These supplement the existing constraint-only supplied-plan replay fixtures.
 - Custom integration scaffold, config flow, options flow, entities, services,
   diagnostics, and versioned Home Assistant `Store` persistence are present.
-  EV maximum import price and low-price charging threshold use conditional
-  `data_entry_flow.Required` markers when the HA 2026.11 API is available.
-  The fallback retains unconditional required fields and existing defaults;
-  omitted hidden thresholds retain stored values through the options merge.
-  `tests/test_config_flow.py` covers both marker paths, independent toggle
-  conditions, omitted values, repeated disable/enable edits, and new-API
-  serialization/validation (the latter requires a supporting HA runtime).
+  EV price settings use native `data_entry_flow.Required` visibility markers.
+  The import and low-price toggles control their own fields. Emergency price
+  and budget also require Departure priority. Hidden values are retained
+  through the options merge.
+  `tests/test_config_flow.py` covers section-local conditions, omitted values,
+  repeated disable/enable edits, and native serialization and validation.
   `tests/test_conditional_ev_options_runtime.py` exercises complete forms through
   HA's options manager, including default injection, stale hidden submissions,
-  persisted values on reopen, independent thresholds and the fallback schema.
-  These runtime checks await a permitted environment; source-contract checks
-  alone do not verify the options manager or browser behavior.
+  persisted values on reopen, independent thresholds, and changes to the
+  departure price policy. CI runs this contract on the pinned minimum and stable.
   The manifest classifies Energy Planner as a service integration so configured
   entries remain visible on the main Devices & services integration page rather
   than being routed to the Helpers-only experience.
@@ -703,8 +717,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   full failure timeout. Pull-request CI classifies changed paths with
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
   fails safe to the full CI set for an unclassified trigger path.
-  Behavioral changes also run real runtime contracts and smoke tests on the HACS
-  minimum/pinned HA 2026.10.0 and current stable. Documentation-only
+  Behavioral changes also run real runtime contracts and smoke tests on the Marketplace
+  minimum/pinned HA 2026.11.0 and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
   complete local gate including minimum/pinned runtime contracts and package smoke.
   CI pins Ubuntu 26.04 and Node 24 artifact uploads. Smoke runs export synthetic
@@ -1436,7 +1450,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
-- The minimum and pinned baseline are HA 2026.10.0. Migration recovery uses the
+- The 1.4.0 minimum and pinned baseline were HA 2026.10.0. Migration recovery uses the
   public retry API directly; obsolete restart branches, strings and tests are
   removed. Schemas import Probatio directly; binary-sensor device classes use
   the current constant module. Tests still initialize HA before collection to
