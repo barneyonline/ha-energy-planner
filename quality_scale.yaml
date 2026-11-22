@@ -459,7 +459,7 @@ rules:
         - ha-energy-planner-spec.md
   docs-installation-parameters:
     status: done
-    comment: README Get started links to Marketplace and the full wiki Installation guide and documents the Home Assistant 2026.11.0 minimum. docs/planning-and-control.md covers UI configuration and compatibility requirements. docs/stable-release.md supplies setup examples and its documentation map.
+    comment: The README Get started section links to Marketplace, explains how to add the repository by link, and documents the Home Assistant 2026.11.0 minimum. docs/planning-and-control.md covers UI configuration and compatibility requirements. docs/stable-release.md supplies setup examples and its documentation map.
     references:
       docs:
         - README.md

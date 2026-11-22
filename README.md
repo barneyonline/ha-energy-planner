@@ -86,17 +86,9 @@ Requires **Home Assistant 2026.11.0 or newer** (Python **3.14+**).
 2. Select **Install**. Complete the setup that opens, or add **Energy Planner** under **Settings → Devices & services → Add integration**. Restart Home Assistant first if prompted.
 3. Map your inputs in **Configure → Planner settings**. Keep **Automatic control** off while reviewing plans and the safety check.
 
-Existing HACS installations migrate automatically when Home Assistant starts after the upgrade. [Marketplace migration guide](https://www.home-assistant.io/integrations/marketplace/#coming-from-hacs) · [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation)
-
-Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
-
-**Automatic control** records your request to operate; **Armed** reports actual command authority.
-
 ## Documentation
 
 [Setup](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup) · [Safety and production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production) · [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) · [Known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
-
-The [planning and control guide](docs/planning-and-control.md) preserves the detailed operating notes, compatibility requirements and safety limits.
 
 <details>
 <summary>Planning and control details</summary>
@@ -116,10 +108,6 @@ The [planning and control guide](docs/planning-and-control.md) preserves the det
 Configured through the Home Assistant UI. No separate vendor credentials or third-party Python dependencies are required. AI explanations are advisory; selected planner context goes to your configured provider only when requested.
 
 </details>
-
-Development validation covers the minimum and current stable Home Assistant runtimes; see the [CI hang diagnostics](docs/validation-warnings.md#ci-hang-diagnostics).
-
-[Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
 
 ---
 
