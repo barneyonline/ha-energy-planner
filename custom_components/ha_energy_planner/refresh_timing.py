@@ -14,6 +14,7 @@ class RefreshTiming:
         self.started = self.boundary = perf_counter()
         self.owner = asyncio.current_task()
         self.name = "unattributed_ms"
+        self.superseded = False
         self.phases: dict[str, float] = {}
         self.aliases: dict[str, float] = {}
 

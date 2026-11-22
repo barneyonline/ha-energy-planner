@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.core import HomeAssistant
 
@@ -51,6 +51,7 @@ _DICT_FIELDS = {
 }
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
+_PENDING_PLAN_PUBLICATION = "_pending_plan_publication"
 _FORECAST_SNAPSHOT_BUCKET_MINUTES = 30
 _FORECAST_SNAPSHOT_HARD_CAP = 128
 _DRY_RUN_COMPARISON_BUCKET_MINUTES = 30
@@ -83,6 +84,7 @@ class PlannerStore:
         )
         self.data: dict[str, Any] = _default_data()
         self.calendar_plan: EnergyPlan | None = None
+        self.pending_calendar_plan: EnergyPlan | None = None
         self._save_delay_depth = 0
         self._mutation_generation = 0
         self._saved_generation = 0
@@ -110,6 +112,11 @@ class PlannerStore:
         self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None = None,
     ) -> None:
         """Persist the compact active plan."""
+        self.record_plan(plan, calendar_events=calendar_events)
+        await self._async_save()
+
+    def record_plan(self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None) -> None:
+        """Record the plan in the current Store view for its enclosing transaction."""
         serialized = to_jsonable(plan)
         self.data["preconditioning_history"] = record_plan(
             self.data.get("preconditioning_history", {}), serialized,
@@ -120,11 +127,8 @@ class PlannerStore:
             self.data["calendar_history"] = update_calendar_history(
                 self.data.get("calendar_history"), calendar_events, datetime.now(UTC),
             )
-            # Feedback can arrive during the final disk flush, before the
-            # coordinator publishes this plan. Keep its runtime presentation
-            # source aligned with the in-memory calendar snapshot.
+            # Keep the runtime source aligned with its calendar snapshot.
             self.calendar_plan = plan
-        await self._async_save()
 
     async def async_remove_if_safe(self) -> bool:
         """Delete this entry's data only when raw recovery evidence is resolved."""
@@ -141,21 +145,25 @@ class PlannerStore:
 
     async def async_save_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Persist observed activity even when no new plan is computed."""
         self.record_calendar_events(events, now=now)
+        history = cast("dict[str, Any] | None", self.data.get("calendar_history"))
         await self._async_flush()
+        return history
 
     def record_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None, location: str | None = None,
-    ) -> None:
-        """Record state feedback synchronously before later events or replans."""
+    ) -> bool:
+        """Record feedback before later events or replans, reporting changes."""
         history = update_calendar_history(
             self.data.get("calendar_history"), events, now or datetime.now(UTC), replace_plan=False, location=location,
         )
-        if self.data.get("calendar_history") != history:
-            self.data["calendar_history"] = history
-            self._mutation_generation += 1
+        if self.data.get("calendar_history") == history:
+            return False
+        self.data["calendar_history"] = history
+        self._mutation_generation += 1
+        return True
 
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""
@@ -182,7 +190,10 @@ class PlannerStore:
                     "outcome": entry,
                 },
             )
-        self.data["calendar_history"] = confirm_calendar_action(self.data.get("calendar_history"), entry)
+        previous_history = self.data.get("calendar_history")
+        calendar_history = confirm_calendar_action(previous_history, entry)
+        if calendar_history != previous_history:
+            self.data["calendar_history"] = calendar_history
         if audit and _deduplicable_outcome(entry) and _same_audit_outcome(audit[-1], entry):
             previous = dict(audit[-1])
             previous["occurrence_count"] = int(previous.get("occurrence_count", 1)) + 1
@@ -255,6 +266,11 @@ class PlannerStore:
 
     async def async_add_forecast_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Persist a compact forecast snapshot for replay."""
+        self.record_forecast_snapshot(snapshot)
+        await self._async_save()
+
+    def record_forecast_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Record the forecast snapshot in the current Store view."""
         snapshots = list(self.data.get("forecast_snapshots", []))
         item = _inherit_forecast_bucket_metadata(
             snapshots,
@@ -275,10 +291,14 @@ class PlannerStore:
             hours=48,
             hard_cap=_FORECAST_SNAPSHOT_HARD_CAP,
         )
-        await self._async_save()
 
     async def async_add_dry_run_comparison(self, comparison: dict[str, Any]) -> None:
         """Persist compact dry-run comparison metadata."""
+        self.record_dry_run_comparison(comparison)
+        await self._async_save()
+
+    def record_dry_run_comparison(self, comparison: dict[str, Any]) -> None:
+        """Record the comparison in the current Store view."""
         comparisons = list(self.data.get("dry_run_comparisons", []))
         item = to_jsonable(comparison)
         if comparisons and _same_dry_run_comparison(comparisons[-1], item):
@@ -297,7 +317,6 @@ class PlannerStore:
             hours=24 * 7,
             hard_cap=_DRY_RUN_COMPARISON_HARD_CAP,
         )
-        await self._async_save()
 
     async def async_save_forecast_calibration(self, model: dict[str, Any]) -> None:
         """Persist compact forecast calibration statistics."""
@@ -414,6 +433,12 @@ class PlannerStore:
         """Persist production arming state."""
         await self._async_set_if_changed("production", production)
 
+    def record_production(self, production: dict[str, Any]) -> None:
+        """Stage changed readiness evidence without writing to disk."""
+        jsonable = to_jsonable(production)
+        if self.data.get("production") != jsonable:
+            self.data["production"] = jsonable
+
     async def async_save_control_pause(self, pause: dict[str, Any]) -> None:
         """Persist active control pause state."""
         await self._async_set_if_changed("control_pause", pause)
@@ -422,14 +447,59 @@ class PlannerStore:
         """Clear planner-owned state for dry-run restore."""
         await self._async_set_if_changed("ownership", {})
 
-    @asynccontextmanager
-    async def async_delay_save(self) -> Any:
-        """Coalesce multiple Store writes into one disk write."""
+    @contextmanager
+    def defer_save(self) -> Iterator[None]:
+        """Keep mutations in memory until the caller arranges a flush."""
         self._save_delay_depth += 1
         try:
             yield
         finally:
             self._save_delay_depth -= 1
+
+    async def async_publish_plan[T](
+        self, stage: Callable[[], T], is_current: Callable[[], bool],
+    ) -> T | None:
+        """Acknowledge a staged plan, then admit it for the next normal flush."""
+        async with self._save_lock:
+            if not is_current():
+                return None
+            previous, previous_calendar = self.data, self.calendar_plan
+            self.data = dict(previous)
+            try:
+                result = stage()
+                changes = {key: value for key, value in self.data.items() if previous.get(key) is not value}
+                calendar = self.calendar_plan
+            finally:
+                self.data, self.calendar_plan = previous, previous_calendar
+            if not is_current():
+                return None
+            generation = self._mutation_generation
+            baseline = dict(previous)
+            # A restart between this write and admission can still load the
+            # previous plan and readiness credit from the canonical fields.
+            if calendar is not previous_calendar:
+                self.pending_calendar_plan = calendar
+            try:
+                await self._store.async_save({**baseline, _PENDING_PLAN_PUBLICATION: changes})
+            finally:
+                self.pending_calendar_plan = None
+            self._saved_generation = generation
+            if not is_current() or any(previous.get(key) is not baseline.get(key) for key in changes):
+                # Preserve independent feedback and ownership mutations that
+                # arrived during the save. Replan rather than overwrite them.
+                return None
+            previous.update(changes)
+            self.calendar_plan = calendar
+            self._mutation_generation += 1
+            return result
+
+    @asynccontextmanager
+    async def async_delay_save(self) -> Any:
+        """Coalesce multiple Store writes into one disk write."""
+        try:
+            with self.defer_save():
+                yield
+        finally:
             if self._save_delay_depth == 0 and self._is_dirty:
                 await self._async_flush()
 
@@ -444,6 +514,10 @@ class PlannerStore:
         """Force all observed mutations to durable storage."""
         await self._async_flush(force=True)
 
+    async def async_flush_deferred(self) -> None:
+        """Persist observed mutations, coalescing with any current batch."""
+        await self._async_flush()
+
     async def _async_flush(self, *, force: bool = False) -> None:
         """Serialize Store writes until every observed mutation is durable."""
         if self._save_delay_depth and not force:
@@ -455,14 +529,9 @@ class PlannerStore:
                 if self._save_delay_depth and not force:
                     return
                 generation = self._mutation_generation
-                # Every mutation in this wrapper replaces a top-level value.
-                # Capturing the root mapping therefore gives the Store executor
-                # an immutable generation while later event-loop mutations build
-                # and install new lists/dicts.
+                # Mutations replace top-level values. Snapshot the generation so
+                # later changes trigger a separate write and acknowledgement.
                 await self._store.async_save(dict(self.data))
-                # A writer may have mutated data while this save was in flight.
-                # Acknowledge only the generation captured before the await so
-                # the loop performs another write for any later mutation.
                 self._saved_generation = generation
 
     @property
@@ -522,6 +591,7 @@ def _default_data() -> dict[str, Any]:
 def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data = _default_data()
     data.update(loaded)
+    data.pop(_PENDING_PLAN_PUBLICATION, None)
     data.pop("haeo_runs", None)
     data.pop("trip_history", None)
     data["execution_audit"] = [_audit_entry(record) for record in audit_records(loaded)][-100:]

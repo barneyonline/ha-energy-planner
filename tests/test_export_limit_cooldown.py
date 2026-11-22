@@ -9,12 +9,18 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.core import State
 from test_export_limit import DATA, ENTITY, NOW, OPTIONS, action, context, limit_state, price_state
 from test_export_limit import setup as export_setup
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
-from custom_components.ha_energy_planner.const import CONF_COMMAND_RATE_LIMIT_SECONDS, CONF_DRY_RUN
-from custom_components.ha_energy_planner.export_limit_cooldown import control_key, cooldown_status
+from custom_components.ha_energy_planner.action_limits import action_budget, budget_history
+from custom_components.ha_energy_planner.const import (
+    CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DRY_RUN,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
+)
+from custom_components.ha_energy_planner.export_limit_cooldown import PRUNED_TIMING_KEY, control_key, cooldown_status
 from custom_components.ha_energy_planner.export_limit_policy import EXPORT_ASSET, build_actions
 from custom_components.ha_energy_planner.models import OutcomeResult
 
@@ -210,6 +216,19 @@ def test_legacy_attempt_migration_is_bounded_and_durable(setup, legacy):
     asyncio.run(run())
 
 
+def test_legacy_cooldown_migration_retains_longer_interval_across_reload(setup):
+    async def run():
+        setup.store.data["command_rate_limits"] = {EXPORT_ASSET: None}
+        setup.control.options[CONF_COMMAND_RATE_LIMIT_SECONDS] = 1800
+        await setup.control.reconcile(NOW)
+        reloaded = runtime.ExportLimitControl(
+            setup.hass, setup.store, DATA, {CONF_COMMAND_RATE_LIMIT_SECONDS: 300},
+        )
+        assert reloaded.cooldown(NOW)["next_eligible_change_at"] == (NOW + timedelta(seconds=1800)).isoformat()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("general", [1, 600])
 def test_backwards_wall_clock_reserves_new_bounded_interval(setup, general):
     async def run():
@@ -244,6 +263,335 @@ def test_reads_noops_and_unavailable_identity_do_not_reserve_attempts(setup):
         s.registry.clear()
         assert await s.control.prepare_cooldown(s.clock["now"]) is None
         assert not s.calls
+    asyncio.run(run())
+
+
+def test_settled_refreshes_do_not_reconcile_or_save_unchanged_settings(setup, monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        save = AsyncMock(wraps=setup.store.async_save_command_rate_limits)
+        setup.store.async_save_command_rate_limits = save
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("settled"))
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        await owner._async_update_data()
+        for second in (300, 600, 900):
+            move(setup, second)
+            await owner._async_update_data()
+            assert owner._export_reconcile_task is None
+        owner._schedule_debounced_refresh.assert_called_once()
+        save.assert_awaited_once()
+        assert not setup.calls
+        # A backward readback or an edited ownership expectation requires a
+        # fresh reconciliation even when the gateway reports the same watts.
+        setup.states[ENTITY].attributes["last_successful_readback"] -= 1
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert owner._schedule_debounced_refresh.call_count == 2
+        save.assert_awaited_once()
+
+        # Changing the ownership expectation alone invalidates both reuse paths.
+        identity = runtime.target_identity(setup.hass, ENTITY)
+        await setup.control.save({"identity": identity, "expected": {"watts": 500, "slew_rate": 100.0}})
+        await owner._async_update_data()
+        task = owner._export_reconcile_task
+        assert task is not None
+        await task
+        assert owner._schedule_debounced_refresh.call_count == 3
+        save.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["backward_poll", "invalid_timing", "unmapped_during_completion"])
+def test_completion_reuse_requires_published_readback_and_valid_timing(setup, change):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("settled"))
+        now = move(setup, 30)
+        attributes = setup.states[ENTITY].attributes
+        attributes["last_successful_readback"] = now.timestamp() - 20
+        flush = setup.store.async_flush
+
+        async def poll_after_reconciliation():
+            await flush()
+            if change == "unmapped_during_completion":
+                owner.entry.data = {}
+            attributes["last_successful_readback"] = now.timestamp()
+
+        setup.store.async_flush = poll_after_reconciliation
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        if change == "unmapped_during_completion":
+            assert owner._export_reconcile_pending
+            assert owner._export_reconciled_for is None
+            return
+        assert owner._settled_export_reconciliation.last_readback == now.timestamp()
+        assert not owner._export_reconcile_pending
+
+        if change == "backward_poll":
+            attributes["last_successful_readback"] = now.timestamp() - 10
+        else:
+            key = control_key(runtime.target_identity(setup.hass, ENTITY))
+            setup.store.data["command_rate_limits"][key]["interval_seconds"] = 0
+        task = owner._admit_export_reconciliation()
+        assert task is not None and owner._export_reconcile_pending
+        await task
+
+    asyncio.run(run())
+
+
+def test_reconciliation_rejects_feedback_that_returns_to_its_original_value_during_save(setup):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("settled"))
+        identity = runtime.target_identity(setup.hass, ENTITY)
+        await setup.control.save({"identity": identity, "expected": {"watts": None, "slew_rate": 100.0}})
+
+        save_timing = setup.store.async_save_command_rate_limits
+        save_ownership = setup.store.async_save_ownership
+
+        async def poll_during_timing_save(value):
+            await save_timing(value)
+            setup.states[ENTITY] = limit_state(500)
+
+        async def poll_during_ownership_save(value):
+            await save_ownership(value)
+            setup.states[ENTITY] = limit_state()
+
+        setup.store.async_save_command_rate_limits = poll_during_timing_save
+        setup.store.async_save_ownership = poll_during_ownership_save
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert setup.control.state["expected"]["watts"] == 500
+        assert owner._export_reconcile_pending
+        assert not owner._export_reconciliation_inputs().reusable
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert setup.control.state["expected"]["watts"] is None
+        assert not owner._export_reconcile_pending
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("skew_seconds", [480, 8 * 3600])
+def test_clock_repair_reopens_daily_allowance_after_remap_and_settled_refresh(setup, monkeypatch, skew_seconds):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        s = setup
+        # Control B has already been observed at the correct time.
+        saved_device = s.registry[ENTITY].device_id
+        await s.control.prepare_cooldown(NOW)
+        key_b = control_key(runtime.target_identity(s.hass, ENTITY))
+        record_b = deepcopy(s.store.data["command_rate_limits"][key_b])
+
+        # A dispatch on control A is recorded with the clock ahead.
+        dispatch = move(s, skew_seconds)
+        s.registry[ENTITY].device_id = "gateway-ahead"
+        s.states["sensor.export_price"] = price_state(start=dispatch.replace(minute=0))
+        s.states["sensor.export_price"].last_updated = dispatch
+        s.mode["value"] = "confirm"
+        assert (await s.control.execute(action(s), dispatch))[2]
+        original_audit = deepcopy(s.store.data["execution_audit"])
+
+        # Return to B and settle its feedback while the clock is still ahead.
+        s.registry[ENTITY].device_id = saved_device
+        readback = NOW if skew_seconds == 480 else dispatch
+        s.states[ENTITY] = limit_state(readback=readback.timestamp())
+        await s.control.save({})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=s.hass)
+        owner.store = s.store
+        s.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("remapped"))
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert owner._settled_export_reconciliation is not None
+
+        # Identical verified feedback can be published after correcting the clock.
+        # Repair must run even though B's saved cooldown is valid and unchanged.
+        corrected = move(s, 0)
+        await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        assert worker is not None
+        await worker
+        assert s.store.data["command_rate_limits"][key_b] == record_b
+        assert s.store.data["execution_audit"] == original_audit
+        ledger = budget_history(s.store.data)
+        assert ledger[0]["attempted_at"] == corrected.isoformat()
+        cap = {"max_daily_export_limit_actions": 1}
+        assert action_budget(ledger, cap, corrected + timedelta(hours=23), EXPORT_ASSET)["remaining"] == 0
+        assert action_budget(ledger, cap, corrected + timedelta(hours=24), EXPORT_ASSET)["remaining"] == 1
+        assert len(s.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_export_planning_rechecks_mutable_tariff_time_and_confidence(setup):
+    s = setup
+    raw = price_state((-0.1, 0.2, 0.3))
+    raw.attributes["confidence"] = 0.8
+    s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+
+    def current(now, **options):
+        return runtime.current_tariff_blocks(s.hass, "sensor.export_price", options, now)
+
+    blocks, issue = current(NOW)
+    assert issue is None and blocks[0]["watts"] == 0
+    blocks[0]["watts"] = 800
+    assert current(NOW)[0][0]["watts"] == 0
+    assert current(NOW + timedelta(minutes=20))[0][0]["watts"] is None
+    assert current(NOW + timedelta(minutes=31))[1] == "export_tariff_stale"
+    assert current(NOW, minimum_tariff_confidence=90)[1] == "export_tariff_confidence_low"
+    raw.attributes["forecasts"][0]["per_kwh"] = 0.2
+    assert current(NOW)[0][0]["watts"] is None
+
+
+def test_export_dispatch_reparses_mutable_tariff_after_reservation(setup):
+    from custom_components.ha_energy_planner.executor import Executor
+    from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+    async def run():
+        raw = price_state((-0.1, 0.2))
+        state = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+        setup.states["sensor.export_price"] = state
+        opts = {**OPTIONS, CONF_DRY_RUN: False}
+        setup.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(DATA, opts)
+        executor = Executor(setup.store, hass=setup.hass, entry_data=DATA, options=opts)
+        requested = action(setup)
+        flush = setup.store.async_flush
+
+        async def change_tariff():
+            await flush()
+            if setup.control.state.get("pending"):
+                state.attributes["forecasts"][0]["per_kwh"] = 0.2
+
+        setup.store.async_flush = change_tariff
+        result = await executor.async_execute_export_limit(requested, NOW)
+        assert result == (OutcomeResult.REJECTED, "export_tariff_changed", False)
+        assert not setup.control.state
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+def test_export_remap_during_dispatch_reservation_returns_unused_budget(setup):
+    from custom_components.ha_energy_planner.executor import Executor
+    from custom_components.ha_energy_planner.planner import DryRunPlanner
+    from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+    async def run():
+        opts = {**OPTIONS, CONF_DRY_RUN: False, "max_daily_export_limit_actions": 1}
+        setup.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(DATA, opts)
+        executor = Executor(setup.store, hass=setup.hass, entry_data=DATA, options=opts)
+        ctx = context(runtime.evidence(setup.hass, DATA, opts, NOW))
+        plan = DryRunPlanner(opts).create_plan(ctx)
+        live_entry_data = dict(DATA)
+        flush = setup.store.async_flush
+
+        async def remap_during_flush():
+            await flush()
+            if setup.control.state.get("pending"):
+                live_entry_data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "sensor.replacement_export_limit"
+
+        setup.store.async_flush = remap_during_flush
+        await executor.async_evaluate(plan, ctx, plan_is_current=lambda: live_entry_data == DATA)
+
+        assert live_entry_data != DATA
+        assert not setup.calls
+        assert not setup.control.state
+        assert action_budget(budget_history(setup.store.data), opts, NOW, EXPORT_ASSET)["used"] == 0
+        assert setup.control.cooldown(NOW)["last_dispatch_reserved_at"] is None
+        outcome = setup.store.data["execution_audit"][-1]
+        assert outcome["result"] == "rejected"
+        assert outcome["reason"] == "plan_superseded_before_dispatch"
+        assert outcome["command_sent"] is False
+
+        # The next current plan can use the refunded allowance immediately.
+        setup.store.async_flush = flush
+        setup.mode["value"] = "confirm"
+        live_entry_data.update(DATA)
+        await executor.async_evaluate(plan, ctx, plan_is_current=lambda: live_entry_data == DATA)
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("prior_clock", ["absent", "malformed", "ahead"])
+def test_export_remap_prunes_expired_records_and_preserves_owned_or_recent_timing(setup, prior_clock):
+    async def run():
+        s = setup
+        identity = runtime.target_identity(s.hass, ENTITY)
+        owned = {**identity, "device_id": "owned"}
+        old = NOW.timestamp() - 86400
+        record = {"version": 1, "checked_at": old, "attempted_at": old, "confirmed_at": None,
+                  "confirmation_request": None, "interval_seconds": 86400}
+        expired_key = control_key({**identity, "device_id": "old"})
+        owned_key = control_key(owned)
+        recent_key = control_key({**identity, "device_id": "recent"})
+        future_key = control_key({**identity, "device_id": "future"})
+        malformed_key = control_key({**identity, "device_id": "malformed"})
+        oversized_at = control_key({**identity, "device_id": "oversized-timestamp"})
+        oversized_interval = control_key({**identity, "device_id": "oversized-interval"})
+        s.store.data["command_rate_limits"] = {
+            expired_key: record, owned_key: record,
+            recent_key: {**record, "checked_at": old + 1},
+            future_key: {**record, "attempted_at": NOW.timestamp() + 1},
+            malformed_key: {**record, "interval_seconds": "invalid"},
+            oversized_at: {**record, "checked_at": 10**400},
+            oversized_interval: {**record, "interval_seconds": 10**400},
+            "daikin": NOW.isoformat(),
+        }
+        ahead = (NOW + timedelta(days=2)).timestamp()
+        if prior_clock != "absent":
+            s.store.data["command_rate_limits"][PRUNED_TIMING_KEY] = {
+                "checked_at": ahead if prior_clock == "ahead" else "invalid",
+                "interval_seconds": 600,
+            }
+        await s.control.save({"identity": owned, "pending": {"sent_at": old}})
+        await s.control.prepare_cooldown(NOW)
+        limits = s.store.data["command_rate_limits"]
+        assert expired_key not in limits
+        assert set(limits) == {
+            owned_key, recent_key, future_key, malformed_key, oversized_at, oversized_interval,
+            "daikin", control_key(identity), PRUNED_TIMING_KEY,
+        }
+        prune_time = ahead if prior_clock == "ahead" else NOW.timestamp()
+        assert limits[PRUNED_TIMING_KEY] == {"checked_at": prune_time, "interval_seconds": 86400}
+        if prior_clock != "ahead":
+            # On a stable clock, remapping a retired identity does not restart its wait.
+            await s.control.save({})
+            s.registry[ENTITY].device_id = "old"
+            remapped = await s.control.prepare_cooldown(NOW)
+            assert remapped["attempted_at"] is None
+
     asyncio.run(run())
 
 
@@ -339,13 +687,14 @@ def test_cooldown_wakeup_diagnostics_and_calendar_show_deferred_plan(setup, monk
         owner.data = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(s.hass, DATA, OPTIONS, NOW)))
         timing = s.control.cooldown(NOW)
         callbacks, cancelled = [], []
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: 100.0)
         monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
             callbacks.append((delay, cb)) or (lambda: cancelled.append(True))))
         owner._schedule_export_boundary({**owner.data.device_plans[EXPORT_ASSET], **timing})
         assert callbacks[-1][0] == 300
         # Restoration still receives a wakeup with disabled policy and no tariff blocks.
         owner._schedule_export_boundary(timing)
-        assert callbacks[-1][0] == 300 and cancelled == [True]
+        assert len(callbacks) == 1 and not cancelled
         status = export_limit_status(owner)
         assert not status["ready"] and status["reason"] == "export_limit_change_rate_limited"
         assert status["last_change_observed_at"] == NOW.timestamp()
@@ -357,6 +706,8 @@ def test_cooldown_wakeup_diagnostics_and_calendar_show_deferred_plan(setup, monk
         assert all("export_limit_change_rate_limited" in event.description for event in events)
         callbacks[-1][1](NOW + timedelta(seconds=300))
         assert owner._force_next_refresh
+        assert callbacks[-1][0] == 0
+        callbacks[-1][1](NOW + timedelta(seconds=300))
         assert owner._pending_refresh_trigger == "export_tariff_boundary"
         owner._schedule_export_boundary({**timing, "next_eligible_change_at": NOW.isoformat()})
         assert callbacks[-1][0] == 0
@@ -559,15 +910,17 @@ def test_expiry_during_refresh_replans_once_using_latest_intent(setup, monkeypat
                 fresh["blocks"] = []
             owner._schedule_export_boundary(fresh)
 
-        owner.async_request_refresh = refresh
+        owner.async_refresh = refresh
         owner._schedule_export_boundary(captured)
         assert cancelled == [True]
         assert scheduled and scheduled[-1][0] == 0
         scheduled[-1][1](now)
+        assert len(scheduled) == 2 and scheduled[-1][0] == 0
+        scheduled[-1][1](now)
         await asyncio.sleep(0)
         assert refreshes == [True]
         assert len(s.calls) == (2 if still_needed else 1)
-        assert sum(delay == 0 for delay, _ in scheduled) == 1
+        assert all(delay > 0 for delay, _ in scheduled[2:])
         if still_needed:
             assert scheduled[-1][0] == 300
             assert s.calls[-1][1] == "disable_export_limit"
@@ -774,3 +1127,54 @@ def test_unpriced_surplus_does_not_credit_exports_or_erase_known_import_cost():
     plan = DryRunPlanner({**OPTIONS, CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: False}).create_plan(ctx)
     assert plan.estimated_daily_cost == round(1.0 * 5 / 60 * 0.2, 4)
     assert all("projected_grid_export_kw" not in row for row in plan.preview)
+
+
+@pytest.mark.parametrize("remap_while_ahead", [False, True])
+@pytest.mark.parametrize("saved_interval", [300, 600])
+@pytest.mark.parametrize("configured_at_repair", [300, 1800])
+def test_remapping_pruned_control_preserves_cooldown_after_clock_correction(
+    setup, saved_interval, remap_while_ahead, configured_at_repair,
+):
+    async def run():
+        s = setup
+        s.control.options = {CONF_COMMAND_RATE_LIMIT_SECONDS: saved_interval}
+        s.mode["value"] = "confirm"
+        assert (await s.control.execute(action(s), NOW))[2]
+        assert (await s.control.restore(move(s, saved_interval)))[0] == OutcomeResult.RESTORED
+        assert not s.control.state
+        original_device = s.registry[ENTITY].device_id
+        original_key = control_key(runtime.target_identity(s.hass, ENTITY))
+
+        s.registry[ENTITY].device_id = "gateway-b"
+        await s.control.prepare_cooldown(move(s, 2 * 86400))
+        assert original_key not in s.store.data["command_rate_limits"]
+        s.store.data = json.loads(json.dumps(s.store.data))
+        s.control = runtime.ExportLimitControl(s.hass, s.store, DATA)
+
+        s.registry[ENTITY].device_id = original_device
+        if remap_while_ahead:
+            remapped = await s.control.prepare_cooldown(s.clock["now"])
+            assert remapped["attempted_at"] is None
+            assert remapped["interval_seconds"] == 300
+
+        corrected_second = saved_interval + 120
+        s.control.options = {CONF_COMMAND_RATE_LIMIT_SECONDS: configured_at_repair}
+        repaired_interval = max(saved_interval, configured_at_repair)
+        now = move(s, corrected_second)
+        result = await s.control.execute(latest_action(s, True), now)
+        assert result == (OutcomeResult.REJECTED, "export_limit_change_rate_limited", False)
+        assert len(s.calls) == 2
+        assert s.control.cooldown(now)["next_eligible_change_at"] == (
+            now + timedelta(seconds=repaired_interval)
+        ).isoformat()
+        s.store.data = json.loads(json.dumps(s.store.data))
+        s.control = runtime.ExportLimitControl(s.hass, s.store, DATA)
+        assert s.control.cooldown(now)["next_eligible_change_at"] == (
+            now + timedelta(seconds=repaired_interval)
+        ).isoformat()
+        just_before = move(s, corrected_second + repaired_interval - 1)
+        assert not (await s.control.execute(latest_action(s, True), just_before))[2]
+        later = move(s, corrected_second + repaired_interval)
+        assert (await s.control.execute(latest_action(s, True), later))[2]
+
+    asyncio.run(run())

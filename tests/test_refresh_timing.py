@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -13,7 +12,7 @@ from test_coordinator import FakeEntry, FakeHass, FakeStore, _plan
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner import refresh_timing as timing_module
 from custom_components.ha_energy_planner.const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
-from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator, _PlanExecution
 
 
 def test_refresh_plans_while_unrelated_command_owns_lock() -> None:
@@ -88,7 +87,7 @@ def test_weather_is_prepared_before_planner_lock() -> None:
             assert not coordinator._planner_lock.locked()
             return prepared
 
-        async def update(*, defer_execution=False):
+        async def update(**kwargs):
             observed.append("planner")
             assert coordinator._planner_lock.locked()
             assert coordinator._prepared_weather_for_refresh is prepared
@@ -195,20 +194,16 @@ def test_timing_partitions_every_exit_and_flush(monkeypatch, exit_path):
         coordinator._pending_refresh_trigger = "state_change"
         coordinator._refresh_request_timing = ("state_change", 9.5, asyncio.current_task())
 
-        @asynccontextmanager
-        async def delayed_save():
-            try:
-                yield
-            finally:
-                clock[0] += 0.7
-                if exit_path == "flush_failure":
-                    raise OSError("atomic flush failed")
-                if exit_path == "flush_cancel":
-                    raise asyncio.CancelledError
+        async def flush_deferred():
+            clock[0] += 0.7
+            if exit_path == "flush_failure":
+                raise OSError("atomic flush failed")
+            if exit_path == "flush_cancel":
+                raise asyncio.CancelledError
 
-        coordinator.store.async_delay_save = delayed_save
+        coordinator.store.async_flush_deferred = flush_deferred
 
-        async def update(*, defer_execution=False):
+        async def update(**kwargs):
             clock[0] += 0.1
             if exit_path == "fingerprint":
                 timing_module.current_timing().aliases["fingerprint_ms"] = 100
@@ -221,7 +216,7 @@ def test_timing_partitions_every_exit_and_flush(monkeypatch, exit_path):
                 raise asyncio.CancelledError
             timing_module.stage("post_plan_ms")
             clock[0] += 0.3
-            coordinator._deferred_plan_execution = (0, _plan("new"), object(), {})
+            coordinator._deferred_plan_execution = _PlanExecution(0, _plan("new"), object(), {})
             return _plan("new")
 
         coordinator._async_update_data_locked = update
@@ -263,7 +258,7 @@ def test_planner_lock_wait_cancellation_does_not_copy_active_refresh(monkeypatch
         coordinator = coordinator_for_timing()
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def update(*, defer_execution=False):
+        async def update(**kwargs):
             timing_module.stage("inputs_ms")
             entered.set()
             await release.wait()
@@ -312,14 +307,14 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
     async def scenario():
         coordinator = coordinator_for_timing(export_entity="select.old")
         coordinator._schedule_debounced_refresh.side_effect = (
-            lambda trigger, *, debounce_seconds, force, immediate: coordinator._mark_replan_requested(force=force)
+            lambda trigger, *, debounce_seconds, force, mode: coordinator._mark_replan_requested(force=force)
         )
         reconcile = AsyncMock()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
         coordinator._async_execute_plan_if_current = AsyncMock()
         await coordinator._command_lock.acquire()
         async def queue_execution():
-            coordinator._pending_plan_execution = (0, _plan("pending"), object(), {})
+            coordinator._pending_plan_execution = _PlanExecution(0, _plan("pending"), object(), {})
             task = asyncio.create_task(coordinator._async_drain_plan_execution())
             await asyncio.sleep(0)
             return task
@@ -374,13 +369,13 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
             assert coordinator._export_reconcile_pending is False
             assert coordinator._refresh_generation == 1
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciled", debounce_seconds=0, force=True, immediate=False)
+                "export_reconciled", debounce_seconds=0, force=True, mode=coordinator_module._RefreshMode.DEBOUNCED)
             assert reconcile.await_count == (0 if result == "mapping_removed" else 1)
         assert coordinator._last_export_reconciliation["duration_ms"] >= 0
         if result == "success":
             # The settled plan uses the ordinary execution path.
             fresh = _plan("fresh")
-            coordinator._pending_plan_execution = (coordinator._refresh_generation, fresh, object(), {})
+            coordinator._pending_plan_execution = _PlanExecution(coordinator._refresh_generation, fresh, object(), {})
             await coordinator._async_drain_plan_execution()
             assert execute.await_args.args[1] is fresh
 
@@ -540,12 +535,14 @@ def test_request_age_tracks_first_coalesced_trigger(monkeypatch):
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
         monkeypatch.setattr(coordinator_module, "perf_counter", lambda: clock[0])
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: clock[0])
         callbacks = []
         monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
             callbacks.append(cb) or (lambda: None)))
-        coordinator._schedule_debounced_refresh("first")
+        coordinator._schedule_debounced_refresh("first", debounce_seconds=1)
         clock[0] = 1
-        coordinator._schedule_debounced_refresh("latest")
+        coordinator._schedule_debounced_refresh("latest", debounce_seconds=1)
+        callbacks[0](None)
         clock[0] = 2
         coordinator.async_request_refresh = coordinator._async_update_data
         callbacks[-1](None)
@@ -554,6 +551,73 @@ def test_request_age_tracks_first_coalesced_trigger(monkeypatch):
         assert coordinator.last_refresh_metadata["trigger"] == "latest"
         assert coordinator.refresh_metrics["coalesced"] == 1
     asyncio.run(scenario())
+
+
+def test_superseded_refresh_keeps_export_boundary_already_queued_on_core(monkeypatch):
+    async def scenario():
+        coordinator = coordinator_for_timing()
+        del coordinator._schedule_debounced_refresh
+        coordinator.data = _plan("published")
+        coordinator._export_boundary_cancel = None
+        coordinator._pending_refresh_trigger = "initial"
+        flush_started = asyncio.Event()
+        finish_flush = asyncio.Event()
+        boundary_waiting = asyncio.Event()
+        core_lock = asyncio.Lock()
+        refreshes = []
+
+        async def flush_deferred():
+            if not flush_started.is_set():
+                flush_started.set()
+                await finish_flush.wait()
+
+        async def serialized_refresh():
+            if core_lock.locked():
+                boundary_waiting.set()
+            async with core_lock:
+                plan = await coordinator._async_update_data()
+                refreshes.append((plan.plan_id, coordinator.last_refresh_metadata.copy()))
+
+        callbacks = []
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, callback: (
+            callbacks.append(callback) or (lambda: None)))
+        coordinator.store.async_flush_deferred = flush_deferred
+        coordinator.async_refresh = serialized_refresh
+        initial = asyncio.create_task(coordinator.async_refresh())
+        await flush_started.wait()
+
+        now = datetime(2026, 11, 21, 8, tzinfo=UTC)
+        coordinator._schedule_export_boundary({"blocks": [{"end": now.isoformat()}]})
+        callbacks.pop(0)(now)
+        callbacks.pop(0)(now)
+        (queued,) = coordinator._listener_tasks
+        await boundary_waiting.wait()
+
+        finish_flush.set()
+        await asyncio.gather(initial, queued)
+        assert callbacks == []
+        assert coordinator._queued_direct_refresh is None
+        assert [(plan_id, metadata["trigger"], metadata["succeeded"]) for plan_id, metadata in refreshes] == [
+            ("published", "initial", False), ("timed", "export_tariff_boundary", True),
+        ]
+        assert refreshes[-1][1]["request_age_ms"] is not None
+        assert coordinator.refresh_metrics["requested"] == 1
+        assert coordinator.refresh_metrics["coalesced"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_canceled_direct_refresh_callback_does_not_queue_during_shutdown(monkeypatch):
+    coordinator = coordinator_for_timing()
+    del coordinator._schedule_debounced_refresh
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, callback: (
+        callbacks.append(callback) or (lambda: None)))
+    coordinator._schedule_debounced_refresh("export_tariff_boundary", mode=coordinator_module._RefreshMode.IMMEDIATE)
+    coordinator._begin_shutdown()
+    callbacks[0](None)
+    assert coordinator._queued_direct_refresh is None
+    assert not coordinator._listener_tasks
 
 
 @pytest.mark.parametrize("shutdown_during_admission", [False, True])
@@ -669,7 +733,7 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
     asyncio.run(scenario())
 
 
-def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_timer(monkeypatch):
+def test_telemetry_refresh_preserves_export_completion_timer(monkeypatch):
     async def scenario():
         owner = coordinator_for_timing(export_entity="select.export")
         del owner._schedule_debounced_refresh
@@ -689,10 +753,11 @@ def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_time
         await owner._export_reconcile_task
         completion = timers[-1]
         owner._schedule_debounced_refresh("state_change")
-        assert completion in cancelled
+        assert timers == [completion]
+        assert not cancelled
         timers[-1](None)
         await asyncio.gather(*owner._listener_tasks)
-        assert owner.last_refresh_metadata["trigger"] == "state_change"
+        assert owner.last_refresh_metadata["trigger"] == "export_reconciled"
         assert not owner._export_reconcile_pending
         assert owner._export_reconcile_task is None
         reconcile.assert_awaited_once()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from itertools import chain
 from typing import Any
 
 CALENDAR_HISTORY_RETENTION_DAYS = 365
@@ -53,6 +54,23 @@ def normalize_calendar_history(saved: Any, now: datetime) -> dict[str, list[dict
     return {"history": _retained_history(history, now), "pending": calendar_records(saved.get("pending"))}
 
 
+def calendar_feedback_recheck_delay(
+    history: dict[str, list[dict[str, str]]], observations: list[dict[str, str]], now: datetime,
+) -> timedelta:
+    """Bound reuse of a no-op merge by window transitions and history retention."""
+    delay = timedelta.max
+    for record in chain(history["pending"], observations):
+        for key in ("start", "end"):
+            if (boundary := _timestamp(record.get(key))) is not None and boundary >= now:
+                delay = min(delay, max(boundary - now, datetime.resolution))
+    # Retention uses an inclusive cutoff. Calculate the elapsed time without
+    # adding days to the stored timestamp, which can be near datetime.max.
+    for record in history["history"]:
+        end = datetime.fromisoformat(record["end"])
+        delay = min(delay, end - now + timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS) + datetime.resolution)
+    return delay
+
+
 def _retained_history(history: list[dict[str, str]], now: datetime) -> list[dict[str, str]]:
     """Keep recent confirmations with a hard ceiling for Store and UI work."""
     cutoff = now - timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS)
@@ -83,8 +101,9 @@ def update_calendar_history(
     ends remain estimates unless a discrete action was confirmed by its adapter.
     Confirmed history is retained for one year with a hard count ceiling.
     """
-    saved = saved if isinstance(saved, dict) else {}
-    history = normalize_calendar_history(saved, now)["history"]
+    normalized = normalize_calendar_history(saved, now)
+    history = normalized["history"]
+    previous_pending = normalized["pending"]
     current = calendar_records(current)
     if not replace_plan:
         # Observations may come from an older coordinator plan while the latest
@@ -97,7 +116,7 @@ def update_calendar_history(
             # An old execution can confirm the same phase with a shorter
             # forecast than the newly published plan. Keep its newer extent.
             for index, record in enumerate(observed):
-                newer = next((saved_record for saved_record in calendar_records(saved.get("pending"))
+                newer = next((saved_record for saved_record in previous_pending
                               if _same_confirmed_window(saved_record, record)
                               and datetime.fromisoformat(saved_record["end"]) > datetime.fromisoformat(record["end"])),
                              None)
@@ -105,7 +124,7 @@ def update_calendar_history(
                     observed[index] = newer
         observed_locations = {record.get("location") for record in observed}
         current = observed + [
-            record for record in calendar_records(saved.get("pending"))
+            record for record in previous_pending
             if not _confirmed_start(record) or (
                 record.get("location") != location if location is not None
                 else record.get("location") not in observed_locations
@@ -117,26 +136,32 @@ def update_calendar_history(
     # phase when a later plan extends it, even if an earlier end was archived.
     # History was filtered to confirmed records above; provisional pending
     # windows cannot supersede it and need not be compared with every record.
-    confirmed_pending = [record for record in pending if _confirmed_start(record)]
-    history = [record for record in history if not any(
-        record["start"] == candidate["start"]
-        and _same_running_window(record, candidate, now)
-        for candidate in confirmed_pending
-    )]
-    for previous in calendar_records(saved.get("pending")):
+    confirmed_pending: dict[str, list[dict[str, str]]] = {}
+    for record in pending:
+        if _confirmed_start(record):
+            confirmed_pending.setdefault(record["start"], []).append(record)
+    history = [
+        record for record in history
+        if not any(_same_running_window(record, candidate, now)
+                   for candidate in confirmed_pending.get(record["start"], ()))
+    ]
+    for previous in previous_pending:
+        if not _confirmed_start(previous):
+            continue
         start, end = datetime.fromisoformat(previous["start"]), datetime.fromisoformat(previous["end"])
-        match = next((record for record in pending if _same_running_window(previous, record, now)), None)
-        if match is not None:
+        if any(_same_running_window(previous, candidate, now)
+               for candidate in confirmed_pending.get(previous["start"], ())):
             continue
         if end <= now:
             _append_unique(history, previous)
-        elif start < now and _confirmed_start(previous):
-            previous["end"] = now.isoformat()
-            previous["description"] = (
-                previous.get("description", "")
-                + "\n\nConfirmed activity. End time is estimated; no confirmed stop time was recorded."
-            ).encode("utf-8")[:4096].decode("utf-8", errors="ignore")
-            _append_unique(history, previous)
+        elif start < now:
+            description = previous.get("description", "")
+            description += "\n\nConfirmed activity. End time is estimated; no confirmed stop time was recorded."
+            _append_unique(history, {
+                **previous,
+                "end": now.isoformat(),
+                "description": description.encode("utf-8")[:4096].decode("utf-8", errors="ignore"),
+            })
         # A replaced window that has not started is not historical activity.
     active = []
     for record in pending:
@@ -149,6 +174,8 @@ def update_calendar_history(
 
 def _append_unique(history: list[dict[str, str]], record: dict[str, str]) -> None:
     """Coalesce the same published window even if its plan ID changed."""
+    if not _confirmed_start(record):
+        return
     for index, previous in enumerate(history):
         if _same_confirmed_window(previous, record):
             if datetime.fromisoformat(previous["end"]) >= datetime.fromisoformat(record["end"]):
@@ -158,7 +185,7 @@ def _append_unique(history: list[dict[str, str]], record: dict[str, str]) -> Non
             history.pop(index)
             break
     keys = ("start", "end", "summary", "location")
-    if _confirmed_start(record) and not any(
+    if not any(
         all(previous.get(key) == record.get(key) for key in keys) for previous in history
     ):
         record = dict(record)
@@ -187,17 +214,11 @@ def _same_confirmed_window(previous: dict[str, str], current: dict[str, str]) ->
 
 
 def _same_running_window(previous: dict[str, str], current: dict[str, str], now: datetime) -> bool:
-    """Match continuous plan windows while keeping real restarts separate."""
+    """Match confirmed windows with an identical start while one is still running."""
     if (any(previous.get(key) != current.get(key) for key in ("summary", "location"))
             and not _same_confirmed_window(previous, current)):
         return False
-    if not (_confirmed_start(previous) and _confirmed_start(current)) or previous["start"] != current["start"]:
-        return False
-    return (
-        datetime.fromisoformat(previous["start"]) <= now
-        and datetime.fromisoformat(current["start"]) <= now < datetime.fromisoformat(current["end"])
-        and datetime.fromisoformat(current["start"]) < datetime.fromisoformat(previous["end"])
-    )
+    return datetime.fromisoformat(current["start"]) <= now < datetime.fromisoformat(current["end"])
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -226,8 +247,9 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
     start = _timestamp(outcome.get("attempted_at"))
     if start is None:
         return state
-    history = normalize_calendar_history(state, start)["history"]
-    pending = calendar_records(state.get("pending"))
+    normalized = normalize_calendar_history(state, start)
+    history = normalized["history"]
+    pending = normalized["pending"]
     restoring_export = outcome.get("kind") == "restore_export_limit"
     if restoring_export and any(record["uid"] == outcome.get("action_id") for record in history):
         return state

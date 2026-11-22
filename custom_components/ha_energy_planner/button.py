@@ -79,7 +79,7 @@ async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
         owner_id=entry_id,
     ):
         return
-    report = build_preflight_report(coordinator.hass, coordinator)
+    report = build_preflight_report(coordinator.hass, coordinator, require_export_write_gate=True)
     await _async_publish_preflight_notification(
         coordinator,
         report,

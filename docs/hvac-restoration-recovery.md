@@ -32,6 +32,11 @@ Preparation also rechecks the execution window, current manual-hold helper and
 production controls after readback and after ownership persistence. Expiry, a
 new hold or disarming cancels the unissued attempt and rolls back only its
 provisional ownership; release of any earlier ownership remains separate.
+The first thermostat, zone or automation command rechecks plan authority, the
+execution window, the manual-hold helper and production controls after any
+command-intent persistence and scheduler-guard work. A rejection at this
+boundary clears the unsent intent and restores the earlier ownership without
+counting an attempt or pausing control.
 It requires both remembered head targets (`dt1`, `dt2`), both complete zone
 arrays (`lztemp_h`, `lztemp_c`), a proven remembered mode, finite mode-specific
 head limits, published Home Assistant head bounds/step and exact zone targets

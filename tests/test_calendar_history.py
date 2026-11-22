@@ -4,9 +4,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from custom_components.ha_energy_planner import calendar_history
 from custom_components.ha_energy_planner.calendar_history import (
     CALENDAR_HISTORY_HARD_CAP,
     CALENDAR_HISTORY_RETENTION_DAYS,
+    calendar_feedback_recheck_delay,
     calendar_records,
     confirm_calendar_action,
     normalize_calendar_history,
@@ -26,6 +28,106 @@ def record(start=-10, end=10, uid="event", summary="EV: Charge", actual=False):
     if actual:
         item["confirmed_start"] = item["start"]
     return item
+
+
+def test_calendar_feedback_recheck_delay_includes_window_boundaries():
+    history = {"history": [], "pending": [record(start=3), record(end=2)]}
+    observations = [record(end=-1), record(end=1), {"start": "invalid"}]
+    assert calendar_feedback_recheck_delay(history, observations, NOW) == timedelta(minutes=1)
+    assert calendar_feedback_recheck_delay(history, [], NOW) == timedelta(minutes=2)
+    assert calendar_feedback_recheck_delay(history, [], NOW + timedelta(minutes=3)) == datetime.resolution
+
+
+def test_calendar_feedback_recheck_delay_includes_history_expiry_without_timestamp_overflow():
+    last_retained_time = NOW - timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS)
+    archived = {**record(actual=True), "end": last_retained_time.isoformat()}
+    history = {"history": [archived], "pending": []}
+    assert calendar_feedback_recheck_delay(history, [], NOW) == datetime.resolution
+
+    latest = datetime.max.replace(tzinfo=UTC)
+    history["history"] = [{**record(actual=True), "end": latest.isoformat()}]
+    assert calendar_feedback_recheck_delay(history, [], latest) == (
+        timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS) + datetime.resolution
+    )
+
+
+@pytest.mark.parametrize("source", ["feedback", "execution", "action"])
+def test_calendar_history_reads_saved_pending_once(monkeypatch, source):
+    saved = {"pending": [
+        record(actual=True),
+        record(start=20, end=30, uid="future"),
+    ]}
+    pending_reads = 0
+
+    def count_saved_pending(value, **kwargs):
+        nonlocal pending_reads
+        if value is saved["pending"]:
+            pending_reads += 1
+        return calendar_records(value, **kwargs)
+
+    monkeypatch.setattr(calendar_history, "calendar_records", count_saved_pending)
+    if source == "action":
+        state = confirm_calendar_action(saved, {
+            "kind": "ev_stop", "result": "applied", "action_id": "event", "attempted_at": NOW.isoformat(),
+        })
+        assert state["history"][0]["confirmed_action"] == "true"
+    else:
+        state = update_calendar_history(
+            saved, [record(actual=True)], NOW, replace_plan=False, location="EV" if source == "feedback" else None,
+        )
+        assert state["pending"] == saved["pending"]
+    assert pending_reads == 1
+
+
+def test_calendar_feedback_only_compares_confirmed_windows_with_matching_starts(monkeypatch):
+    running = record(actual=True)
+    history = [
+        record(start=-index - 60, end=-index - 59, uid=f"archive-{index}", actual=True)
+        for index in range(CALENDAR_HISTORY_HARD_CAP)
+    ]
+    future = [
+        {
+            **record(start=index * 5 + 10, end=index * 5 + 15, uid=f"tariff-{index}"),
+            "location": "Enphase Export Limit",
+        }
+        for index in range(288)
+    ]
+    saved = {"history": list(reversed(history)), "pending": [running, *future]}
+    comparisons = []
+    original_match = calendar_history._same_running_window
+
+    def count_match(previous, current, now):
+        comparisons.append((previous["uid"], current["uid"]))
+        return original_match(previous, current, now)
+
+    monkeypatch.setattr(calendar_history, "_same_running_window", count_match)
+
+    assert update_calendar_history(saved, [running], NOW, replace_plan=False, location="EV") == saved
+    assert comparisons == [(running["uid"], running["uid"])]
+
+
+def test_expired_provisional_windows_skip_confirmed_history_comparisons(monkeypatch):
+    history = [
+        record(start=-index - 60, end=-index - 59, uid=f"archive-{index}", actual=True)
+        for index in reversed(range(CALENDAR_HISTORY_HARD_CAP))
+    ]
+    expired = [
+        record(start=-index - 2, end=-index - 1, uid=f"planned-{index}")
+        for index in range(288)
+    ]
+    saved = {"history": history, "pending": expired}
+    comparisons = 0
+    original_match = calendar_history._same_confirmed_window
+
+    def count_match(previous, current):
+        nonlocal comparisons
+        comparisons += 1
+        return original_match(previous, current)
+
+    monkeypatch.setattr(calendar_history, "_same_confirmed_window", count_match)
+
+    assert update_calendar_history(saved, [], NOW, replace_plan=False) == {"history": history, "pending": []}
+    assert comparisons == 0
 
 
 def test_history_expires_confirmed_windows_after_retention_period():
@@ -90,6 +192,12 @@ def test_history_cap_counts_valid_confirmations_after_malformed_tail_records():
 def test_cancelled_future_window_is_discarded_before_it_starts():
     state = update_calendar_history(None, [record(start=20, end=30)], NOW)
     assert update_calendar_history(state, [], NOW + timedelta(minutes=1)) == {"history": [], "pending": []}
+
+
+def test_confirmation_removed_at_its_start_does_not_archive_a_zero_length_window():
+    state = update_calendar_history(None, [record(start=0, actual=True)], NOW)
+
+    assert update_calendar_history(state, [], NOW) == {"history": [], "pending": []}
 
 
 def test_unconfirmed_replan_preserves_current_action_id_and_timing():

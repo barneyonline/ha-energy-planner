@@ -2,28 +2,40 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite
+from operator import itemgetter
+from sys import float_info
 from typing import Any
 
 from .const import CONF_MIN_TARIFF_CONFIDENCE, CONF_PRICE_FRESHNESS_MINUTES
 from .forecasts import (
+    TARIFF_END_KEYS,
     _amber_half_hour_start,
-    _explicit_interval_minutes,
+    _declared_interval_minutes,
     _flatten_item,
     _forecast_item_unit,
-    _forecast_items,
+    _forecast_items_from_canonical,
     _parse_datetime_or_none,
+    _tariff_row_durations,
+    _utc_forecast_time,
     _with_canonical_keys,
+    cacheable_tariff_snapshot,
     normalize_scalar_value,
+    tariff_snapshot_matches,
+    tariff_source_attributes,
 )
 from .models import ActionAsset, ActionKind, DecisionContext, DecisionSlot, PlanAction
 
 EXPORT_ASSET = "enphase_export_limit"
+GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
 PRICE_KEYS = ("export_price", "feed_in_price", "per_kwh", "price", "value")
 START_KEYS = ("start_time", "period_start", "valid_at", "datetime", "from", "time", "date", "nem_time")
-END_KEYS = ("end_time", "period_end", "valid_until", "to")
 BLOCK_DURATION = timedelta(minutes=30)
+_LAST_INFERRED_BLOCK_START = datetime.max.replace(tzinfo=UTC) - BLOCK_DURATION
 
 
 READBACK_MAX_AGE = timedelta(minutes=10)
@@ -37,15 +49,14 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
     readback: Any = attributes.get("last_successful_readback")
     if readback is None:
         return {}, "export_limit_entity_unavailable"
-    if type(readback) not in (int, float) or not isfinite(readback):
+    if type(readback) not in (int, float) or not -float_info.max <= readback <= float_info.max:
         return {}, "export_limit_readback_invalid"
     age = now.timestamp() - readback
     watts = attributes.get("confirmed_watts")
     slew: Any = attributes.get("slew_rate")
     if (
         type(slew) not in (int, float)
-        or not isfinite(slew)
-        or slew <= 0
+        or not 0 < slew <= float_info.max
         or round(slew, 2) != slew
         or type(attributes.get("pending")) is not bool
         or (watts is not None and (type(watts) is not int or not 0 <= watts <= 100000))
@@ -68,8 +79,12 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
         "request_status": attributes.get("request_status"),
         "last_readback": readback,
     }
-    gateway = attributes.get("gateway_identity")
-    if isinstance(gateway, str) and len(gateway) == 64 and all(char in "0123456789abcdef" for char in gateway):
+    if "gateway_identity" in attributes or "gateway_identity_verified" in attributes:
+        gateway = attributes.get("gateway_identity")
+        if (attributes.get("gateway_identity_verified") is not True
+                or not isinstance(gateway, str) or len(gateway) != 64
+                or any(char not in "0123456789abcdef" for char in gateway)):
+            return result, GATEWAY_UNVERIFIED
         result["gateway_identity"] = gateway
     if not 0 <= age <= READBACK_MAX_AGE.total_seconds():
         return result, "export_limit_readback_stale"
@@ -79,7 +94,9 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
 def aware_time(value: Any) -> datetime | None:
     """Reject ambiguous local timestamps, retaining absolute UTC instants."""
     result = value if isinstance(value, datetime) else _parse_datetime_or_none(value)
-    return result.astimezone(UTC) if result is not None and result.tzinfo is not None else None
+    if result is None or result.tzinfo is None:
+        return None
+    return _utc_forecast_time(result)
 
 
 def block_time(value: Any) -> datetime:
@@ -112,22 +129,145 @@ def _half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]
     return _amber_half_hour_start(start, end, item)
 
 
-def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+@dataclass(frozen=True, slots=True)
+class ExportTariffSource:
+    """Validated rows and the metadata needed to check them at sampling time."""
+
+    updated_at: datetime | None
+    confidence: float | None
+    rows: list[tuple[datetime, datetime, float]]
+    issue: str | None
+
+
+@dataclass(slots=True)
+class ExportTariffCache:
+    """Retain one detached tariff payload for repeated preflight reports."""
+
+    _snapshot: dict[str, Any] | None = None
+    _updated_at: datetime | None = None
+    _source: ExportTariffSource | None = None
+
+    def _clear(self) -> None:
+        self._snapshot = None
+        self._updated_at = None
+        self._source = None
+
+    def blocks(self, state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        """Reuse validation while checking current freshness and payload mutations."""
+        if state is None or state.state in {"unknown", "unavailable"}:
+            self._clear()
+            return [], "export_tariff_unavailable"
+        raw_attributes = tariff_source_attributes(state.attributes or {})
+        updated_at = aware_time(state.last_updated)
+        if (self._source is not None and self._snapshot is not None and self._updated_at == updated_at
+                and tariff_snapshot_matches(raw_attributes, self._snapshot, acyclic_snapshot=True)):
+            return tariff_blocks_from_source(self._source, now, options)
+        # Drop the previous payload when a new one cannot be cached.
+        self._clear()
+        attributes = _with_canonical_keys(raw_attributes)
+        issued_at, confidence = _tariff_metadata(attributes, state.last_updated)
+        if issue := _tariff_metadata_issue(issued_at, confidence, now, options):
+            return [], issue
+        source = _validated_tariff_source(raw_attributes, attributes, issued_at, confidence)
+        snapshot = cacheable_tariff_snapshot(raw_attributes)
+        if snapshot is not None:
+            self._source = source
+            self._snapshot = snapshot
+            self._updated_at = updated_at
+        return _select_tariff_blocks(source, now)
+
+
+def parse_export_tariff(raw_attributes: dict[str, Any], last_updated: datetime) -> ExportTariffSource:
+    """Normalize and validate a detached export tariff payload."""
+    attributes = _with_canonical_keys(raw_attributes)
+    issued_at, confidence = _tariff_metadata(attributes, last_updated)
+    return _validated_tariff_source(raw_attributes, attributes, issued_at, confidence)
+
+
+def _tariff_metadata(attributes: dict[str, Any], last_updated: datetime) -> tuple[datetime | None, float | None]:
+    return _tariff_issued_at(attributes, last_updated), _tariff_confidence(attributes)
+
+
+def export_tariff_issued_at(attributes: Mapping[str, Any], last_updated: datetime) -> datetime | None:
+    """Resolve the provider's issue time, falling back to the HA update instant."""
+    return _tariff_issued_at(_with_canonical_keys(dict(attributes)), last_updated)
+
+
+def _tariff_issued_at(attributes: dict[str, Any], last_updated: datetime) -> datetime | None:
+    return aware_time(attributes.get("issued_at") or attributes.get("last_updated") or last_updated)
+
+
+def _validated_tariff_source(
+    raw_attributes: dict[str, Any], attributes: dict[str, Any], issued_at: datetime | None, confidence: float | None,
+) -> ExportTariffSource:
+    rows, issue = _parse_blocks(attributes, raw_attributes)
+    return ExportTariffSource(issued_at, confidence, rows, issue)
+
+
+def tariff_blocks(
+    state: Any, now: datetime, options: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
     """Preserve real half-hour source intervals without extrapolating scalar prices."""
     if state is None or state.state in {"unknown", "unavailable"}:
         return [], "export_tariff_unavailable"
-    attributes = _with_canonical_keys(state.attributes or {})
-    updated = aware_time(attributes.get("issued_at") or attributes.get("last_updated") or state.last_updated)
-    freshness = timedelta(minutes=float(options.get(CONF_PRICE_FRESHNESS_MINUTES, 30)))
-    if updated is None or not timedelta(0) <= now - updated <= freshness:
-        return [], "export_tariff_stale"
-    confidence = _tariff_confidence(attributes)
+    raw_attributes = state.attributes or {}
+    attributes = _with_canonical_keys(raw_attributes)
+    issued_at, confidence = _tariff_metadata(attributes, state.last_updated)
+    if issue := _tariff_metadata_issue(issued_at, confidence, now, options):
+        return [], issue
+    return _select_tariff_blocks(_validated_tariff_source(raw_attributes, attributes, issued_at, confidence), now)
+
+
+def tariff_blocks_from_source(
+    source: ExportTariffSource | None, now: datetime, options: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Select the current block from validated rows if source evidence is still fresh."""
+    if source is None:
+        return [], "export_tariff_unavailable"
+    if issue := _tariff_metadata_issue(source.updated_at, source.confidence, now, options):
+        return [], issue
+    return _select_tariff_blocks(source, now)
+
+
+def _tariff_metadata_issue(
+    updated: datetime | None, confidence: float | None, now: datetime, options: dict[str, Any],
+) -> str | None:
+    if not export_tariff_is_fresh(updated, now, options):
+        return "export_tariff_stale"
     if (
         confidence is None
         or confidence < float(options.get(CONF_MIN_TARIFF_CONFIDENCE, 50)) / 100
     ):
-        return [], "export_tariff_confidence_low"
-    items = _forecast_items(attributes, PRICE_KEYS)
+        return "export_tariff_confidence_low"
+    return None
+
+
+def export_tariff_is_fresh(
+    issued_at: datetime | None, now: datetime, options: Mapping[str, Any],
+) -> bool:
+    """Apply Export Limit's inclusive age boundary to the issued forecast."""
+    freshness = timedelta(minutes=float(options.get(CONF_PRICE_FRESHNESS_MINUTES, 30)))
+    return issued_at is not None and timedelta(0) <= now - issued_at <= freshness
+
+
+def _select_tariff_blocks(source: ExportTariffSource, now: datetime) -> tuple[list[dict[str, Any]], str | None]:
+    if source.issue is not None:
+        return [], source.issue
+    index = bisect_right(source.rows, now, key=itemgetter(0)) - 1
+    if index < 0 or now >= source.rows[index][1]:
+        return [], "export_tariff_block_missing"
+    return [
+        {"start": start.isoformat(), "end": end.isoformat(), "price": price,
+         "watts": 0 if price < 0 else None, "confidence": source.confidence}
+        for start, end, price in source.rows[index:index + 2]
+    ], None
+
+
+def _parse_blocks(
+    attributes: dict[str, Any], raw_attributes: dict[str, Any],
+) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
+    """Validate the complete source before selecting its current block."""
+    items = _forecast_items_from_canonical(attributes, PRICE_KEYS)
     parsed = []
     for raw in items:
         if not isinstance(raw, dict):
@@ -136,47 +276,42 @@ def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[l
         start = next((aware_time(item[key]) for key in START_KEYS if key in item), None)
         key = next((key for key in PRICE_KEYS if key in item), None)
         value: Any = item.get(key) if key is not None else None
-        if start is None or type(value) not in (int, float) or not isfinite(value):
+        if start is None or type(value) not in (int, float) or not -float_info.max <= value <= float_info.max:
             return [], "export_tariff_invalid"
         unit = _forecast_item_unit(item, key, str(attributes.get("unit_of_measurement", attributes.get("unit", ""))))
         price = normalize_scalar_value(value, value_kind="price", unit=unit)
-        end_key = next((key for key in END_KEYS if key in item), None)
+        end_key = next((key for key in TARIFF_END_KEYS if key in item), None)
         end = aware_time(item[end_key]) if end_key else None
         if end_key and end is None:
             return [], "export_tariff_invalid"
+        if any(
+            type(duration) not in (int, float) or duration != 30
+            for duration in _tariff_row_durations(raw)
+        ):
+            return [], "export_tariff_overlap_or_duration"
         start = _half_hour_start(start, end, item)
         parsed.append((start, end, price))
     parsed.sort(key=lambda value: value[0])
-    blocks: list[dict[str, Any]] = []
-    cadence = _explicit_interval_minutes(attributes)
-    if cadence is not None and cadence != 30:
+    blocks: list[tuple[datetime, datetime, float]] = []
+    cadences = tuple(_declared_interval_minutes(raw_attributes))
+    if any(minutes != 30 for minutes in cadences):
         return [], "export_tariff_ambiguous_duration"
     for index, (start, end, price) in enumerate(parsed):
         if end is None:
-            if cadence == 30 or (index + 1 < len(parsed) and parsed[index + 1][0] - start == BLOCK_DURATION):
-                end = start + BLOCK_DURATION
-            elif index > 0 and start - parsed[index - 1][0] == BLOCK_DURATION:
-                end = start + BLOCK_DURATION
-            else:
+            half_hour = (
+                bool(cadences)
+                or (index + 1 < len(parsed) and parsed[index + 1][0] - start == BLOCK_DURATION)
+                or (index > 0 and start - parsed[index - 1][0] == BLOCK_DURATION)
+            )
+            if not half_hour or start > _LAST_INFERRED_BLOCK_START:
                 return [], "export_tariff_ambiguous_duration"
-        if end - start != BLOCK_DURATION or (blocks and start < block_time(blocks[-1]["end"])):
+            end = start + BLOCK_DURATION
+        if end - start != BLOCK_DURATION or (blocks and start < blocks[-1][1]):
             return [], "export_tariff_overlap_or_duration"
-        if blocks and start > block_time(blocks[-1]["end"]):
+        if blocks and start > blocks[-1][1]:
             return [], "export_tariff_gap"
-        blocks.append(
-            {
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "price": price,
-                "watts": 0 if price < 0 else None,
-                "confidence": confidence,
-            }
-        )
-    current = next((block for block in blocks if block_time(block["start"]) <= now < block_time(block["end"])), None)
-    if current is None:
-        return [], "export_tariff_block_missing"
-    following = next((block for block in blocks if block_time(block["start"]) == block_time(current["end"])), None)
-    return [current, *([following] if following else [])], None
+        blocks.append((start, end, price))
+    return blocks, None
 
 
 def build_actions(context: DecisionContext) -> list[PlanAction]:

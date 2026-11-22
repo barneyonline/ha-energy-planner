@@ -49,7 +49,7 @@ class EnphaseProfileAdapter:
         self.entry_data = entry_data
         self.confirmation_attempts = max(int(confirmation_attempts), 1)
         self.confirmation_interval_seconds = max(float(confirmation_interval_seconds), 0.0)
-        self.before_dispatch: Callable[[str], Awaitable[None]] | None = None
+        self.before_dispatch: Callable[[str], Awaitable[str | None]] | None = None
 
     async def async_execute(self, action: PlanAction) -> EnphaseCommandResult:
         """Execute an Enphase profile action."""
@@ -101,7 +101,8 @@ class EnphaseProfileAdapter:
         if self.before_dispatch is not None and current_profile is not None:
             # Persistence is outside the service-error boundary: a failed save
             # must prevent both the requested command and compensation.
-            await self.before_dispatch(current_profile)
+            if (reason := await self.before_dispatch(current_profile)) is not None:
+                return self._result(False, reason, pre_state, current_profile, False)
         try:
             await async_call_device_service(self.hass, domain, service, service_data, blocking=True)
         except DeviceTargetUnavailable:

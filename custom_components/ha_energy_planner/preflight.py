@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Collection
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +14,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AMBER_EXPORT_PRICE,
     CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -35,9 +36,11 @@ from .const import (
     CONF_PLANNER_ENABLED,
 )
 from .discovery import CapabilityDiscovery
+from .enphase_export_limit import EXPORT_IDENTITY_ISSUES, current_tariff_blocks
 from .entry_data import combined_entry_data, remove_retired_config_keys
 from .ev_policy import EV_DEFAULTS
-from .export_limit_policy import EXPORT_ASSET, area_safe
+from .export_limit_cooldown import same_control
+from .export_limit_policy import EXPORT_ASSET, ExportTariffCache, area_safe
 from .load_forecast import FORECAST_CONTRACT_VERSION
 from .planner import confidence_eligible_control_areas
 from .safety import (
@@ -73,21 +76,43 @@ _EVIDENCE_ENTRY_EXCLUSIONS = {
 }
 
 
-def build_preflight_report(
+@dataclass(slots=True)
+class PreflightEvidence:
+    """One current evaluation of automatic control readiness."""
+
+    entry_data: dict[str, Any]
+    options: dict[str, Any]
+    control_areas: dict[str, Any]
+    discovery: dict[str, Any]
+    current_plan: dict[str, Any]
+    production: dict[str, Any]
+    recorder: dict[str, Any]
+    recorder_required: bool
+    control_paused: bool
+    control_area_blocking: bool
+    safe_to_activate_now: bool
+    active_control_ready: bool
+    safety_gates_bypassed: bool
+
+
+def evaluate_preflight(
     hass: HomeAssistant,
     coordinator: Any,
     *,
     options_override: dict[str, Any] | None = None,
     export_limit_override: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Return a redacted readiness report without calling device services."""
+    require_export_write_gate: bool = False,
+    now: datetime | None = None,
+) -> PreflightEvidence:
+    """Evaluate live authority and per-area readiness from the same evidence."""
     entry_data = combined_entry_data(coordinator.entry)
     options = coordinator.options if options_override is None else {**coordinator.options, **options_override}
     bypass_safety_gates = strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False)
-    now = dt_util.utcnow()
+    now = dt_util.utcnow() if now is None else now
     plan = getattr(coordinator, "data", None)
     if plan is not None and export_limit_override is not None:
         plan = replace(plan, control_area_health={**plan.control_area_health, EXPORT_ASSET: export_limit_override})
+    export_write_blocked = require_export_write_gate and _export_activation_blocked(coordinator)
     control_areas, discovery = _runtime_control_area_report(
         hass,
         entry_data,
@@ -95,12 +120,15 @@ def build_preflight_report(
         plan=plan,
         pause=coordinator.store.data.get("control_pause"),
         now=now,
+        export_ownership=coordinator.store.data.get("ownership", {}).get(EXPORT_ASSET, {}),
+        export_reconciliation_pending=getattr(coordinator, "_export_reconcile_pending", False),
+        export_plan_unconfirmed=_export_plan_unconfirmed(coordinator),
+        export_write_blocked=export_write_blocked,
+        check_export_tariff=True,
+        export_tariff_cache=getattr(coordinator, "_preflight_tariff_cache", None),
     )
-    entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
-    service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
     recorder_required = bool(entry_data.get(CONF_HOUSEHOLD_LOAD)) and control_areas["required"] != [EXPORT_ASSET]
-    safety = _safety_report(options)
     evidence_fingerprint = production_evidence_fingerprint(entry_data, options)
     production = _production_report(
         coordinator.store.data,
@@ -123,17 +151,51 @@ def build_preflight_report(
     if export_safe:
         current_plan["safe"] = True
         current_plan["message"] = "Export Limit has fresh tariff and gateway readback evidence."
-    audit = _audit_report(coordinator.store.data)
+    control_paused = bool(control_areas["ready"] and not control_areas["available"])
+    control_area_blocking = bool(control_areas["required"] and not control_areas["ready"])
+    safe_to_activate_now = bypass_safety_gates or (
+        not control_area_blocking
+        and (not recorder_required or recorder["available"])
+        and bool(control_areas["available"])
+        and production["dry_run_evidence_complete"]
+        and current_plan["safe"]
+        and bool(control_areas["confidence_eligible"])
+        and production["device_controls_enabled"]
+        and not control_paused
+    )
+    production["safe_to_activate_now"] = safe_to_activate_now
+    production["safety_gates_bypassed"] = bypass_safety_gates
+    arm_confirmed = not require_export_write_gate or getattr(coordinator, "_operator_arm_confirmed", lambda: True)()
+    active_control_ready = safe_to_activate_now and production["armed"] and arm_confirmed and not (
+        export_write_blocked and control_areas["required"] == [EXPORT_ASSET]
+    )
+    return PreflightEvidence(
+        entry_data=entry_data, options=options, control_areas=control_areas, discovery=discovery,
+        current_plan=current_plan, production=production, recorder=recorder, recorder_required=recorder_required,
+        control_paused=control_paused, control_area_blocking=control_area_blocking,
+        safe_to_activate_now=safe_to_activate_now, active_control_ready=active_control_ready,
+        safety_gates_bypassed=bypass_safety_gates,
+    )
 
-    ready_control_areas = list(control_areas.get("ready", []))
-    unpaused_control_areas = list(control_areas.get("available", []))
-    confidence_eligible_areas = list(control_areas.get("confidence_eligible", []))
-    control_paused = bool(ready_control_areas and not unpaused_control_areas)
-    control_area_blocking = bool(control_areas["required"] and not ready_control_areas)
-    blocking = [
-        *(["control_areas"] if control_area_blocking else []),
-        *(["recorder"] if recorder_required and not recorder["available"] else []),
-    ]
+
+def build_preflight_report(
+    hass: HomeAssistant,
+    coordinator: Any,
+    *,
+    options_override: dict[str, Any] | None = None,
+    export_limit_override: dict[str, Any] | None = None,
+    require_export_write_gate: bool = False,
+) -> dict[str, Any]:
+    """Return a redacted readiness report without calling device services."""
+    evidence = evaluate_preflight(
+        hass, coordinator, options_override=options_override, export_limit_override=export_limit_override,
+        require_export_write_gate=require_export_write_gate,
+    )
+    control_areas, current_plan, production = evidence.control_areas, evidence.current_plan, evidence.production
+    entity_report = _entity_report(hass, evidence.entry_data, required_areas=control_areas["required"])
+    service_report = _service_report(hass, evidence.entry_data, required_areas=control_areas["required"])
+    safety = _safety_report(evidence.options)
+    confidence_eligible_areas = control_areas["confidence_eligible"]
     checks = [
         {
             "check": "safe_first_run_mode",
@@ -148,7 +210,7 @@ def build_preflight_report(
         {
             "check": "configured_entities_available",
             "ok": not entity_report["missing"] and not entity_report["unavailable"],
-            "blocking": control_area_blocking,
+            "blocking": evidence.control_area_blocking,
             "message": _availability_message(
                 "All configured entities are present and available.",
                 missing=entity_report["missing"],
@@ -158,7 +220,7 @@ def build_preflight_report(
         {
             "check": "configured_services_available",
             "ok": not service_report["missing"] and not service_report["unavailable"],
-            "blocking": control_area_blocking,
+            "blocking": evidence.control_area_blocking,
             "message": _availability_message(
                 "All configured services are registered.",
                 missing=service_report["missing"],
@@ -167,16 +229,16 @@ def build_preflight_report(
         },
         {
             "check": "required_control_areas_supported",
-            "ok": not control_areas["required"] or bool(ready_control_areas),
+            "ok": not evidence.control_area_blocking,
             "blocking": True,
-            "message": _control_area_message(control_areas, discovery),
+            "message": _control_area_message(control_areas, evidence.discovery),
         },
         {
             "check": "recorder_available",
-            "ok": recorder["available"],
-            "blocking": recorder_required,
+            "ok": evidence.recorder["available"],
+            "blocking": evidence.recorder_required,
             "message": "Recorder is available for history imports."
-            if recorder["available"]
+            if evidence.recorder["available"]
             else "Recorder is not detected.",
         },
         {
@@ -194,11 +256,11 @@ def build_preflight_report(
         },
         {
             "check": "control_not_paused",
-            "ok": not control_paused,
+            "ok": not evidence.control_paused,
             "blocking": True,
             "message": (
                 "At least one ready control area is not paused."
-                if not control_paused
+                if not evidence.control_paused
                 else "Every ready control area is paused."
             ),
         },
@@ -232,37 +294,25 @@ def build_preflight_report(
             ),
         },
     ]
-    if bypass_safety_gates:
+    if evidence.safety_gates_bypassed:
         for check in checks:
             check["bypassed"] = not bool(check["ok"])
             check["blocking"] = False
-    safe_to_activate_now = bypass_safety_gates or (
-        not blocking
-        and bool(unpaused_control_areas)
-        and production["dry_run_evidence_complete"]
-        and current_plan["safe"]
-        and bool(confidence_eligible_areas)
-        and production["device_controls_enabled"]
-        and not control_paused
-    )
-    production["safe_to_activate_now"] = safe_to_activate_now
-    production["safety_gates_bypassed"] = bypass_safety_gates
-    active_control_ready = safe_to_activate_now and production["armed"]
     return {
-        "ok": active_control_ready,
-        "active_control_ready": active_control_ready,
-        "safe_to_activate_now": safe_to_activate_now,
-        "safety_gates_bypassed": bypass_safety_gates,
+        "ok": evidence.active_control_ready,
+        "active_control_ready": evidence.active_control_ready,
+        "safe_to_activate_now": evidence.safe_to_activate_now,
+        "safety_gates_bypassed": evidence.safety_gates_bypassed,
         "current_plan": current_plan,
         "mode": safety,
         "production": production,
         "checks": checks,
         "entities": entity_report,
         "services": service_report,
-        "recorder": recorder,
+        "recorder": evidence.recorder,
         "control_areas": control_areas,
-        "discovery": discovery,
-        "audit": audit,
+        "discovery": evidence.discovery,
+        "audit": _audit_report(coordinator.store.data),
     }
 
 
@@ -674,12 +724,54 @@ def _runtime_control_area_report(
     plan: Any,
     pause: Any,
     now: datetime,
+    export_ownership: dict[str, Any],
+    export_reconciliation_pending: bool = False,
+    export_plan_unconfirmed: bool = False,
+    export_write_blocked: bool = False,
+    check_export_tariff: bool = False,
+    export_tariff_cache: ExportTariffCache | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return shared capability, pause, and confidence readiness by area."""
     control_areas = _control_area_report(entry_data, options)
-    discovery = CapabilityDiscovery(hass, entry_data, options).inspect().as_dict()
+    report = CapabilityDiscovery(hass, entry_data, options).inspect(export_ownership=export_ownership)
+    export = report.enphase_export_limit
+    tariff_issue = None
+    if EXPORT_ASSET in control_areas["required"]:
+        if export_reconciliation_pending:
+            export.supported = False
+            export.issues.append("export_reconciliation_pending")
+        elif export_plan_unconfirmed:
+            export.supported = False
+            export.issues.append("current_plan_refresh_unconfirmed")
+        elif export_write_blocked:
+            export.supported = False
+            export.issues.append("export_activation_pending")
+        elif export.supported and area_safe(plan):
+            planned = plan.control_area_health[EXPORT_ASSET]
+            if not _export_feedback_matches_plan(planned.get("feedback"), export.details):
+                export.supported = False
+                export.issues.append("current_plan_refresh_unconfirmed")
+            elif check_export_tariff:
+                blocks, tariff_issue = current_tariff_blocks(
+                    hass, entry_data.get(CONF_AMBER_EXPORT_PRICE), options, now,
+                    preflight_cache=export_tariff_cache,
+                )
+                planned_blocks = planned.get("blocks")
+                if tariff_issue is None and planned_blocks and planned_blocks[0] != blocks[0]:
+                    tariff_issue = "export_tariff_changed"
+            if tariff_issue is not None:
+                export.supported = False
+                export.issues.append(tariff_issue)
+    discovery = report.as_dict()
     _apply_ev_keep_on_preflight(discovery, entry_data, options)
     _apply_control_area_readiness(hass, entry_data, control_areas, discovery)
+    if EXPORT_ASSET in control_areas["required"]:
+        for issue in export.issues:
+            if issue == tariff_issue or issue in EXPORT_IDENTITY_ISSUES or issue in {
+                "export_reconciliation_pending", "current_plan_refresh_unconfirmed", "export_activation_pending",
+            }:
+                control_areas["details"][EXPORT_ASSET]["reason"] = issue
+                break
     ready = list(control_areas.get("ready", []))
     available, paused = partition_control_areas_by_pause(pause, now, ready)
     confidence_eligible = confidence_eligible_control_areas(plan, available, options)
@@ -697,6 +789,33 @@ def _runtime_control_area_report(
         }
     )
     return control_areas, discovery
+
+
+def _export_feedback_matches_plan(planned: Any, observed: dict[str, Any]) -> bool:
+    """Check that live feedback belongs to the control and gateway that informed the plan."""
+    if not isinstance(planned, dict) or not planned.get("identity"):
+        return False
+    live_identity = observed.get("identity")
+    return bool(
+        live_identity and same_control(planned["identity"], live_identity)
+        and planned.get("gateway_identity") == observed.get("gateway_identity")
+    )
+
+
+def _export_activation_blocked(coordinator: Any) -> bool:
+    """Read the current Export Limit write gate for runtime-facing reports."""
+    blocked = getattr(coordinator, "_export_write_blocked", None)
+    return callable(blocked) and blocked()
+
+
+def _export_plan_unconfirmed(coordinator: Any) -> bool:
+    """Check whether the last attempt confirms the current Export Limit plan."""
+    generation = getattr(coordinator, "_refresh_generation", None)
+    refresh = getattr(coordinator, "last_refresh_metadata", None)
+    return isinstance(refresh, dict) and (
+        refresh.get("succeeded") is False
+        or (generation is not None and refresh.get("generation", generation) != generation)
+    )
 
 
 def _apply_control_area_readiness(

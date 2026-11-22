@@ -12,14 +12,23 @@ from unittest.mock import patch
 import pytest
 from homeassistant import auth, loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState, ConfigSubentry
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import frame
+from homeassistant.helpers.storage import Store
 
 from custom_components.ha_energy_planner import async_migrate_entry
 from custom_components.ha_energy_planner.config_flow import ConfigFlow
-from custom_components.ha_energy_planner.const import CONF_EV_SMART_CHARGING_TARGET_SOC, DEFAULT_OPTIONS, DOMAIN
+from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_IMPORT_PRICE,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
+    DEFAULT_OPTIONS,
+    DOMAIN,
+)
+from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+from custom_components.ha_energy_planner.storage import PlannerStore
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -180,6 +189,78 @@ def test_separate_data_and_options_writes_preserve_reload_recovery(tmp_path: Pat
             production = replacement.store.data["production"]
             assert production["disarmed_reason"] == "configuration_changed"
             assert production["startup_auto_recovery"]["status"] == "waiting_for_home_assistant"
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("armed", [True, False])
+def test_first_plan_supersession_preserves_control_for_core_retry(tmp_path: Path, armed: bool) -> None:
+    """A tariff revision during the first Store write leaves startup intent intact."""
+    shutil.copytree(ROOT / "custom_components/ha_energy_planner", tmp_path / "custom_components/ha_energy_planner")
+
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        frame.async_setup(hass)
+        loader.async_setup(hass)
+        hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
+        dr.async_setup(hass)
+        await dr.async_load(hass)
+        await er.async_load(hass)
+        hass.auth = await auth.auth_manager_from_config(hass, [{"type": "homeassistant"}], [])
+        price_entity = "sensor.import_price"
+        entry = make_entry(
+            {CONF_AMBER_IMPORT_PRICE: price_entity},
+            options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+        )
+        hass.config_entries._entries[entry.entry_id] = entry
+        hass.states.async_set(price_entity, "0.20", {"unit_of_measurement": "AUD/kWh"})
+        previous = PlannerStore(hass, entry.entry_id)
+        ownership = {"enphase_profile": "AI Optimisation"}
+        reservation = {"active": True, "load_kw": 7.2}
+        await previous.async_save_ownership(ownership)
+        await previous.async_save_ev_grid_reservation(reservation)
+        await previous.async_save_production({
+            "armed": armed,
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(dict(entry.data), dict(entry.options)),
+            "startup_auto_recovery": {"status": "waiting_for_safe"},
+        })
+
+        save = Store.async_save
+        candidate_writes = 0
+
+        async def change_tariff_during_save(storage, payload):
+            nonlocal candidate_writes
+            await save(storage, payload)
+            if storage.key == f"{DOMAIN}_state_{entry.entry_id}" and "_pending_plan_publication" in payload:
+                candidate_writes += 1
+                if candidate_writes == 1:
+                    hass.states.async_set(price_entity, "0.31", {"unit_of_measurement": "AUD/kWh"})
+
+        try:
+            with patch.object(Store, "async_save", change_tariff_during_save):
+                assert not await hass.config_entries.async_setup(entry.entry_id)
+                assert entry.state is ConfigEntryState.SETUP_RETRY
+                assert not hasattr(entry, "runtime_data")
+                assert candidate_writes == 1
+                await previous.async_load()
+                assert not previous.data.get("active_plan")
+                assert previous.data["ownership"] == ownership
+                assert previous.data["ev_grid_reservation"] == reservation
+                assert previous.data["production"]["armed"] is armed
+                assert previous.data["production"]["startup_auto_recovery"]["status"] == "waiting_for_home_assistant"
+
+                # Let Core deliver the registered automatic retry at startup.
+                hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+                await asyncio.wait_for(hass.async_block_till_done(wait_background_tasks=True), 10)
+                assert candidate_writes >= 2
+                assert entry.state is ConfigEntryState.LOADED
+                assert entry.runtime_data.data is not None
+                assert entry.runtime_data.active_control is armed
+                assert entry.runtime_data._startup_auto_recovery_authorized
+                assert entry.runtime_data.store.data["ownership"] == ownership
         finally:
             await hass.async_stop(force=True)
 

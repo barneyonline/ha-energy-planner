@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from math import isfinite
@@ -193,15 +194,19 @@ def power_provenance(hass: Any, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_climate_inputs(
-    hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime, load_details: dict[str, Any]
+    hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime,
+    load_details: dict[str, Any],
+    *, tariff_intervals: list[dict[str, Any]] | None = None, read_state: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Read only mapped sensors; missing optional evidence stays explicitly absent."""
     from .zone_control import read_topology, topology
     sources: dict[str, Any] = {}
     freshness = timedelta(minutes=float(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)))
 
+    get_state = hass.states.get if read_state is None else read_state
+
     def state(entity: Any) -> Any:
-        return hass.states.get(entity) if isinstance(entity, str) and entity else None
+        return get_state(entity) if isinstance(entity, str) and entity else None
 
     def number(entity: Any, kind: str) -> float | None:
         item = state(entity)
@@ -304,7 +309,7 @@ def read_climate_inputs(
         "identity": climate_identity(data, options),
         "head_entity": data.get(CONF_DAIKIN_CLIMATE),
         **power_provenance(hass, data),
-        "tariff_intervals": tariff_source_intervals(
+        "tariff_intervals": tariff_intervals if tariff_intervals is not None else tariff_source_intervals(
             tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), slot_starts=[now, end],
         ),
         "target": finite(attrs.get("temperature")),

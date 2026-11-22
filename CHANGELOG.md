@@ -12,8 +12,14 @@
 
 ### 🐛 Bug fixes
 
-- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard.
-- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change.
+- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard. Missing verified gateway settings during installer preparation or guarded apply pauses recovery without spending the check.
+- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change. Gateway problems stay visible when tariff data is missing, a cooldown is active, or a replacement gateway already has a pending request. Export Limit blocks partial verification metadata and identifies remapped controls separately from gateway replacements even when the new control is unavailable.
+- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes. Preserve the command cooldown when a pruned control is remapped before or after correcting the clock. Keep remap reconciliation running when an inactive control has invalid timing metadata. Lowering the command interval preserves any longer wait recorded during clock repair.
+- Keep forecast refreshes running when a provider reports a cadence too small or too large to represent. Use the next valid cadence field and require timestamped cadence to fit its source rows. Block Export Limit writes when cadence fields conflict with its 30-minute requirement or a tariff timestamp falls outside the supported UTC range. Recheck current tariff rows before dispatch and require usable timestamps for secondary PV coverage.
+- Keep scheduled planning boundaries on time during sustained Home Assistant state changes.
+- Preserve newer manual EV limits during Charge Now rollback. Cancel unsent Export Limit writes when Automatic Control is switched off, and preserve installer retry attempts when tariff data becomes unusable.
+- Recheck live Export Limit tariff data during arming. Resume prior startup recovery after a rejected replacement arm and pause ready installer retries until Export Limit can write again.
+- Discard plans when tariff data changes during publication. Preserve unsent Export Limit retry attempts when verified gateway replacement coincides with a probe error or tariff deferral.
 
 ### 🔧 Improvements
 

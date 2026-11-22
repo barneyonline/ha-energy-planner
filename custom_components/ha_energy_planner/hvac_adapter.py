@@ -48,6 +48,10 @@ class _HVACManualOverrideError(RuntimeError):
     """Raised when a user supersedes an in-flight HVAC command."""
 
 
+class _HVACAcquisitionRejected(RuntimeError):
+    """Raised when a plan loses authority before its first device command."""
+
+
 @dataclass(slots=True)
 class HVACCommandResult:
     """Result of an HVAC adapter action."""
@@ -89,6 +93,7 @@ class DaikinHVACAdapter:
         self._prior_mode_intent: dict[str, Any] | None = None
         self._async_cycle_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._command_callback: Callable[[dict[str, Any]], None] | None = None
+        self._acquisition_guard: Callable[[], str | None] | None = None
         self._last_commands: dict[str, dict[str, Any]] = {}
         self._abort_main_state: dict[str, Any] = {}
         self._command_started: dict[str, float] = {}
@@ -293,6 +298,17 @@ class DaikinHVACAdapter:
         """Record the exact issued service and its bounded feedback expectation."""
         self._command_callback = callback
 
+    def set_acquisition_guard(self, guard: Callable[[], str | None]) -> None:
+        """Validate plan authority at the first device command boundary."""
+        self._acquisition_guard = guard
+
+    def _authorize_acquisition(self) -> None:
+        """Leave confirmation and safety cleanup under the admitted transaction's authority."""
+        if self._acquisition_guard is not None:
+            if (reason := self._acquisition_guard()) is not None:
+                raise _HVACAcquisitionRejected(reason)
+            self._acquisition_guard = None
+
     async def _async_command(
         self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any],
         *, emergency_off: bool = False, respect_manual_override: bool = True, **kwargs: Any
@@ -410,6 +426,8 @@ class DaikinHVACAdapter:
                         and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
                     # Read-only: recheck after all persistence and guard awaits.
                     await self._async_cycle_callback({**record, "stage": "dispatch"})
+                if respect_manual_override:
+                    self._authorize_acquisition()
             except BaseException:  # Cancellation before dispatch is an unsent intent too.
                 self._unconfirmed_main_mode = unconfirmed_before
                 # This intent never reached the service bus. Retire superseded
@@ -424,6 +442,9 @@ class DaikinHVACAdapter:
                 self._last_commands.pop(entity_id, None)
                 self._command_started.pop(entity_id, None)
                 raise
+        elif (self._acquisition_guard is not None and respect_manual_override
+                and (domain == "automation" or entity_id in self._zone_entities())):
+            self._authorize_acquisition()
         if self._command_callback is not None:
             self._command_callback({**record, "stage": "issued"})
         try:
@@ -689,7 +710,10 @@ class DaikinHVACAdapter:
         baseline = self._abort_main_state or self.main_takeover_snapshot()
         try:
             return await self._async_execute(action)
+        except _HVACAcquisitionRejected as error:
+            return HVACCommandResult(False, str(error), {}, self._snapshot(), {}, True)
         except BaseException as error:
+            self._acquisition_guard = None
             if self._command_callback is not None:
                 self._command_callback(
                     {
@@ -722,6 +746,7 @@ class DaikinHVACAdapter:
                     )
             raise
         finally:
+            self._acquisition_guard = None
             self._deferred_zone_entities = None
 
     async def _async_execute(self, action: PlanAction) -> HVACCommandResult:
@@ -1021,6 +1046,8 @@ class DaikinHVACAdapter:
             )
         except _HVACStateConfirmationError:
             state_confirmed = False
+        except _HVACAcquisitionRejected:
+            raise
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
             if action.desired_state.get("zone_intent"):
                 return HVACCommandResult(False, "zone_subset_service_failed", pre_state, self._snapshot(),
@@ -1105,6 +1132,7 @@ class DaikinHVACAdapter:
         saved_main_state: dict[str, Any] | None = None,
     ) -> HVACCommandResult:
         """Restore transactionally, with independent off cleanup on every exception."""
+        self._acquisition_guard = None
         try:
             return await self._async_restore(saved_automation_states, saved_zone_states, saved_main_state)
         except BaseException as error:
@@ -1472,6 +1500,8 @@ class DaikinHVACAdapter:
                             blocking=True,
                             context=service_context,
                         )
+                except _HVACAcquisitionRejected:
+                    raise
                 except Exception:  # noqa: BLE001
                     return False, changed
                 try:
@@ -1636,6 +1666,7 @@ class DaikinHVACAdapter:
         restore_main: bool = True,
     ) -> tuple[bool, dict[str, str], dict[str, Any], dict[str, Any]]:
         """Release every actuator acquired before a climate command failed."""
+        self._acquisition_guard = None
         if restore_main and self._set_pending_main_restore is not None:
             self._set_pending_main_restore(dict(saved_main_state))
         if self._set_pending_zone_restore is not None:
@@ -2536,6 +2567,8 @@ class DaikinHVACAdapter:
                     {ATTR_ENTITY_ID: automation_id, "stop_actions": True},
                     blocking=True,
                 )
+            except _HVACAcquisitionRejected:
+                raise
             except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
                 return False, changed_states
             try:

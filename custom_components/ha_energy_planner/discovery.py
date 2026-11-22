@@ -90,14 +90,14 @@ class CapabilityDiscovery:
         self.entry_data = entry_data
         self.options = {**DEFAULT_OPTIONS, **(options or {})}
 
-    def inspect(self) -> DiscoveryReport:
+    def inspect(self, *, export_ownership: dict[str, Any] | None = None) -> DiscoveryReport:
         """Return current capability evidence."""
         return DiscoveryReport(
             ev=self._inspect_ev(),
             hvac=self._inspect_hvac(),
             enphase=self._inspect_enphase(),
             ai=self._inspect_ai(),
-            enphase_export_limit=self._inspect_export_limit(),
+            enphase_export_limit=self._inspect_export_limit(export_ownership),
         )
 
     def _inspect_ev(self) -> CapabilityEvidence:
@@ -243,15 +243,18 @@ class CapabilityDiscovery:
             },
         )
 
-    def _inspect_export_limit(self) -> CapabilityEvidence:
+    def _inspect_export_limit(self, ownership: dict[str, Any] | None) -> CapabilityEvidence:
         from homeassistant.util import dt as dt_util
 
         from .const import CONF_ENPHASE_EXPORT_LIMIT_ENTITY
-        from .enphase_export_limit import feedback
+        from .enphase_export_limit import feedback, owned_feedback_issue
 
         if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
             return CapabilityEvidence(False, ["export_limit_not_configured"])
         observed, issue = feedback(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), dt_util.utcnow())
+        issue = owned_feedback_issue(ownership or {}, observed, issue)
+        if issue is None and observed.get("pending"):
+            issue = "export_limit_pending"
         issues = [issue] if issue else []
         for service in ("set_export_limit", "disable_export_limit"):
             issues.extend(_service_evidence(self.hass, f"enphase_ev.{service}", "export_limit_service").issues)

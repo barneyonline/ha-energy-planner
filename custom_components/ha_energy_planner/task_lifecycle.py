@@ -45,9 +45,11 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if self._debounce_cancel is not None:
         self._debounce_cancel()
         self._debounce_cancel = None
+    self._queued_direct_refresh = None
     if self._boundary_cancel is not None:
         self._boundary_cancel()
         self._boundary_cancel = None
+    self._planning_boundary_at = None
     tariff_cancel = getattr(self, "_tariff_retry_cancel", None)
     if tariff_cancel is not None:
         tariff_cancel()
@@ -59,6 +61,8 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if export_cancel is not None:
         export_cancel()
         self._export_boundary_cancel = None
+    self._export_boundary_at = None
+    self._export_boundary_fire_at = None
     self._export_boundary_followup_due = False
     export_retry_cancel = getattr(self, "_export_retry_cancel", None)
     if export_retry_cancel is not None:
@@ -114,4 +118,5 @@ async def async_wait_for_refresh_shutdown(self: EnergyPlannerCoordinator) -> Non
     # writes as well, using the same command-then-planner order as operator work.
     async with self._command_lock:
         async with self._planner_lock:
-            return
+            if getattr(self, "_calendar_feedback_flush_needed", False):
+                await self._async_flush_calendar_feedback()

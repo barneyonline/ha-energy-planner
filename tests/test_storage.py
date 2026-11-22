@@ -1282,6 +1282,176 @@ def test_calendar_plan_source_is_available_before_persistence_finishes(monkeypat
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("invalidated", [None, "before_stage", "during_stage"])
+def test_staged_plan_checks_currentness_before_writing(monkeypatch, invalidated):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+
+    async def run():
+        store = PlannerStore(object(), "staged")
+        writes = []
+        current = invalidated != "before_stage"
+
+        async def save(data):
+            assert store.pending_calendar_plan is None
+            writes.append(data)
+
+        def stage():
+            nonlocal current
+            store.record_production({"dry_run_ready_cycles": 3})
+            if invalidated == "during_stage":
+                current = False
+            return True
+
+        store._store.async_save = save
+        store.data["production"] = {"dry_run_ready_cycles": 2}
+        outcome = await store.async_publish_plan(stage, lambda: current)
+        if invalidated is None:
+            assert outcome is True
+            assert len(writes) == 1
+            assert store.data["production"]["dry_run_ready_cycles"] == 3
+        else:
+            assert outcome is None
+            assert not writes
+            assert store.data["production"]["dry_run_ready_cycles"] == 2
+
+    asyncio.run(run())
+
+
+def test_failed_plan_stage_leaves_candidate_unpublished(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+
+    async def run():
+        store = PlannerStore(object(), "staged")
+
+        def stage():
+            store.record_production({"dry_run_ready_cycles": 3})
+            raise ValueError("invalid plan evidence")
+
+        with pytest.raises(ValueError, match="invalid plan evidence"):
+            await store.async_publish_plan(stage, lambda: True)
+        assert not store.data["production"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "obsolete", "conflict", "cancelled", "failed"])
+def test_candidate_save_recovers_only_canonical_plan(monkeypatch, tmp_path, outcome):
+    import json
+    from dataclasses import replace
+    from pathlib import Path
+
+    from homeassistant.core import HomeAssistant
+    from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.helpers.storage import Store as HomeAssistantStore
+    from homeassistant.util.file import WriteError
+
+    previous = EnergyPlan(
+        plan_id="previous", created_at=datetime.now(UTC), horizon_hours=24, interval_minutes=5,
+        status="current", health=InputHealth.HEALTHY, mode=PlannerMode.DRY_RUN,
+        summary="test", confidence=0.9, estimated_daily_cost=2.0, actions=[], preview=[],
+    )
+    candidate = replace(previous, plan_id="candidate")
+    pending_key = "_pending_plan_publication"
+    write_data = HomeAssistantStore._async_write_data
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        try:
+            store = PlannerStore(hass, "staged")
+            path = Path(store._store.path)
+            entered, release = asyncio.Event(), asyncio.Event()
+            current = True
+
+            def saved_data():
+                return json.loads(path.read_text())["data"]
+
+            async def write(backend, envelope):
+                pending = pending_key in envelope["data"]
+                if pending and outcome == "failed":
+                    raise WriteError("simulated file write failure")
+                await write_data(backend, envelope)
+                if pending:
+                    # Pause after the atomic write, before its acknowledgement.
+                    entered.set()
+                    await release.wait()
+
+            async with store.async_delay_save():
+                await store.async_save_plan(previous, calendar_events=[])
+                await store.async_save_production({"dry_run_ready_cycles": 2})
+
+            def stage():
+                store.record_plan(candidate, calendar_events=[])
+                store.record_production({"dry_run_ready_cycles": 3})
+                return candidate
+
+            monkeypatch.setattr(HomeAssistantStore, "_async_write_data", write)
+            operation = store.async_publish_plan(stage, lambda: current)
+            if outcome == "failed":
+                with pytest.raises(HomeAssistantError, match="storage_write_failed"):
+                    await operation
+                assert store.calendar_plan is previous
+                assert store.pending_calendar_plan is None
+                assert pending_key not in saved_data()
+            else:
+                task = asyncio.create_task(operation)
+                try:
+                    await asyncio.wait_for(entered.wait(), 2)
+                    assert store.calendar_plan is previous
+                    assert store.pending_calendar_plan is candidate
+                    assert store.data["active_plan"]["plan_id"] == previous.plan_id
+                    snapshot = saved_data()
+                    assert snapshot["active_plan"]["plan_id"] == previous.plan_id
+                    assert snapshot["production"]["dry_run_ready_cycles"] == 2
+                    pending = snapshot[pending_key]
+                    assert pending["active_plan"]["plan_id"] == candidate.plan_id
+                    assert pending["production"]["dry_run_ready_cycles"] == 3
+                    if outcome == "accepted":
+                        with store.defer_save():
+                            await store.async_save_control_pause({"reason": "independent_update"})
+                    if outcome == "conflict":
+                        with store.defer_save():
+                            await store.async_save_production({"dry_run_ready_cycles": 0})
+                    if outcome == "cancelled":
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        assert not task.done()
+                    if outcome == "obsolete":
+                        current = False
+                finally:
+                    release.set()
+                if outcome == "cancelled":
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    assert await task is (candidate if outcome == "accepted" else None)
+                assert saved_data() == snapshot
+                assert store.calendar_plan is (candidate if outcome == "accepted" else previous)
+                assert store.pending_calendar_plan is None
+
+            expected_plan = candidate if outcome == "accepted" else previous
+            expected_count = {"accepted": 3, "conflict": 0}.get(outcome, 2)
+            assert store.data["production"]["dry_run_ready_cycles"] == expected_count
+            if outcome in {"accepted", "conflict"}:
+                await store.async_flush_deferred()
+                assert pending_key not in saved_data()
+            elif outcome != "failed":
+                await store.async_flush_deferred()
+                assert saved_data() == snapshot
+
+            restarted = PlannerStore(hass, "staged")
+            await restarted.async_load()
+            assert restarted.data["active_plan"]["plan_id"] == expected_plan.plan_id
+            assert restarted.data["production"]["dry_run_ready_cycles"] == expected_count
+            assert pending_key not in restarted.data
+            assert pending_key not in saved_data()
+            if outcome == "accepted":
+                assert restarted.data["control_pause"] == {"reason": "independent_update"}
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("ledger", [True, False])
 def test_reload_cleans_missing_control_attempts_but_preserves_uncertain_commands(monkeypatch, ledger):
     from custom_components.ha_energy_planner.action_limits import action_budget

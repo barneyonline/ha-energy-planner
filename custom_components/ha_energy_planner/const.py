@@ -245,6 +245,8 @@ ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 STATE_UNKNOWN_VALUES = {"unknown", "unavailable", None}
 EV_RESERVATION_RETAIN_WHEN_UNLOADED = "retain_when_unloaded"
 EV_RESERVATION_EXTERNAL_BASELINE = "external_baseline"
+EV_RESERVATION_EXTERNAL_POWER_OPTIONS = "external_power_options"
+EV_RESERVATION_EXTERNAL_TOPOLOGY = "external_topology"
 
 # Optional EV policies preserve legacy booleans and hard ceilings on upgrade.
 

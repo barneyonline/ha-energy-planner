@@ -29,9 +29,18 @@ def finite(value: Any) -> float | None:
         return None
     try:
         number = float(value)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
     return number if isfinite(number) else None
+
+
+def power_limit_options(options: Mapping[str, Any]) -> dict[str, float]:
+    """Retain the finite settings required to interpret one native EV limit."""
+    return {
+        key: value
+        for key in ("ev_limit_min", "ev_limit_max", "ev_voltage", "ev_phases")
+        if (value := finite(options.get(key))) is not None
+    }
 
 
 def strategy(options: Mapping[str, Any]) -> str:

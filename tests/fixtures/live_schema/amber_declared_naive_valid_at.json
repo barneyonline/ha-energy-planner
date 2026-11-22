@@ -1,0 +1,28 @@
+{
+  "kind": "forecast_state",
+  "name": "amber_declared_naive_valid_at",
+  "issued_at": "2026-11-20T02:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 30,
+  "value_kind": "price",
+  "value_keys": ["per_kwh"],
+  "state": "0.4",
+  "attributes": {
+    "detailedForecast": [
+      {
+        "valid_at": "2026-11-20T02:00:00",
+        "start_time": "2026-11-20T02:00:00+00:00",
+        "end_time": "2026-11-20T02:30:00+00:00",
+        "duration": 30,
+        "per_kwh": 0.4
+      },
+      {
+        "start_time": "2026-11-20T02:30:00+00:00",
+        "end_time": "2026-11-20T03:00:00+00:00",
+        "duration": 30,
+        "per_kwh": 0.5
+      }
+    ]
+  },
+  "expected": [null, null]
+}

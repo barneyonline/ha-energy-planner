@@ -80,6 +80,18 @@ PLATFORMS: list[Platform] = []
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register smoke-test helper services."""
+    audit_timeline: dict[tuple, dict] = {}
+
+    async def retain_audit(entry) -> None:
+        """Capture durable fixture outcomes before later commands rotate the audit."""
+        if entry.data.get("daikin_climate_entity") != "climate.fake_daikin":
+            return
+        await entry.runtime_data.store.async_flush()
+        source = Path(hass.config.path(".storage", f"ha_energy_planner_state_{entry.entry_id}"))
+        encoded = await hass.async_add_executor_job(source.read_text, "utf-8")
+        for outcome in json.loads(encoded)["data"]["execution_audit"]:
+            identity = tuple(outcome.get(key) for key in ("action_id", "attempted_at", "reason", "result"))
+            audit_timeline[identity] = outcome
 
     async def force_ev_calibration_due(call: ServiceCall) -> None:
         """Mark HA Energy Planner EV calibration due for smoke validation."""
@@ -118,20 +130,25 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
 
     async def seed_thermal_model_sample(call: ServiceCall) -> None:
-        """Seed a recent same-regime anchor; the real coordinator must learn the next window."""
+        """Seed a recent same-regime anchor on the sensor report clock."""
         from custom_components.ha_energy_planner.thermal_learning import sample, update
 
-        sampled_at = dt_util.utcnow() - timedelta(minutes=5)
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = entry.runtime_data
             context = coordinator._last_decision_context
             previous = sample(context, coordinator.options, hass.states, "climate.fake_daikin")
             if previous["intervention"] or previous["sources"]["head"]["mode"] != "heat":
                 raise ValueError(f"Thermal smoke must start in confirmed normal heating: {previous}")
-            previous["at"] = sampled_at.isoformat()
+            anchor_times = []
             for reading in previous["sources"].values():
+                reported_at = dt_util.parse_datetime(reading["reported_at"] or "")
+                if reported_at is None:
+                    raise ValueError("Thermal smoke requires a current temperature report")
+                anchor = reported_at - timedelta(minutes=5, seconds=1)
+                anchor_times.append(anchor)
                 reading["temperature"] -= 0.1
-                reading["reported_at"] = sampled_at.isoformat()
+                reading["reported_at"] = anchor.isoformat()
+            previous["at"] = min(anchor_times).isoformat()
             await coordinator.store.async_save_thermal_model(update({}, previous))
 
     async def seed_enphase_command_rate_limit(call: ServiceCall) -> None:
@@ -194,22 +211,28 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             raise RuntimeError("Unsafe production arm unexpectedly succeeded")
 
     async def wait_for_planner_idle(call: ServiceCall) -> None:
-        """Drain execution, coalesce pending state changes, and drain once more."""
+        """Drain execution and wait for a successful refresh after fixture changes."""
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = getattr(entry, "runtime_data", None)
             if coordinator is None:
                 continue
-            await coordinator.async_wait_for_plan_execution()
-            await asyncio.sleep(0)
-            debounce_cancel = getattr(coordinator, "_debounce_cancel", None)
-            if debounce_cancel is not None:
-                debounce_cancel()
-                coordinator._debounce_cancel = None
-            await coordinator.async_refresh()
-            await coordinator.async_wait_for_plan_execution()
+            for _ in range(4):
+                await coordinator.async_wait_for_plan_execution()
+                await asyncio.sleep(0)
+                debounce_cancel = getattr(coordinator, "_debounce_cancel", None)
+                if debounce_cancel is not None:
+                    debounce_cancel()
+                    coordinator._debounce_cancel = None
+                await coordinator.async_refresh()
+                await coordinator.async_wait_for_plan_execution()
+                if coordinator.last_refresh_metadata.get("succeeded"):
+                    break
+            else:
+                raise RuntimeError("Smoke inputs did not settle into a successful planner refresh")
             ai_task = getattr(coordinator, "_ai_advice_task", None)
             if ai_task is not None:
                 await ai_task
+            await retain_audit(entry)
 
     async def assert_startup_climate_restored(call: ServiceCall) -> None:
         """Check the restored baseline and include actual state on failure."""
@@ -406,7 +429,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             Path(hass.config.config_dir, ".export_limit_smoke_complete").touch()
 
     async def mark_smoke_complete(call: ServiceCall) -> None:
-        """Write a completion marker before Home Assistant shuts down."""
+        """Preserve the durable audit checkpoints and let Home Assistant shut down."""
+        for entry in hass.config_entries.async_entries("ha_energy_planner"):
+            await retain_audit(entry)
+        path = Path(hass.config.path(".ha_energy_planner_smoke_audit"))
+        await hass.async_add_executor_job(path.write_text, json.dumps(list(audit_timeline.values())), "utf-8")
         Path(hass.config.config_dir, ".ha_energy_planner_smoke_complete").touch()
 
     async def capture_persistent_notification(call: ServiceCall) -> None:
@@ -1077,6 +1104,8 @@ automation:
         data:
           entity_id: input_select.enphase_profile
           option: AI Optimisation
+      # Arm against the published plan for the updated profile.
+      - action: fake_planner_test.wait_for_planner_idle
       - action: fake_planner_test.seed_production_evidence
       - action: ha_energy_planner.arm_production_control
         data:
@@ -1710,7 +1739,8 @@ if thermal_model.get("active_hvac_load_kw", {}).get("sample_count", 0) != 0:
 overrides = store_data.get("overrides", [])
 if not any(item.get("reason") == "docker_smoke_manual_override" for item in overrides):
     raise SystemExit("set_manual_hvac_override service did not persist the smoke override")
-outcomes = store_data.get("execution_audit", [])
+audit_path = config_dir / ".ha_energy_planner_smoke_audit"
+outcomes = json.loads(audit_path.read_text(encoding="utf-8"))
 restore_outcomes = [
     item
     for item in outcomes

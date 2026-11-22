@@ -162,7 +162,7 @@ def test_next_action_stops_after_generation_changes_without_hass():
         ]
     ]
 
-    async def invalidate(*args):
+    async def invalidate(*args, **kwargs):
         owner._refresh_generation += 1
 
     owner.executor.async_evaluate = AsyncMock(side_effect=invalidate)

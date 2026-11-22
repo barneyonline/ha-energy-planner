@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta
+from functools import cached_property
 from math import isfinite
 from typing import Any, cast
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State, StateMachine
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -43,6 +44,13 @@ from .type_defs import EnergyPlannerConfigEntry
 
 # Read-only entities receive coordinator updates.
 PARALLEL_UPDATES = 0
+
+_CONTROL_OPTION_BY_ASSET = {
+    ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
+    ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
+    ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+    ActionAsset.ENPHASE_EXPORT_LIMIT: CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+}
 
 
 async def async_setup_entry(
@@ -112,7 +120,7 @@ def _events_with_history(
 
 
 class _CalendarPlanView:
-    """Override presentation data while delegating runtime reads to their owner."""
+    """Use one live mapping and option snapshot for a synchronous calendar build."""
 
     def __init__(self, coordinator: EnergyPlannerCoordinator, plan: EnergyPlan) -> None:
         self._coordinator = coordinator
@@ -121,18 +129,28 @@ class _CalendarPlanView:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._coordinator, name)
 
+    @cached_property
+    def entry_data(self) -> dict[str, Any]:
+        """Resolve vehicle identity through the live owner on the first read."""
+        return getattr(self._coordinator, "entry_data", {})
+
+    @cached_property
+    def options(self) -> dict[str, Any]:
+        """Read merged device control options once for all windows."""
+        return self._coordinator.options
+
 
 def calendar_event_records(
     coordinator: EnergyPlannerCoordinator, plan: EnergyPlan | None = None,
-    *, state_overrides: dict[str, Any] | None = None,
+    *, state_overrides: dict[str, Any] | None = None, confirmed_only: bool = False,
+    feedback_asset: ActionAsset | None = None,
 ) -> list[dict[str, str]]:
     """Snapshot the same bounded event metadata that the calendar publishes."""
-    if plan is not None:
-        # Runtime properties must execute on the live owner: entry_data can
-        # update vehicle identity, overrides, and the planner safety generation.
-        coordinator = cast(EnergyPlannerCoordinator, _CalendarPlanView(coordinator, plan))
     records = []
-    for event, confirmed_start in _calendar_windows(coordinator, state_overrides=state_overrides):
+    for event, confirmed_start in _calendar_windows(
+        coordinator, plan, state_overrides=state_overrides, confirmed_only=confirmed_only,
+        feedback_asset=feedback_asset,
+    ):
         record = {
             "start": event.start.isoformat(), "end": event.end.isoformat(),
             "summary": event.summary, "uid": event.uid or "",
@@ -150,24 +168,33 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
 
 
 def _calendar_windows(
-    coordinator: EnergyPlannerCoordinator, *, state_overrides: dict[str, Any] | None = None,
+    coordinator: EnergyPlannerCoordinator, plan: EnergyPlan | None = None, *,
+    state_overrides: dict[str, Any] | None = None,
+    confirmed_only: bool = False, feedback_asset: ActionAsset | None = None,
 ) -> list[tuple[CalendarEvent, datetime | None]]:
     """Pair each displayed window with independently confirmed start evidence."""
-    plan = coordinator.data
+    plan = coordinator.data if plan is None else plan
     if plan is None:
         return []
+    coordinator = cast(EnergyPlannerCoordinator, _CalendarPlanView(coordinator, plan))
+    confirmed_only = confirmed_only or feedback_asset is not None
     events: list[tuple[CalendarEvent, datetime | None]] = []
+    states = dict(state_overrides or {})
+    now = dt_util.utcnow()
     for action in plan.actions:
         if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
             continue  # Its tariff windows remain visible without redundant commands.
+        if feedback_asset is not None and action.asset != feedback_asset:
+            continue
         if not _calendar_control_enabled(coordinator, action.asset):
+            continue
+        actual_start = _actual_start(coordinator, action, now, state_overrides=states)
+        if confirmed_only and actual_start is None:
             continue
         candidates = (
             _ev_charging_events(action, plan.interval_minutes)
             if action.kind == ActionKind.EV_SCHEDULE else [_calendar_event(action, coordinator)]
         )
-        now = dt_util.utcnow()
-        actual_start = _actual_start(coordinator, action, now, state_overrides=state_overrides)
         # Delayed feedback can prove that an elapsed allocation actually ran.
         # Prefer the current window; otherwise confirm one latest past window
         # covered by the same physical charging start, keeping its identity unique.
@@ -209,8 +236,9 @@ def _calendar_windows(
                         f"{coordinator.entry.entry_id}-{action.asset}-{actual_start.isoformat()}", max_bytes=255,
                     ),
                 )
-            events.append((event, confirmed_start))
-    if _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
+            if not confirmed_only or confirmed_start is not None:
+                events.append((event, confirmed_start))
+    if not confirmed_only and _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
         export = export_limit_status(coordinator)
         windows: list[list[dict[str, Any]]] = []
         for block in export.get("blocks", []):
@@ -248,6 +276,17 @@ def _calendar_windows(
     return sorted(events, key=lambda item: item[0].start)
 
 
+def _read_calendar_state(
+    states: StateMachine, entity_id: str | None, cache: dict[str, State | None],
+) -> State | None:
+    """Reuse the first read of an entity across one calendar build."""
+    if not entity_id:
+        return None
+    if entity_id not in cache:
+        cache[entity_id] = states.get(entity_id)
+    return cache[entity_id]
+
+
 def _actual_start(
     coordinator: EnergyPlannerCoordinator, action: PlanAction, now: datetime,
     *, state_overrides: dict[str, Any] | None = None,
@@ -257,9 +296,10 @@ def _actual_start(
     states = getattr(coordinator.hass, "states", None)
     if states is None:
         return None
+    if state_overrides is None:
+        state_overrides = {}
     if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_SCHEDULE, ActionKind.EV_START}:
-        entity_id = mapping.get(CONF_EV_CHARGING)
-        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
+        state = _read_calendar_state(states, mapping.get(CONF_EV_CHARGING), state_overrides)
         if state is None or ev_charging_state(state.state) is not True:
             return None
         start = getattr(state, "last_changed", None)
@@ -267,8 +307,7 @@ def _actual_start(
         control = coordinator.store.data.get("ownership", {}).get("hvac_control", {})
         if not isinstance(control, dict):
             return None
-        entity_id = mapping.get(CONF_DAIKIN_CLIMATE)
-        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
+        state = _read_calendar_state(states, mapping.get(CONF_DAIKIN_CLIMATE), state_overrides)
         if (not control.get("main_state_committed") or control.get("required_evidence_lost")
                 or state is None or state.state not in {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"}
                 or (state.state == "off" and action.desired_state.get("hvac_mode") != "off")
@@ -288,13 +327,7 @@ def _calendar_control_enabled(
     asset: ActionAsset,
 ) -> bool:
     """Return whether the asset is selected for device control."""
-    option_by_asset = {
-        ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
-        ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
-        ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
-        ActionAsset.ENPHASE_EXPORT_LIMIT: CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
-    }
-    return strict_bool(coordinator.options.get(option_by_asset[asset]), default=False)
+    return strict_bool(coordinator.options.get(_CONTROL_OPTION_BY_ASSET[asset]), default=False)
 
 
 def _ev_charging_events(

@@ -1,0 +1,25 @@
+{
+  "name": "enphase_export_limit_gateway_unavailable",
+  "kind": "enphase_export_limit",
+  "source": "Synthetic Enphase Energy v5.3.1 Export Limit sensor contract",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "unavailable",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "confirmed_watts": null,
+      "slew_rate": null,
+      "pending": false,
+      "requested_watts": null,
+      "requested_action": null,
+      "pending_requested_at": null,
+      "request_status": "idle",
+      "last_successful_readback": null,
+      "gateway_identity": null,
+      "gateway_identity_verified": false,
+      "requested_slew_rate": null
+    }
+  },
+  "expected": {},
+  "expected_issue": "export_limit_entity_unavailable"
+}
