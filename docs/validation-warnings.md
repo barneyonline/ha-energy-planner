@@ -2,9 +2,8 @@
 
 Validation keeps unexpected warnings visible. Pytest treats new warnings as
 errors. Its two exceptions match the exact category, message and module of the
-Home Assistant 2026.10 HTTP implementation's aiohttp warnings; they do not apply
-to Energy Planner code. Remove each exception when all supported Home Assistant
-images stop emitting it.
+Home Assistant 2026.11.0 HTTP implementation's aiohttp warnings. Remove each
+exception when all supported Home Assistant images stop emitting it.
 
 Smoke runs retain their synthetic Home Assistant console log and a classified
 warning report on success and failure. Local evidence is under
@@ -83,7 +82,7 @@ verification.
 
 | Audited messages | Handling and removal criterion |
 | --- | --- |
-| Home Assistant HTTP inheritance deprecation and aiohttp `NotAppKeyWarning` | Exact test-only exceptions in `pyproject.toml`. Retain repair/upgrade tests and remove exceptions after the supported images adopt the upstream fix. [Owning implementation](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/http/server.py). |
+| Home Assistant HTTP inheritance deprecation and aiohttp `NotAppKeyWarning` | Exact test-only exceptions in `pyproject.toml`. Retain repair/upgrade tests and remove exceptions after the supported images adopt the upstream fix. [Owning implementation](https://github.com/home-assistant/core/blob/2026.11.0/homeassistant/components/http/server.py). |
 | Rich `return` in a `finally` block | Classify the exact dependency warning in smoke evidence. Follow the Home Assistant image's Rich update; do not pin or monkey-patch Rich in this integration. [Upstream report](https://github.com/Textualize/rich/issues/4161). |
 | Custom integration loader notices for Energy Planner and the smoke helper | Expected for custom integrations; preserve the notices in the console/report. The repository's Platinum claim does not imply Home Assistant review. |
 | Codecov GPG key lacks web-of-trust certification | Preserve verification. The audited upload reports a good signature and a matching checksum. Do not disable integrity checks or assign arbitrary trust just to hide the notice. |

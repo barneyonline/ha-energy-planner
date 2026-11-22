@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Require Home Assistant 2026.11.0 or newer. Update Home Assistant before installing this Energy Planner release.
 
 ### ✨ New features
 
@@ -20,7 +20,10 @@
 
 ### 🔧 Improvements
 
-- None
+- Show the EV price policy when the import price limit is enabled. Show the emergency price and budget only with Departure priority. Saved values are retained when the controls are hidden.
+- Show Home Assistant's reported unit alongside live climate temperatures in Current state.
+- Rename the Climate control active entity in place so its ownership updates continue under the new entity ID.
+- Link vehicle target migration repairs to their config entry. Startup adopts older notices, preserves ignored repairs that still need migration, and removes stale notices.
 
 ### 🔄 Other changes
 

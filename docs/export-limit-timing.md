@@ -20,6 +20,14 @@ During the hold, projected grid export and estimated costs use the fresh, settle
 
 Export Limit diagnostics and next actions expose `export_limit_change_rate_limited`, `next_eligible_change_at`, `last_dispatch_reserved_at` and `last_change_observed_at`. Calendar entries remain planned previews and are labelled deferred while the ceiling applies. The deadline is the earliest timing eligibility, not a promise that other blockers will clear then.
 
+If Enphase device telemetry drops out, check the optional **Communication level
+2.4 GHz** and **Communication level sub-GHz** sensors on the affected Enpower
+or Encharge device in Home Assistant's Enphase Envoy integration. Where the
+equipment supplies these readings, enable the sensors to record their 0–5
+radio levels and compare them with the times of the dropouts. Planner verifies
+Export Limit changes using gateway identity and matching settings readback.
+[Enphase Envoy communication sensors](https://www.home-assistant.io/integrations/enphase_envoy/#enpower-sensor-entities)
+
 ### Automatic recovery after a temporary Enphase rejection
 
 Planner allows three recovery attempts after Enphase explicitly reports a temporary pre-write failure. After an unsuccessful check, Planner waits at least five minutes before another check and respects the recorded dispatch cooldown and any longer command interval. Planner persists each definitive rejection and its daily allowance charge together. If the process stops during dispatch, the recovered uncertain request charges the allowance once. Retry counts, deadlines and operator-required pauses survive unrelated reloads and subsequent startup recovery for the same enabled export target. Authorized startup recovery can run the read-only installer check after Home Assistant starts and startup grace completes. Both ordinary export control and recovery writes wait for final startup activation preflight. Planner persists the provisional gate with arming. Restart and device-only configuration changes resume from disarmed recovery until final validation or an operator arm. A startup retry takes a fresh installer snapshot using the same attempt. Feedback events and planner refreshes share one wakeup. Installer checks run outside the planner and command locks. Before dispatch, an operator pause, a pending gateway request, a runtime replacement or a changed tariff can defer recovery without consuming the affected attempt. If Enphase is already handling another request, Planner defers the retry without charging a write.

@@ -23,6 +23,7 @@ test_files=(
   tests/test_upgrade_runtime.py
   tests/test_repairs.py
   tests/test_config_flow.py
+  tests/test_conditional_ev_options_runtime.py
   tests/test_lifecycle.py
   tests/test_services.py
   tests/test_calendar.py
