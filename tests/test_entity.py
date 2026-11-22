@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from custom_components.ha_energy_planner.const import DOMAIN
@@ -24,11 +25,16 @@ def test_planner_entity_uses_single_named_device() -> None:
 
     entity = EnergyPlannerEntity(coordinator, "plan_status")
 
+    device_info = entity.device_info
+    as_dict = getattr(device_info, "as_dict", None)
+    device_fields = as_dict() if callable(as_dict) else device_info
+
     assert entity.unique_id == "entry-1_plan_status"
-    assert entity.device_info["identifiers"] == {(DOMAIN, "entry-1")}
-    assert entity.device_info["name"] == "House Energy Planner"
-    assert entity.device_info["entry_type"] is None
-    assert entity.device_info["model"] == "Energy Planner"
+    assert isinstance(device_fields, Mapping)
+    assert device_fields["identifiers"] == {(DOMAIN, "entry-1")}
+    assert device_fields["name"] == "House Energy Planner"
+    assert device_fields["entry_type"] is None
+    assert device_fields["model"] == "Energy Planner"
     assert planner_device_identifier("entry-1") == (DOMAIN, "entry-1")
 
 
