@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- Require Home Assistant 2026.11.0 or newer. Update Home Assistant before installing this Energy Planner release.
+- None
 
 ### ✨ New features
 
@@ -12,23 +12,45 @@
 
 ### 🐛 Bug fixes
 
-- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes.
-- Keep forecast refreshes running when a provider reports an out-of-range forecast interval.
-- Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision.
-- Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean.
-- Pause synchronized HVAC takeover when native Daikin zones omit setpoints in Dry mode, and preserve safe restoration and reporting of genuine target faults.
-- Pause installer retries without spending an attempt when gateway settings or tariffs become unusable, and keep gateway identity problems visible while Export Limit is deferred.
-- Preserve the Export Limit cooldown across clock corrections and control remaps, and continue reconciliation when inactive controls have invalid timing metadata.
-- Discard plans when tariff data changes during publication. Recheck tariffs during arming and resume prior startup recovery after a rejected replacement arm.
-- Preserve manual EV limits during Charge Now rollback and cancel unsent Export Limit changes when Automatic Control is turned off.
-- Recheck live control authority before the first HVAC takeover command.
+- None
 
 ### 🔧 Improvements
 
-- Show the EV price policy when the import price limit is enabled. Show the emergency price and budget only with Departure priority. Saved values are retained when the controls are hidden.
-- Show Home Assistant's reported unit alongside live climate temperatures in Current state.
-- Rename the Climate control active entity in place so its ownership updates continue under the new entity ID.
-- Link vehicle target migration repairs to their config entry. Startup adopts older notices, preserves ignored repairs that still need migration, and removes stale notices.
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.6.0 - 2026-11-22
+
+### 🚧 Breaking changes
+
+- Require Home Assistant 2026.11.0 or newer. Update Home Assistant before installing this Energy Planner release. ([#192](https://github.com/barneyonline/ha-energy-planner/pull/192))
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes. ([#188](https://github.com/barneyonline/ha-energy-planner/pull/188))
+- Keep forecast refreshes running when a provider reports an out-of-range forecast interval. ([#188](https://github.com/barneyonline/ha-energy-planner/pull/188))
+- Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision. ([#189](https://github.com/barneyonline/ha-energy-planner/pull/189))
+- Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean. ([#190](https://github.com/barneyonline/ha-energy-planner/pull/190))
+- Pause synchronized HVAC takeover when native Daikin zones omit setpoints in Dry mode, and preserve safe restoration and reporting of genuine target faults. ([#191](https://github.com/barneyonline/ha-energy-planner/pull/191))
+- Pause installer retries without spending an attempt when gateway settings or tariffs become unusable, and keep gateway identity problems visible while Export Limit is deferred. ([#195](https://github.com/barneyonline/ha-energy-planner/pull/195))
+- Preserve the Export Limit cooldown across clock corrections and control remaps, and continue reconciliation when inactive controls have invalid timing metadata. ([#195](https://github.com/barneyonline/ha-energy-planner/pull/195))
+- Discard plans when tariff data changes during publication. Recheck tariffs during arming and resume prior startup recovery after a rejected replacement arm. ([#195](https://github.com/barneyonline/ha-energy-planner/pull/195))
+- Preserve manual EV limits during Charge Now rollback and cancel unsent Export Limit changes when Automatic Control is turned off. ([#195](https://github.com/barneyonline/ha-energy-planner/pull/195))
+- Recheck live control authority before the first HVAC takeover command. ([#195](https://github.com/barneyonline/ha-energy-planner/pull/195))
+
+### 🔧 Improvements
+
+- Show the EV price policy when the import price limit is enabled. Show the emergency price and budget only with Departure priority. Saved values are retained when the controls are hidden. ([#192](https://github.com/barneyonline/ha-energy-planner/pull/192))
+- Show Home Assistant's reported unit alongside live climate temperatures in Current state. ([#192](https://github.com/barneyonline/ha-energy-planner/pull/192))
+- Rename the Climate control active entity in place so its ownership updates continue under the new entity ID. ([#192](https://github.com/barneyonline/ha-energy-planner/pull/192))
+- Link vehicle target migration repairs to their config entry. Startup adopts older notices, preserves ignored repairs that still need migration, and removes stale notices. ([#164](https://github.com/barneyonline/ha-energy-planner/pull/164))
 
 ### 🔄 Other changes
 
