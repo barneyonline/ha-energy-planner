@@ -757,6 +757,43 @@ def test_ev_confirmation_failure_without_a_new_command_does_not_claim_ownership(
     assert hass.services.calls == []
 
 
+@pytest.mark.parametrize(("switch_state", "stop_feedback", "safe"), [
+    ("off", "off", True),
+    ("off", "on", False),
+    ("off", "unavailable", False),
+    ("on", "off", None),
+])
+def test_start_rechecks_freshness_before_retry_and_preserves_safe_stop(switch_state, stop_feedback, safe) -> None:
+    checks = 0
+
+    def authorized() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 1
+
+    hass = FakeHass({"switch.ev": switch_state, "binary_sensor.charging": "off"})
+    original = hass.services.async_call
+
+    async def read_back_stop(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if service == "turn_off":
+            hass.states.values["binary_sensor.charging"] = stop_feedback
+
+    hass.services.async_call = read_back_stop
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "binary_sensor.charging"},
+        confirmation_timeout_seconds=0, confirmation_retries=1, start_guard=authorized,
+    )
+    result = asyncio.run(adapter.async_set_charging(True))
+    assert result.reason == "ev_grid_projection_stale"
+    assert result.safe_state_confirmed is safe
+    assert result.rollback_succeeded is safe
+    assert [service for _, service, _ in hass.services.calls] == (
+        ["turn_on", "turn_off"] if switch_state == "off" else []
+    )
+    assert hass.states.get("switch.ev").state == switch_state
+
+
 def test_ev_retry_service_failure_still_restores_first_command() -> None:
     class RetryFailServices(FakeServices):
         turn_on_calls = 0
@@ -1940,6 +1977,94 @@ def test_ev_expired_number_write_preserves_active_charger_setpoint(monkeypatch) 
     assert not hass.services.calls
 
 
+@pytest.mark.parametrize("current_limit", ["3", "6"])
+def test_guarded_ev_lease_expiring_during_number_preflight_leaves_prior_charge_running(monkeypatch, current_limit):
+    now = datetime.now(UTC)
+    lease = now + timedelta(seconds=1)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    attrs = {"min": 1, "max": 7, "step": 1, "unit_of_measurement": "kW"}
+    hass = FakeHass({"switch.charger": "on", "number.limit": FakeState(current_limit, attrs, "number.limit")})
+
+    def start_authorized():
+        clock[0] = lease
+        return True
+
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", "ev_power_limit_entity": "number.limit"},
+        power_options={"ev_limit_min": 1, "ev_limit_max": 7}, start_guard=start_authorized,
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": lease.isoformat(),
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert result.reason == "ev_allocation_expired"
+    assert not result.applied and not result.command_sent
+    assert hass.states.get("number.limit").state == current_limit
+    assert hass.states.get("switch.charger").state == "on"
+    assert not hass.services.calls
+
+
+@pytest.mark.parametrize("stage", ["start_entry", "before_switch", "after_switch"])
+def test_guarded_ev_lease_expiring_after_confirmed_cap_stops_and_restores(monkeypatch, stage):
+    now = datetime.now(UTC)
+    lease = now + timedelta(seconds=1)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    attrs = {"min": 1, "max": 7, "step": 1, "unit_of_measurement": "kW"}
+    prior_charge = "off" if stage == "after_switch" else "on"
+    hass = FakeHass({
+        "switch.charger": prior_charge, "sensor.feedback": prior_charge,
+        "number.limit": FakeState("3", attrs, "number.limit"),
+    })
+    original_call = hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+        if service == "turn_on":
+            hass.states.values["sensor.feedback"] = "on"
+            clock[0] = lease
+        if service == "turn_off":
+            hass.states.values["sensor.feedback"] = "off"
+
+    def start_authorized():
+        if stage == "before_switch" and hass.services.calls:
+            clock[0] = lease
+        return True
+
+    hass.services.async_call = dispatch
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback",
+               "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0, confirmation_retries=0, start_guard=start_authorized,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 7},
+    )
+    original_start = adapter._async_start
+
+    async def start(action):
+        if stage == "start_entry":
+            clock[0] = lease
+        return await original_start(action)
+
+    monkeypatch.setattr(adapter, "_async_start", start)
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": lease.isoformat(),
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert result.reason == "ev_allocation_expired"
+    assert not result.applied and result.command_sent
+    assert result.safe_state_confirmed and result.rollback_succeeded
+    assert [service for _, service, _ in hass.services.calls] == [
+        "set_value", *(["turn_on"] if stage == "after_switch" else []), "turn_off", "set_value",
+    ]
+    assert hass.states.get("sensor.feedback").state == "off"
+    assert float(hass.states.get("number.limit").state) == 3
+
+
 @pytest.mark.parametrize("status", ["SUSPENDED_EV", "SuspendedEV"])
 @pytest.mark.parametrize("kind", [ActionKind.EV_START, ActionKind.EV_SCHEDULE])
 def test_vehicle_refusal_prevents_all_writes(status, kind):
@@ -2036,6 +2161,262 @@ def test_refusal_arriving_during_power_limit_write_compensates_and_reports_final
     assert result.post_state[CONF_EV_CHARGER] == "off"
     assert result.post_state["vehicle_refusal_feedback"] == "SuspendedEV"
     assert [call[1] for call in hass.services.calls] == ["set_value", "turn_off"]
+
+
+@pytest.mark.parametrize("feedback", ["off", "unavailable"])
+def test_stale_start_requires_stopped_feedback_before_restoring_higher_power_limit(feedback):
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "off",
+        "sensor.status": feedback,
+        "number.limit": FakeState("6", attrs, "number.limit"),
+    })
+    current = True
+    original = hass.services.async_call
+
+    async def power_write(domain, service, data, **kwargs):
+        nonlocal current
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+            current = False
+
+    hass.services.async_call = power_write
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status",
+               "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        confirmation_retries=0,
+        start_guard=lambda: current,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3},
+    })))
+
+    assert result.reason == "ev_grid_projection_stale"
+    assert result.rollback_succeeded is (feedback == "off")
+    assert [(domain, data["value"]) for domain, _, data in hass.services.calls] == (
+        [("number", 3), ("number", 6)] if feedback == "off" else [("number", 3)]
+    )
+
+
+@pytest.mark.parametrize("changed_limit", ["5", "unavailable"])
+def test_guarded_start_rechecks_power_limit_before_retry(changed_limit):
+    """Reject a lost limit readback even before a listener invalidates the plan."""
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "off",
+        "sensor.status": "off",
+        "number.limit": FakeState("6", attrs, "number.limit"),
+    })
+    original = hass.services.async_call
+
+    async def change_limit_after_start(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+        elif service == "turn_on":
+            hass.states.values["number.limit"] = FakeState(changed_limit, attrs, "number.limit")
+
+    hass.services.async_call = change_limit_after_start
+    adapter = EVChargerAdapter(
+        hass,
+        {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status", "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        confirmation_retries=1,
+        start_guard=lambda: True,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3},
+    })))
+
+    assert result.reason == "ev_grid_projection_stale"
+    assert not result.applied and result.safe_state_confirmed
+    assert result.rollback_succeeded is (changed_limit != "unavailable")
+    assert [service for _, service, _ in hass.services.calls] == ["set_value", "turn_on", "turn_off"]
+    assert hass.states.values["number.limit"].state == changed_limit
+
+
+@pytest.mark.parametrize("service_error", [False, True])
+@pytest.mark.parametrize("readback", ["3", "5", "unavailable"])
+def test_guarded_start_requires_cap_at_charging_confirmation(service_error, readback):
+    """Successful charging feedback must still be limited to the reserved cap."""
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "off",
+        "sensor.status": "off",
+        "number.limit": FakeState("6", attrs, "number.limit"),
+    })
+    original = hass.services.async_call
+
+    async def confirm_feedback(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+        elif service == "turn_on":
+            hass.states.values["number.limit"] = FakeState(readback, attrs, "number.limit")
+            hass.states.values["sensor.status"] = "on"
+            if service_error:
+                raise RuntimeError("start service reported an error after applying")
+        elif service == "turn_off":
+            hass.states.values["sensor.status"] = "off"
+
+    hass.services.async_call = confirm_feedback
+    adapter = EVChargerAdapter(
+        hass,
+        {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status", "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        confirmation_retries=0,
+        start_guard=lambda: True,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3},
+    })))
+
+    calls = [service for _, service, _ in hass.services.calls]
+    if readback == "3":
+        assert result.applied
+        assert calls == ["set_value", "turn_on"]
+    else:
+        assert not result.applied and result.reason == "ev_grid_projection_stale"
+        assert result.safe_state_confirmed and calls == ["set_value", "turn_on", "turn_off"]
+        assert hass.states.values["sensor.status"] == "off"
+    assert hass.states.values["number.limit"].state == readback
+
+
+def test_guarded_start_preserves_a_lower_manual_limit_on_a_running_charger():
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "on",
+        "sensor.status": "on",
+        "number.limit": FakeState("5", attrs, "number.limit"),
+    })
+    original = hass.services.async_call
+
+    async def write_device(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+        elif service == "turn_off":
+            hass.states.values["sensor.status"] = "off"
+
+    def authorized():
+        if not hass.services.calls:
+            return True
+        hass.states.values["number.limit"] = FakeState("3", attrs, "number.limit")
+        return False
+
+    hass.services.async_call = write_device
+    adapter = EVChargerAdapter(
+        hass,
+        {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status", "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        start_guard=authorized,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert result.reason == "ev_grid_projection_stale"
+    assert result.rollback_succeeded and result.safe_state_confirmed is None
+    assert hass.states.get("switch.charger").state == "on"
+    assert hass.states.values["number.limit"].state == "3"
+    assert [service for _, service, _ in hass.services.calls] == ["set_value"]
+
+
+@pytest.mark.parametrize(("applied_metadata", "restored_metadata", "stop_confirmed", "expected_services"), [
+    ({}, {}, None, ["set_value", "set_value"]),
+    ({}, {"unit_of_measurement": "A"}, True, ["set_value", "set_value", "turn_off"]),
+    ({}, {"step": 2}, True, ["set_value", "set_value", "turn_off"]),
+    ({}, {"max": 3}, True, ["set_value", "set_value", "turn_off"]),
+    ({}, {"unit_of_measurement": "A"}, False, ["set_value", "set_value", "turn_off", "turn_off"]),
+    ({"min": 0, "step": 3}, {}, True, ["set_value", "turn_off"]),
+])
+def test_guarded_start_validates_restore_limit_metadata(
+    applied_metadata, restored_metadata, stop_confirmed, expected_services,
+):
+    """Numeric readback alone cannot prove a lower rollback limit on an active charger."""
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "on",
+        "sensor.status": "on",
+        "number.limit": FakeState("4", attrs, "number.limit"),
+    })
+    original = hass.services.async_call
+
+    async def write_device(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            metadata = restored_metadata if data["value"] == 4 else applied_metadata
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), {**attrs, **metadata}, "number.limit")
+        elif service == "turn_off" and stop_confirmed:
+            hass.states.values["sensor.status"] = "off"
+
+    hass.services.async_call = write_device
+    adapter = EVChargerAdapter(
+        hass,
+        {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status", "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        confirmation_retries=0,
+        start_guard=lambda: not hass.services.calls,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert result.reason == "ev_grid_projection_stale"
+    assert not result.applied and result.command_sent
+    assert result.safe_state_confirmed is stop_confirmed
+    assert result.rollback_succeeded is (stop_confirmed is None)
+    assert [service for _, service, _ in hass.services.calls] == expected_services
+
+
+@pytest.mark.parametrize("changed_metadata", [{"step": 2}, {"unit_of_measurement": "A"}])
+@pytest.mark.parametrize("stop_confirmed", [False, True])
+def test_guarded_start_treats_unchanged_limit_with_invalid_metadata_as_unverified(changed_metadata, stop_confirmed):
+    attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+    hass = FakeHass({
+        "switch.charger": "on",
+        "sensor.status": "on",
+        "number.limit": FakeState("3", attrs, "number.limit"),
+    })
+    original = hass.services.async_call
+
+    async def write_device(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(str(data["value"]), attrs, "number.limit")
+        elif service == "turn_off" and stop_confirmed:
+            hass.states.values["sensor.status"] = "off"
+
+    def authorized():
+        if hass.services.calls:
+            hass.states.values["number.limit"] = FakeState("6", {**attrs, **changed_metadata}, "number.limit")
+        return True
+
+    hass.services.async_call = write_device
+    adapter = EVChargerAdapter(
+        hass,
+        {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.status", "ev_power_limit_entity": "number.limit"},
+        confirmation_timeout_seconds=0,
+        confirmation_retries=0,
+        start_guard=authorized,
+        power_options={"ev_limit_min": 1, "ev_limit_max": 6},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert result.reason == "ev_grid_projection_stale"
+    assert not result.applied and result.command_sent and not result.rollback_succeeded
+    assert (result.safe_state_confirmed is True) is stop_confirmed
+    services = [service for _, service, _ in hass.services.calls]
+    assert services == ["set_value", "turn_off"] + ([] if stop_confirmed else ["turn_off"])
 
 
 def test_vehicle_refusal_between_preflight_and_dispatch_issues_no_command():

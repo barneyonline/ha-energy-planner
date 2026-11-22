@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, NamedTuple
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -17,6 +21,8 @@ from custom_components.ha_energy_planner.forecasts import (
     _energy_to_kwh,
     _items_from_value,
     _parse_datetime_or_none,
+    cacheable_tariff_snapshot,
+    capture_tariff_source_attributes,
     constant_forecast,
     forecast_coverage_details,
     forecast_coverage_ratio,
@@ -24,6 +30,7 @@ from custom_components.ha_energy_planner.forecasts import (
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
+    tariff_snapshot_matches,
 )
 
 
@@ -35,19 +42,167 @@ class FakeState:
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
-@pytest.mark.parametrize("declared", [False, True])
-def test_unrepresentable_tariff_timestamp_leaves_a_gap(declared) -> None:
-    now = datetime(2026, 10, 1, tzinfo=UTC)
-    row = {"start_time": "9999-12-31T23:00:00-02:00", "per_kwh": -0.15}
-    if declared:
-        row.update(end_time="9999-12-31T23:30:00-02:00", duration=30)
-    state = FakeState("-0.15", {"forecasts": [row]})
+def test_tariff_snapshot_detects_changed_offset_and_container_size():
+    first = datetime(2026, 4, 5, 2, 30, tzinfo=ZoneInfo("Australia/Melbourne"))
+    rows = [first, (0.25,)]
+    rows.append(rows)
+    attributes = {"forecast": rows}
+    snapshot = deepcopy(attributes)
+
+    assert tariff_snapshot_matches(attributes, snapshot)
+
+    rows[0] = first.replace(fold=1)
+    assert rows[0] == first
+    assert not tariff_snapshot_matches(attributes, snapshot)
+
+    rows[0] = first
+    rows.pop()
+    assert not tariff_snapshot_matches(attributes, snapshot)
+
+
+def test_tariff_snapshot_treats_uncomparable_provider_values_as_changed():
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    invalid = {"import_price": {now: {"diagnostic": "first", "price": Decimal("sNaN")}}}
+    recovered = {"import_price": {now: {"diagnostic": "second", "price": Decimal("0.25")}}}
+
+    # HA can detect the attribute change from provider metadata that Planner ignores.
+    assert recovered != invalid
+    assert not tariff_snapshot_matches(recovered, invalid)
+    assert not tariff_snapshot_matches(invalid, recovered)
+
+
+def test_tariff_snapshot_treats_invalid_provider_offset_as_changed():
+    class BrokenOffset(tzinfo):
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            raise ValueError("Invalid provider UTC offset")
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    invalid = {"forecast": [{"diagnostic": "old", "start_time": now.replace(tzinfo=BrokenOffset())}]}
+    recovered = {"forecast": [{"diagnostic": "new", "start_time": now}]}
+
+    assert invalid != recovered
+    assert not tariff_snapshot_matches(recovered, invalid)
+    assert not tariff_snapshot_matches(invalid, recovered)
+
+
+def test_tariff_capture_preserves_nested_time_maps_and_price_aliases():
+    class DebugMetadata(NamedTuple):
+        value: str
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    leaf = {"perKwh": 0.25, "startTime": now, "debug": DebugMetadata("unused")}
+    time_map = {now.isoformat(): {"value": leaf, "values": ("invalid alternate payload",), "debug": ("nested",)}}
+    attributes = time_map
+    for _ in range(5):
+        attributes = {"forecast": attributes}
+
+    def price_series(payload):
+        return forecast_series_from_state(
+            FakeState("0.25", payload), issued_at=now, horizon_hours=1, interval_minutes=5,
+            value_keys=("per_kwh",), value_kind="price",
+        )
+
+    snapshot = capture_tariff_source_attributes(attributes)
+    assert tariff_snapshot_matches(attributes, snapshot)
+    series = price_series(snapshot)
+    assert series[0] == 0.25
+    leaf["debug"] = ("changed",)
+    assert tariff_snapshot_matches(attributes, snapshot)
+    leaf["perKwh"] = 0.50
+    assert not tariff_snapshot_matches(attributes, snapshot)
+    leaf["perKwh"] = {"value": 0.50}
+    invalid_snapshot = capture_tariff_source_attributes(attributes)
+    assert price_series(attributes) is None
+    assert price_series(invalid_snapshot) is None
+    assert tariff_snapshot_matches(attributes, invalid_snapshot)
+
+
+def test_tariff_cache_preserves_timestamp_keys_without_copying_unrelated_row_metadata():
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    row = {"Export Price": -0.25, "debug": MappingProxyType({"first": True})}
+    attributes = {"forecast": {now: row}}
+
+    snapshot = cacheable_tariff_snapshot(attributes)
+
+    assert snapshot == {"forecast": {now: {"Export Price": -0.25}}}
+    row["debug"] = MappingProxyType({"second": True})
+    assert tariff_snapshot_matches(attributes, snapshot, acyclic_snapshot=True)
+    row["Export Price"] = 0.50
+    assert not tariff_snapshot_matches(attributes, snapshot, acyclic_snapshot=True)
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_tariff_cache_skips_oversized_sequences(container):
+    assert cacheable_tariff_snapshot({"forecast": container([0] * MAX_FORECAST_SOURCE_ROWS)}) is not None
+    assert cacheable_tariff_snapshot({"forecast": container([0] * (MAX_FORECAST_SOURCE_ROWS + 1))}) is None
+
+
+def test_tariff_cache_bounds_nested_fields_and_scalar_payloads():
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    too_many_keys = {
+        (now + timedelta(minutes=index)).isoformat(): 0
+        for index in range(MAX_FORECAST_SOURCE_ROWS + 1)
+    }
+    assert cacheable_tariff_snapshot({"forecast": too_many_keys}) is None
+
+    individually_bounded = [[0] * MAX_FORECAST_SOURCE_ROWS] * 16
+    assert cacheable_tariff_snapshot({"forecast": individually_bounded}) is None
+    assert cacheable_tariff_snapshot({"forecast": [{"price": "0" * 1_000}]}) is None
+    assert cacheable_tariff_snapshot({"forecast": [{"price": 10**400}]}) is None
+
+
+@pytest.mark.parametrize("timestamped", [False, True])
+def test_oversized_forecast_price_keeps_its_gap(timestamped):
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    rows = [10**400, 0.25]
+    state = FakeState("0.15", {"forecast": [
+        {"valid_at": now + timedelta(minutes=index * 5), "price": price}
+        for index, price in enumerate(rows)
+    ] if timestamped else rows})
+
     series = forecast_series_from_state(
-        state, issued_at=now, horizon_hours=1, interval_minutes=30, value_keys=("per_kwh",), value_kind="price",
+        state, issued_at=now, horizon_hours=1, interval_minutes=5, value_keys=("price",), value_kind="price",
     )
-    assert series == [None, None]
-    assert latest_forecast_valid_at_from_state(state, value_keys=("per_kwh",)) is None
-    assert forecast_timestamp_status_from_state(state, value_keys=("per_kwh",)) == "untimestamped"
+
+    assert series is not None
+    assert series[:2] == [None, 0.25]
+
+
+@pytest.mark.parametrize("middle", ["invalid", "absent", "valid_duplicate"])
+@pytest.mark.parametrize("explicit_cadence", [False, True])
+def test_inferred_tariff_boundaries_and_series_preserve_reported_price_gaps(middle, explicit_cadence):
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    half_hour = timedelta(minutes=30)
+    middle_at = now + half_hour
+    following_at = middle_at + half_hour
+    rows = [
+        {"valid_at": now, "price": 0.25},
+        {"valid_at": following_at, "price": 0.50},
+    ]
+    if middle != "absent":
+        if middle == "valid_duplicate":
+            rows.insert(1, {"valid_at": middle_at, "price": 0.30})
+        rows.insert(-1, {"valid_at": middle_at, "price": 10**400})
+    attributes = {"forecast": rows}
+    if explicit_cadence:
+        attributes["forecast_interval_minutes"] = 60
+    state = FakeState("0.15", attributes)
+
+    series = forecast_series_from_state(
+        state, issued_at=now, horizon_hours=2, interval_minutes=30, value_keys=("price",), value_kind="price",
+    )
+    boundaries = forecasts_module.tariff_source_intervals(state, 30)
+
+    assert series is not None
+    assert series == {
+        "invalid": [0.25, None, 0.50, None],
+        "absent": [0.25, 0.25, 0.50, 0.50],
+        "valid_duplicate": [0.25, 0.30, 0.50, None],
+    }[middle]
+    assert boundaries[0]["end"] == (following_at if middle == "absent" else middle_at).isoformat()
+    assert [row["price"] for row in boundaries] == (
+        [0.25, 0.30, 0.50] if middle == "valid_duplicate" else [0.25, 0.50]
+    )
 
 
 @pytest.mark.parametrize("kind", ["value", "cadence", "energy", "naive"])
@@ -91,7 +246,7 @@ def test_dense_forecast_does_not_truncate_values_inside_requested_horizon() -> N
         value_keys=("value",), value_kind="power") == [float(i * 300) for i in range(12)]
 
 
-@pytest.mark.parametrize("invalid", ["start", "overlap", "non_dict", "naive"])
+@pytest.mark.parametrize("invalid", ["start", "overlap", "non_dict", "naive", "naive_priority"])
 def test_large_declared_tariffs_validate_all_source_evidence(invalid) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     rows = [
@@ -106,6 +261,8 @@ def test_large_declared_tariffs_validate_all_source_evidence(invalid) -> None:
         rows.insert(0, dict(rows[0]))
     elif invalid == "naive":
         rows.append({**rows[0], "start_time": rows[0]["start_time"].replace("+00:00", "")})
+    elif invalid == "naive_priority":
+        rows[-1]["valid_at"] = rows[-1]["start_time"].replace("+00:00", "")
     else:
         rows.append(0.1)
     state = FakeState("0", {"detailedForecast": rows})
@@ -135,6 +292,42 @@ def test_published_tariff_window_keeps_current_rows_after_validation(declared) -
     assert result[0]["start"] == now.isoformat()
     assert result[-1]["start"] == (now + timedelta(hours=1)).isoformat()
     assert forecasts_module.tariff_source_intervals(state, 5, slot_starts=[]) != []
+
+
+@pytest.mark.parametrize("container", ["rows", "time_map"])
+def test_shared_tariff_rows_preserve_boundary_and_price_precedence(container):
+    from custom_components.ha_energy_planner.forecasts import (
+        TariffForecast,
+        forecast_series_from_source,
+        tariff_intervals_from_source,
+    )
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    if container == "rows":
+        forecasts = [{"start_time": now.isoformat(), "import_price": 45, "export_price": -20, "per_kwh": 10}]
+        boundary_price, export_price = 45, -0.2
+    else:
+        forecasts = {now.isoformat(): 45}
+        boundary_price, export_price = 45, 0.45
+    tariff = TariffForecast({"forecasts": forecasts, "unit": "c/kWh"})
+    intervals = tariff_intervals_from_source(tariff.boundary_source(15))
+    series = forecast_series_from_source(
+        tariff.source(15, ("export_price", "feed_in_price", "per_kwh", "price", "value")),
+        issued_at=now, horizon_hours=1, interval_minutes=15, slot_starts=[now],
+    )
+    assert intervals[0]["price"] == boundary_price
+    assert series == [export_price]
+
+
+def test_inferred_tariff_window_caps_unique_boundaries():
+    start = datetime(2026, 6, 27, 8, 1, tzinfo=UTC)
+    starts = [start + timedelta(minutes=7 * index) for index in range(3)]
+    rows = [{"start_time": at.isoformat(), "price": 0.2} for at in starts]
+    state = FakeState("0.2", {"forecast": [rows[0]] * 576 + rows[1:]})
+
+    intervals = forecasts_module.tariff_source_intervals(state, 5, slot_starts=starts)
+
+    assert [row["start"] for row in intervals] == [at.isoformat() for at in starts]
 
 
 def test_tariff_intervals_select_current_window_after_large_history_prefix() -> None:
@@ -612,6 +805,15 @@ def test_forecast_series_treats_bad_times_as_ordered_values() -> None:
     ) == [1.0, None, None, None]
 
 
+def test_ordered_forecast_without_an_explicit_grid_uses_complete_slots() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    state = FakeState("0", {"forecast": [1, 2, 3]})
+    assert forecast_series_from_state(
+        state, issued_at=now, horizon_hours=1, interval_minutes=25,
+        value_keys=("value",), value_kind="power",
+    ) == [1.0, 2.0]
+
+
 def test_ordered_forecast_honors_explicit_minute_cadence_without_extending_coverage() -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
@@ -629,12 +831,18 @@ def test_ordered_forecast_honors_explicit_minute_cadence_without_extending_cover
     ) == [1.0, 1.0, 2.0, 2.0, None, None, None, None]
 
 
-@pytest.mark.parametrize("cadence", ["invalid", 1e15])
-def test_ordered_forecast_ignores_invalid_explicit_cadence(cadence) -> None:
+@pytest.mark.parametrize(("cadence", "fallback_cadence", "expected"), [
+    ("invalid", None, [1.0, 2.0, None, None]),
+    (1e15, None, [1.0, 2.0, None, None]),
+    (1e15, 30, [1.0, 1.0, 2.0, 2.0]),
+    ("1e-999999999999999999999", 30, [1.0, 1.0, 2.0, 2.0]),
+    ("-1e999999999999999999999", 30, [1.0, 1.0, 2.0, 2.0]),
+])
+def test_ordered_forecast_uses_first_valid_explicit_cadence(cadence, fallback_cadence, expected) -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
         "0",
-        {"forecast": [1.0, 2.0], "forecast_interval_minutes": cadence},
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": cadence, "interval_minutes": fallback_cadence},
     )
 
     assert forecast_series_from_state(
@@ -644,7 +852,39 @@ def test_ordered_forecast_ignores_invalid_explicit_cadence(cadence) -> None:
         interval_minutes=15,
         value_keys=("value",),
         value_kind="price",
-    ) == [1.0, 2.0, None, None]
+    ) == expected
+
+
+@pytest.mark.parametrize("timestamped", [False, True])
+@pytest.mark.parametrize("tiny", [5e-324, 1e-9])
+def test_forecast_cadence_skips_values_below_datetime_resolution(timestamped, tiny):
+    issued_at = datetime(2026, 6, 27, tzinfo=UTC)
+    state = FakeState("0", {
+        "forecast_interval_minutes": 1e15,
+        "interval_minutes": tiny,
+        "resolution_minutes": 30,
+        "forecast": [{"valid_at": issued_at.isoformat(), "value": 1.0}] if timestamped else [1.0],
+    })
+    assert forecast_series_from_state(
+        state, issued_at=issued_at, horizon_hours=1, interval_minutes=15,
+        value_keys=("value",), value_kind="power",
+        slot_starts=[issued_at + timedelta(minutes=step) for step in (0, 15, 30, 45)],
+    ) == [1.0, 1.0, None, None]
+
+
+@pytest.mark.parametrize("canonical", [1e15, 30])
+def test_forecast_cadence_preserves_valid_spellings_of_the_same_field(canonical):
+    issued_at = datetime(2026, 6, 27, tzinfo=UTC)
+    state = FakeState("0", {
+        "forecastIntervalMinutes": 30 if canonical == 1e15 else 15,
+        "forecast_interval_minutes": canonical,
+        "interval_minutes": 45,
+        "forecast": [{"valid_at": issued_at.isoformat(), "value": 1.0}],
+    })
+    assert forecast_series_from_state(
+        state, issued_at=issued_at, horizon_hours=1, interval_minutes=15,
+        value_keys=("value",), value_kind="power",
+    ) == [1.0, 1.0, None, None]
 
 
 def test_empty_forecast_with_oversized_cadence_has_no_coverage() -> None:
@@ -931,6 +1171,8 @@ def _amber_state():
 @pytest.mark.parametrize("changes", [
     {"duration": None}, {"duration": True}, {"duration": "30"}, {"duration": float("nan")},
     {"duration": -30}, {"duration": 15}, {"end_time": "bad"},
+    {"Duration": 5}, {"values": {"duration": 5}}, {"Values": {"Duration": 5}},
+    {"values": {"duration": "30"}},
     {"end_time": "2026-11-04T08:29:59+00:00"},
     {"end_time": "2026-11-04T08:30:01+00:00"},
     {"end_time": "2026-11-04T08:30:00"}, {"start_time": "2026-11-04T08:00:01"},
@@ -950,6 +1192,15 @@ def test_amber_inconsistent_metadata_cannot_fall_back_to_convenience_or_scalar(c
         interval_minutes=15, value_keys=("per_kwh", "price", "value"), value_kind="price",
     )
     assert series == [None] * 48
+
+
+def test_amber_agreeing_duration_declarations_keep_native_intervals():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    state = _amber_state()
+    expected = tariff_source_intervals(state, 15)
+    state.attributes["detailedForecast"][0].update(Duration=30.0, values={"duration": 30})
+    assert tariff_source_intervals(state, 15) == expected
 
 
 @pytest.mark.parametrize("missing", ["start_time", "end_time", "duration", "per_kwh"])
@@ -1085,3 +1336,36 @@ def test_declared_amber_duration_cannot_exceed_explicit_source_cadence():
     assert tariff_source_intervals(state, 15) == []
     assert forecast_series_from_state(state, issued_at=datetime(2026, 11, 4, 8, tzinfo=UTC),
         horizon_hours=1, interval_minutes=15, value_keys=("per_kwh",), value_kind="price") == [None] * 4
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_unrepresentable_tariff_timestamp_leaves_a_gap(declared) -> None:
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    row = {"start_time": "9999-12-31T23:00:00-02:00", "per_kwh": -0.15}
+    if declared:
+        row.update(end_time="9999-12-31T23:30:00-02:00", duration=30)
+    state = FakeState("-0.15", {"forecasts": [row]})
+    series = forecast_series_from_state(
+        state, issued_at=now, horizon_hours=1, interval_minutes=30, value_keys=("per_kwh",), value_kind="price",
+    )
+    assert series == ([None, None] if declared else None)
+    assert latest_forecast_valid_at_from_state(state, value_keys=("per_kwh",)) is None
+    assert forecast_timestamp_status_from_state(state, value_keys=("per_kwh",)) == "untimestamped"
+
+
+@pytest.mark.parametrize("cadence", ["invalid", 1e15])
+def test_ordered_forecast_ignores_invalid_explicit_cadence(cadence) -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": cadence},
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 2.0, None, None]

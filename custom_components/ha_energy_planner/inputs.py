@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from .const import (
     CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
     CONF_ENPHASE_AI_PROFILE,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
@@ -55,17 +57,28 @@ from .const import (
     STATE_UNKNOWN_VALUES,
 )
 from .ev import ev_charging_state, ev_vehicle_suspended
+from .export_limit_policy import (
+    ExportTariffSource,
+    export_tariff_is_fresh,
+    export_tariff_issued_at,
+    parse_export_tariff,
+    tariff_blocks_from_source,
+)
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     ForecastSource,
+    TariffForecast,
+    capture_tariff_source_attributes,
     forecast_coverage_details,
+    forecast_series_from_source,
     forecast_series_from_state,
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
     parse_forecast_source,
-    parse_tariff_source,
-    tariff_source_intervals,
+    tariff_intervals_from_source,
+    tariff_snapshot_matches,
+    tariff_source_attributes,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
@@ -95,6 +108,10 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_PV_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
+_TARIFF_VALUE_KEYS_BY_CONFIG = {
+    CONF_AMBER_IMPORT_PRICE: ("import_price", "general_price", "per_kwh", "price", "value"),
+    CONF_AMBER_EXPORT_PRICE: ("export_price", "feed_in_price", "per_kwh", "price", "value"),
+}
 
 
 def _daylight_windows(
@@ -157,6 +174,53 @@ _LOAD_FALLBACK_SUMMARIES = {
 }
 
 
+@dataclass(slots=True)
+class _InputReadCache:
+    """State snapshots and source parsing shared by both grids of one build."""
+
+    states: dict[str, State | None] = field(default_factory=dict)
+    forecast_sources: dict[tuple[str, tuple[str, ...], str], ForecastSource] = field(default_factory=dict)
+    tariff_payloads: dict[str, TariffForecast] = field(default_factory=dict)
+    tariff_sources: dict[str, ForecastSource] = field(default_factory=dict)
+    export_tariffs: dict[str, ExportTariffSource | None] = field(default_factory=dict)
+    secondary_forecast_status: dict[tuple[str, tuple[str, ...], datetime, int], str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _TariffInput:
+    """One detached attribute snapshot and the price columns needed from it."""
+
+    attributes: dict[str, Any]
+    price_columns: set[tuple[str, ...]] = field(default_factory=set)
+    export_last_updated: datetime | None = None
+
+
+def _tariff_age_band(age: timedelta, timeout: timedelta) -> str:
+    """Return the age classification used by price freshness and validity checks."""
+    if age < timedelta():
+        return "future"
+    return "stale" if age > timeout else "fresh"
+
+
+def _prepare_tariff_sources(
+    inputs: dict[str, _TariffInput], interval: int, export_entity: str | None,
+) -> _InputReadCache:
+    """Validate full tariff sources before sampling any planning horizon."""
+    cache = _InputReadCache()
+    for entity_id, source in inputs.items():
+        tariff = TariffForecast(source.attributes)
+        cache.tariff_sources[entity_id] = tariff.boundary_source(interval)
+        for value_keys in source.price_columns:
+            cache.forecast_sources[entity_id, value_keys, "price"] = tariff.source(interval, value_keys)
+    if export_entity is not None:
+        export = inputs.get(export_entity)
+        cache.export_tariffs[export_entity] = (
+            parse_export_tariff(export.attributes, export.export_last_updated)
+            if export is not None and export.export_last_updated is not None else None
+        )
+    return cache
+
+
 class InputManager:
     """Build normalized planner inputs from configured Home Assistant entities."""
 
@@ -171,11 +235,17 @@ class InputManager:
         load_source_outage: Mapping[str, Any] | None = None,
         weather_forecast: Mapping[str, Any] | None = None,
         weather_forecast_details: Mapping[str, Any] | None = None,
+        *,
+        read_cache: _InputReadCache | None = None,
+        observe_export_limit: bool = False,
     ) -> None:
         """Initialize input manager."""
         self.hass = hass
-        self.entry_data = entry_data
-        self.options = options
+        self.entry_data = dict(entry_data)
+        self.options = dict(options)
+        self._observe_export_limit = (
+            observe_export_limit or self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+        )
         self.forecast_calibration = dict(forecast_calibration or {})
         self.load_forecast_model = dict(load_forecast_model or {})
         self.load_forecast_update_reason = load_forecast_update_reason
@@ -190,20 +260,104 @@ class InputManager:
         self._conservative_forecast_series: dict[str, list[float | None]] = {}
         self._forecast_source_issued_at: dict[str, datetime] = {}
         self._forecast_confidence_scores: list[float] = []
-        self._state_cache: dict[str, State | None] = {}
-        self._forecast_sources: dict[tuple[str, tuple[str, ...], str], ForecastSource] = {}
-        self._tariff_sources: dict[str, ForecastSource] = {}
+        self._read_cache = read_cache or _InputReadCache()
+        self._tariff_inputs: dict[str, tuple[State | None, _TariffInput | None]] = {}
+        self._tariff_context_at: datetime | None = None
 
     def build_context(self, overrides: list[Override] | None = None) -> DecisionContext:
+        """Build planner inputs synchronously for offline callers."""
+        return self._build_context_with_extension(overrides, _InputReadCache(), dt_util.utcnow())
+
+    async def async_build_context(self, overrides: list[Override] | None = None) -> DecisionContext | None:
+        """Capture tariff state on the loop and validate its complete payload in a worker."""
+        states: dict[str, State | None] = {}
+        captured: dict[str, _TariffInput] = {}
+        export_entity = self.entry_data.get(CONF_AMBER_EXPORT_PRICE)
+        if not export_entity or not self._observe_export_limit:
+            export_entity = None
+        for config_key, keys in _TARIFF_VALUE_KEYS_BY_CONFIG.items():
+            entity = self.entry_data.get(config_key)
+            if not entity:
+                continue
+            entity_id = str(entity)
+            if entity_id not in states:
+                states[entity_id] = self.hass.states.get(entity_id)
+            state = states[entity_id]
+            if state is not None:
+                if entity_id not in captured:
+                    captured[entity_id] = _TariffInput(capture_tariff_source_attributes(state.attributes or {}))
+                if self._valid_state(state):
+                    captured[entity_id].price_columns.add(keys)
+                if entity_id == export_entity and state.state not in {"unknown", "unavailable"}:
+                    captured[entity_id].export_last_updated = state.last_updated
+        self._tariff_inputs = {entity_id: (state, captured.get(entity_id)) for entity_id, state in states.items()}
+        self._tariff_context_at = None
+        cache = _InputReadCache()
+        if captured or export_entity is not None:
+            cache = await self.hass.async_add_executor_job(
+                _prepare_tariff_sources, captured, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]), export_entity,
+            )
+            if not self.tariff_inputs_current():
+                return None
+        cache.states = states
+        # Pin the clock used for sampling so publication and dispatch can
+        # detect that a still-identical State passed its freshness deadline.
+        self._tariff_context_at = dt_util.utcnow()
+        return self._build_context_with_extension(overrides, cache, self._tariff_context_at)
+
+    def tariff_inputs_current(self) -> bool:
+        """Check the captured tariff after a worker or publication await."""
+        now = dt_util.utcnow()
+        for entity_id, (state, snapshot) in self._tariff_inputs.items():
+            current = self.hass.states.get(entity_id)
+            if state is None or current is None:
+                if state is not current:
+                    return False
+                continue
+            assert snapshot is not None
+            if current.state != state.state or not tariff_snapshot_matches(
+                tariff_source_attributes(current.attributes or {}), snapshot.attributes,
+            ):
+                # A provider can mutate nested attributes without replacing the
+                # State or emitting a state change event.
+                return False
+            if not self._tariff_update_times_agree(
+                snapshot, state.last_updated, current.last_updated, now=now,
+            ):
+                return False
+        return True
+
+    def _tariff_update_times_agree(
+        self, snapshot: _TariffInput, previous: datetime, current: datetime, *, now: datetime,
+    ) -> bool:
+        """Check that tariff freshness still agrees with the sampled context."""
+        sampled_at = self._tariff_context_at or now
+        if snapshot.export_last_updated is not None:
+            # Export Limit uses the provider issue time when supplied and
+            # independently requires an exact HA update time on fallback.
+            issued_at = export_tariff_issued_at(snapshot.attributes, previous)
+            if previous != current and issued_at != export_tariff_issued_at(snapshot.attributes, current):
+                return False
+            if export_tariff_is_fresh(issued_at, sampled_at, self.options) != export_tariff_is_fresh(
+                issued_at, now, self.options,
+            ):
+                return False
+        timeout = timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
+        before, after = sampled_at - previous, now - current
+        # The ordinary price planner uses both past freshness and the
+        # not-in-the-future check for coverage diagnostics and validity retry.
+        return _tariff_age_band(before, timeout) == _tariff_age_band(after, timeout)
+
+    def _build_context_with_extension(
+        self, overrides: list[Override] | None, cache: _InputReadCache, now: datetime,
+    ) -> DecisionContext:
         """Extend EV forecasts without weakening the configured control-health horizon."""
         from math import ceil
 
         from .planner_ev import _next_ready_by
 
-        self._state_cache.clear()
-        self._forecast_sources.clear()
-        self._tariff_sources.clear()
-        context = self._build_context(overrides)
+        self._read_cache = cache
+        context = self._build_context(overrides, now=now)
         if (not self.entry_data.get(CONF_EV_SOC) or context.ev_target_soc_percent is None
                 or context.ev_connected is False):
             return context
@@ -217,10 +371,8 @@ class InputManager:
             forecast_calibration=self.forecast_calibration, load_forecast_model=self.load_forecast_model,
             load_forecast_update_reason=self.load_forecast_update_reason, load_source_outage=self.load_source_outage,
             weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
+            read_cache=self._read_cache,
         )
-        extended_manager._state_cache = self._state_cache
-        extended_manager._forecast_sources = self._forecast_sources
-        extended_manager._tariff_sources = self._tariff_sources
         extended = extended_manager._build_context(overrides, now=context.created_at, ev_extension=True)
         context.slots[-1] = extended.slots[len(context.slots) - 1]
         context.slots.extend(extended.slots[len(context.slots):])
@@ -242,23 +394,24 @@ class InputManager:
         tariffs = []
         import_intervals = None
         self._tariff_source_details: dict[str, dict[str, Any]] = {}
-        for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
+        for key in _TARIFF_VALUE_KEYS_BY_CONFIG:
             entity = self.entry_data.get(key)
             state = self._state(entity)
             if state is not None:
                 source_key = str(entity)
-                if (source := self._tariff_sources.get(source_key)) is None:
-                    source = self._tariff_sources[source_key] = parse_tariff_source(state, interval)
+                if (source := self._read_cache.tariff_sources.get(source_key)) is None:
+                    source = self._read_cache.tariff_sources[source_key] = self._tariff_forecast(
+                        source_key, state,
+                    ).boundary_source(interval)
                 details: dict[str, Any] = {}
-                intervals = tariff_source_intervals(
-                    state, interval, details=details,
+                intervals = tariff_intervals_from_source(
+                    source, details=details,
                     slot_starts=[now, now + timedelta(hours=horizon)],
-                    source=source,
                 )
                 if key == CONF_AMBER_IMPORT_PRICE:
                     import_intervals = intervals
-                age = now - state.last_updated
-                fresh = timedelta() <= age <= timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
+                timeout = timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
+                fresh = _tariff_age_band(now - state.last_updated, timeout) == "fresh"
                 details.update(source_freshness="fresh" if fresh else "stale", next_retry_at=None)
                 # Retry only a known, imminent validity boundary, never poll for
                 # missing data. Coverage remains unsafe until that instant.
@@ -275,7 +428,7 @@ class InputManager:
         self._slot_starts = planning_starts(now, horizon, interval, tariffs)
         import_prices, import_issue = self._required_series(
             CONF_AMBER_IMPORT_PRICE,
-            ("import_price", "general_price", "per_kwh", "price", "value"),
+            _TARIFF_VALUE_KEYS_BY_CONFIG[CONF_AMBER_IMPORT_PRICE],
             "price",
             now,
             horizon,
@@ -283,7 +436,7 @@ class InputManager:
         )
         export_prices, export_issue = self._required_series(
             CONF_AMBER_EXPORT_PRICE,
-            ("export_price", "feed_in_price", "per_kwh", "price", "value"),
+            _TARIFF_VALUE_KEYS_BY_CONFIG[CONF_AMBER_EXPORT_PRICE],
             "price",
             now,
             horizon,
@@ -422,12 +575,7 @@ class InputManager:
             if bool(self.options.get(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED, False))
             else []
         )
-        from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
-        from .enphase_export_limit import evidence
-
-        export_limit = (evidence(self.hass, dict(self.entry_data), dict(self.options), now)
-                        if not ev_extension and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
-                        else {})
+        export_limit = self._export_limit_evidence(now) if not ev_extension and self._observe_export_limit else {}
         return DecisionContext(
             export_limit=export_limit,
             created_at=now,
@@ -487,6 +635,16 @@ class InputManager:
             ),
         )
 
+    def _export_limit_evidence(self, now: datetime) -> dict[str, Any]:
+        from .enphase_export_limit import evidence, evidence_for_tariff
+
+        data, options = dict(self.entry_data), dict(self.options)
+        entity = data.get(CONF_AMBER_EXPORT_PRICE)
+        if entity in self._read_cache.export_tariffs:
+            blocks = tariff_blocks_from_source(self._read_cache.export_tariffs[entity], now, options)
+            return evidence_for_tariff(self.hass, data, now, blocks)
+        return evidence(self.hass, data, options, now)
+
     def _numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
         entity_id = self.entry_data.get(config_key)
         if not entity_id:
@@ -520,17 +678,21 @@ class InputManager:
             # Native boundaries already remain stable between refreshes. Keep
             # every provider boundary, including short price intervals.
             return list(context.slots)
-        interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
+        interval = timedelta(minutes=interval_minutes)
         origin = peak + ((context.created_at - peak) // interval) * interval
-        state = self._state(self.entry_data.get(CONF_AMBER_IMPORT_PRICE))
+        entity = self.entry_data.get(CONF_AMBER_IMPORT_PRICE)
+        state = self._state(entity)
         if not self._valid_state(state):
             return []
-        prices = forecast_series_from_state(
-            state, issued_at=origin,
+        value_keys = _TARIFF_VALUE_KEYS_BY_CONFIG[CONF_AMBER_IMPORT_PRICE]
+        source = self._read_cache.forecast_sources.get((str(entity), value_keys, "price"))
+        if source is None:
+            source = parse_forecast_source(state, interval_minutes, value_keys, "price")
+        prices = forecast_series_from_source(
+            source, issued_at=origin,
             horizon_hours=int(self.options[CONF_PLANNING_HORIZON_HOURS]) + 1,
-            interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
-            value_keys=("import_price", "general_price", "per_kwh", "price", "value"),
-            value_kind="price", require_timestamped=True,
+            interval_minutes=interval_minutes, require_timestamped=True,
         )
         if not prices:
             return []
@@ -567,13 +729,8 @@ class InputManager:
         secondary_entity_id = self.entry_data.get(secondary_config_key) if secondary_config_key else None
         secondary_state = self._state(secondary_entity_id) if secondary_entity_id else None
         if secondary_config_key and secondary_entity_id:
-            secondary_status = _forecast_source_status(
-                secondary_state,
-                now=now,
-                freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
-                value_keys=value_keys,
-                require_timestamped=True,
-                interval_minutes=interval,
+            secondary_status = self._secondary_forecast_status(
+                str(secondary_entity_id), secondary_state, now, value_keys, interval,
             )
             if secondary_status == "usable":
                 assert secondary_state is not None
@@ -598,21 +755,15 @@ class InputManager:
             self._forecast_source_issued_at[calibration_field] = source_issued_at
 
         source_forecasts = []
-        for _, source_entity, source_state in source_states:
-            cache_key = (source_entity, value_keys, value_kind)
-            if (source := self._forecast_sources.get(cache_key)) is None:
-                source = self._forecast_sources[cache_key] = parse_forecast_source(
-                    source_state, interval, value_keys, value_kind,
-                )
-            source_forecasts.append(forecast_series_from_state(
-                source_state,
+        for source_config, source_entity, source_state in source_states:
+            source = self._parsed_forecast_source(source_entity, source_state, interval, value_keys, value_kind)
+            source_forecasts.append(forecast_series_from_source(
+                source,
                 issued_at=now,
                 horizon_hours=horizon,
                 interval_minutes=interval,
-                value_keys=value_keys,
-                value_kind=value_kind,
+                require_timestamped=source_config != config_key,
                 slot_starts=getattr(self, "_slot_starts", None),
-                source=source,
             ))
         forecasts = [item for item in source_forecasts if item]
         forecast = _stitch_forecast_series(forecasts, slot_count) if forecasts else None
@@ -1297,6 +1448,7 @@ class InputManager:
         issues: list[str] = []
         price_timeout = timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
         forecast_timeout = timedelta(minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]))
+        interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
             entity_id = self.entry_data.get(key)
             state = self._state(entity_id) if entity_id else None
@@ -1315,7 +1467,10 @@ class InputManager:
                     state,
                     now,
                     _FORECAST_VALUE_KEYS_BY_CONFIG[key],
-                    interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+                    interval_minutes=interval,
+                    source=self._parsed_forecast_source(
+                        str(entity_id), state, interval, _FORECAST_VALUE_KEYS_BY_CONFIG[key], "power",
+                    ) if key == CONF_PV_FORECAST else None,
                 )
                 and not (key == CONF_PV_FORECAST and self._secondary_pv_covers_now(now))
             ):
@@ -1331,34 +1486,67 @@ class InputManager:
             issues.append(f"{CONF_HOUSEHOLD_LOAD}_stale")
         return issues
 
+    def _parsed_forecast_source(
+        self, entity_id: str, state: State, interval: int, value_keys: tuple[str, ...], value_kind: str,
+    ) -> ForecastSource:
+        key = (entity_id, value_keys, value_kind)
+        if (source := self._read_cache.forecast_sources.get(key)) is None:
+            source = (
+                self._tariff_forecast(entity_id, state).source(interval, value_keys)
+                if value_kind == "price" else parse_forecast_source(state, interval, value_keys, value_kind)
+            )
+            self._read_cache.forecast_sources[key] = source
+        return source
+
+    def _tariff_forecast(self, entity_id: str, state: State) -> TariffForecast:
+        if (tariff := self._read_cache.tariff_payloads.get(entity_id)) is None:
+            tariff = self._read_cache.tariff_payloads[entity_id] = TariffForecast(state.attributes or {})
+        return tariff
+
+    def _secondary_forecast_status(
+        self, entity_id: str, state: State | None, now: datetime, value_keys: tuple[str, ...], interval: int,
+    ) -> str:
+        if not self._valid_state(state):
+            return "unavailable"
+        key = (entity_id, value_keys, now, interval)
+        if (status := self._read_cache.secondary_forecast_status.get(key)) is None:
+            source = self._parsed_forecast_source(entity_id, state, interval, value_keys, "power")
+            status = self._read_cache.secondary_forecast_status[key] = _forecast_source_status(
+                state,
+                now=now,
+                freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
+                value_keys=value_keys,
+                require_timestamped=True,
+                interval_minutes=interval,
+                source=source,
+            )
+        return status
+
     def _secondary_pv_covers_now(self, now: datetime) -> bool:
         """Use the same validated secondary source admitted by PV stitching."""
         entity_id = self.entry_data.get(CONF_PV_FORECAST_SECONDARY)
-        state = self._state(entity_id) if entity_id else None
+        if not entity_id:
+            return False
+        state = self._state(entity_id)
         value_keys = _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_PV_FORECAST]
-        if _forecast_source_status(
-            state,
-            now=now,
-            freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
-            value_keys=value_keys,
-            require_timestamped=True,
-            interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
-        ) != "usable":
+        interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
+        if self._secondary_forecast_status(str(entity_id), state, now, value_keys, interval) != "usable":
             return False
         assert state is not None
         return _has_current_forecast_slot(
-            state, now, value_keys, interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+            state, now, value_keys, interval_minutes=interval,
+            source=self._parsed_forecast_source(str(entity_id), state, interval, value_keys, "power"),
         )
 
     def current_forecast_observations(self) -> dict[str, dict[str, Any] | None]:
         """Return timestamped observed power from dedicated ground-truth entities."""
         observations: dict[str, dict[str, Any] | None] = {}
-        for config_key, field in _OBSERVATION_FIELDS_BY_CONFIG.items():
+        for config_key, observation_field in _OBSERVATION_FIELDS_BY_CONFIG.items():
             value, _issue = self._optional_numeric_state(config_key)
             entity_id = self.entry_data.get(config_key)
             state = self._state(entity_id) if entity_id else None
             observed_at = getattr(state, "last_updated", None)
-            observations[field] = (
+            observations[observation_field] = (
                 {"value": value, "observed_at": observed_at}
                 if value is not None and isinstance(observed_at, datetime)
                 else None
@@ -1396,10 +1584,12 @@ class InputManager:
 
     def _state(self, entity_id: Any) -> State | None:
         """Return a cached Home Assistant state for this refresh."""
+        if not entity_id:
+            return None
         cache_key = str(entity_id)
-        if cache_key not in self._state_cache:
-            self._state_cache[cache_key] = self.hass.states.get(cache_key)
-        return self._state_cache[cache_key]
+        if cache_key not in self._read_cache.states:
+            self._read_cache.states[cache_key] = self.hass.states.get(cache_key)
+        return self._read_cache.states[cache_key]
 
     @staticmethod
     def _valid_state(state: State | None) -> TypeGuard[State]:
@@ -1634,52 +1824,58 @@ def _combined_confidence(values: list[float]) -> float:
 
 def _has_current_forecast_data(
     state: State, now: datetime, value_keys: tuple[str, ...], *, interval_minutes: int,
+    source: ForecastSource | None = None,
 ) -> bool:
     latest_valid_at = latest_forecast_valid_at_from_state(state, value_keys=value_keys)
     return latest_valid_at is not None and (
-        latest_valid_at >= now or _has_current_forecast_slot(state, now, value_keys, interval_minutes=interval_minutes)
+        latest_valid_at >= now
+        or _has_current_forecast_slot(state, now, value_keys, interval_minutes=interval_minutes, source=source)
     )
 
 
 def _has_current_forecast_slot(
     state: State, now: datetime, value_keys: tuple[str, ...], *, interval_minutes: int,
+    source: ForecastSource | None = None,
 ) -> bool:
     """Respect the same final-interval cadence and exclusive end as planning."""
-    series = forecast_series_from_state(
-        state,
+    if source is None:
+        source = parse_forecast_source(state, interval_minutes, value_keys, "power")
+    series = forecast_series_from_source(
+        source,
         issued_at=now,
         horizon_hours=1,
         interval_minutes=interval_minutes,
-        value_keys=value_keys,
-        value_kind="power",
         require_timestamped=True,
+        slot_starts=[now],
     )
     return bool(series and series[0] is not None)
 
 
 def _forecast_source_status(
-    state: State | None,
+    state: State,
     *,
     now: datetime,
     freshness_minutes: int,
     value_keys: tuple[str, ...],
     require_timestamped: bool = False,
     interval_minutes: int = 5,
+    source: ForecastSource | None = None,
 ) -> str:
-    """Classify an optional forecast source without affecting usable siblings."""
-    if state is None or state.state in STATE_UNKNOWN_VALUES:
-        return "unavailable"
+    """Classify a present forecast source without affecting usable siblings."""
     if now - state.last_updated > timedelta(minutes=freshness_minutes) and not _has_current_forecast_data(
         state,
         now,
         value_keys,
         interval_minutes=interval_minutes,
+        source=source,
     ):
         return "stale"
     if require_timestamped:
         timestamp_status = forecast_timestamp_status_from_state(state, value_keys=value_keys)
         if timestamp_status != "aware_timestamps":
             return timestamp_status
+        if source is not None and not source.points:
+            return "untimestamped"
     return "usable"
 
 

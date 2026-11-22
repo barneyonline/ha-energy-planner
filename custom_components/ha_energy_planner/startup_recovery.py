@@ -146,7 +146,7 @@ async def async_cancel_startup_auto_recovery(
     task = getattr(self, "_startup_auto_recovery_task", None)
     if task is None or task is asyncio.current_task() or task.done():
         task = None
-    else:
+    elif not task.cancelling():
         task.cancel()
     if disarm_reason is not None:
         try:
@@ -166,12 +166,25 @@ async def async_cancel_startup_auto_recovery(
             self._startup_auto_recovery_task = None
         await self.executor.async_dismiss_startup_recovery_notification()
         return
-    if task is not None:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    self._startup_auto_recovery_task = None
+    if task is None:
+        self._startup_auto_recovery_task = None
+    else:
+        # Drain the retiring task before rollback can resume startup recovery.
+        # Its expected cancellation is independent of cancellation of this caller.
+        retired = asyncio.gather(task, return_exceptions=True)
+        cancelled = False
+        while not retired.done():
+            try:
+                await asyncio.shield(retired)
+            except asyncio.CancelledError:
+                cancelled = True
+        if self._startup_auto_recovery_task is task:
+            self._startup_auto_recovery_task = None
+        if cancelled:
+            raise asyncio.CancelledError
+        error = retired.result()[0]
+        if isinstance(error, Exception):
+            raise error
     if not isinstance(store_data, dict):
         return
     if operator_disarm is not getattr(self, "_operator_disarm_request", None):
@@ -200,8 +213,9 @@ async def async_cancel_startup_auto_recovery(
         if not preserve_control:
             await self.executor.async_dismiss_startup_recovery_notification()
         return
-    if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload", "options_changed"}:
-        # Keep recovery restartable until shutdown or the new options handoff.
+    if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload", "operator_armed"}:
+        # Persist the current grace/recovery state verbatim so the next
+        # process or a rejected operator replacement can resume it.
         return
     await self._async_update_startup_auto_recovery(
         "interrupted" if preserve_control else "cancelled",

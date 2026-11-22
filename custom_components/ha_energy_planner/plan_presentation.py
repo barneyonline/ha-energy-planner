@@ -11,9 +11,11 @@ from homeassistant.util import dt as dt_util
 from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
 from .enphase_export_limit import (
     COMPANION_UPGRADE_REQUIRED,
+    EXPORT_IDENTITY_ISSUES,
     GATEWAY_CHANGED,
     GATEWAY_UNVERIFIED,
-    live_owned_gateway_issue,
+    TARGET_CHANGED,
+    live_export_identity_issue,
     retry_status,
     target_identity,
 )
@@ -72,18 +74,21 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     if identity is None and isinstance(ownership, dict):
         identity = ownership.get("identity")
     if hass is not None and isinstance(ownership, dict) and (
-        gateway_issue := live_owned_gateway_issue(hass, entity, ownership, dt_util.utcnow())
+        identity_issue := live_export_identity_issue(hass, entity, ownership, dt_util.utcnow())
     ):
-        runtime_reason = gateway_issue
-        status.update(ready=False, reason=gateway_issue, summary=plain_reason(gateway_issue))
+        runtime_reason = identity_issue
+        status.update(ready=False, feedback_ready=False, reason=identity_issue, summary=plain_reason(identity_issue))
     timing = cooldown_status(coordinator.store.data, identity,
                              getattr(coordinator, "options", {}), dt_util.utcnow())
     status.update(timing)
     if timing.get("deferred"):
         status.update(ready=False, reason=(timing["cooldown_reason"]
             if status.get("reason") in {None, "export_limit_restoration_pending"} else status["reason"]))
-        status["summary"] = ("Export setting changes are deferred until "
-                             f"{timing['next_eligible_change_at']}; latest tariff and feedback will be rechecked.")
+        if status["reason"] in EXPORT_IDENTITY_ISSUES:
+            status["summary"] = plain_reason(status["reason"])
+        else:
+            status["summary"] = ("Export setting changes are deferred until "
+                                 f"{timing['next_eligible_change_at']}; latest tariff and feedback will be rechecked.")
     if getattr(coordinator, "_export_reconcile_pending", False):
         status.update(ready=False, reconciliation_pending=True)
         if runtime_reason and status.get("reason") == runtime_reason:
@@ -103,7 +108,9 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         retry["next_attempt_at"] = scheduled.isoformat() if scheduled is not None else None
         if retry["state"] == "scheduled" and scheduled is None:
             retry["state"] = "suspended"
-        if retry.get("operator_action"):
+        if status.get("reason") in EXPORT_IDENTITY_ISSUES:
+            status["summary"] = plain_reason(status["reason"])
+        elif retry.get("operator_action"):
             status["summary"] = retry["operator_action"]
         status["retry"] = retry
     return status
@@ -633,6 +640,7 @@ def plain_reason(value: Any) -> str:
     labels = {
         COMPANION_UPGRADE_REQUIRED: "Upgrade Enphase Energy to enable verified Export Limit recovery.",
         GATEWAY_CHANGED: "Export Limit ownership belongs to a different gateway.",
+        TARGET_CHANGED: "Export Limit ownership belongs to a different mapped control.",
         GATEWAY_UNVERIFIED: "Waiting for Export Limit readback verified against the active gateway.",
         "ev_load_fallback_continue": "Consumption unavailable; continuing with conservative forecast limits.",
         "ev_load_fallback_waiting": "Consumption unavailable; waiting for stable readings before starting.",

@@ -3120,7 +3120,8 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
             assert store.data["ownership"]["ev_smart_charging_state"] == {"ev_charger_entity": "off"}
 
 
-def test_executor_rejects_active_command_when_production_gate_not_armed() -> None:
+@pytest.mark.parametrize("tentative", [False, True])
+def test_executor_rejects_active_command_when_production_gate_not_armed(tentative) -> None:
     now = datetime.now(UTC)
     action = PlanAction(
         action_id="ev",
@@ -3150,11 +3151,12 @@ def test_executor_rejects_active_command_when_production_gate_not_armed() -> Non
         preview=[],
     )
     store = FakeStore()
-    store.data["production"] = {}
+    store.data["production"] = {"armed": tentative}
     executor = Executor(
         store,
         options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
     )
+    executor.operator_arm_confirmed = lambda: not tentative
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
@@ -4128,10 +4130,14 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
     assert store.data["ownership"]["hvac_control"]["suppression_min_price_delta"] == 0.15
 
 
-@pytest.mark.parametrize("optional_hooks", [True, False])
+@pytest.mark.parametrize(("optional_hooks", "stale_at"), [
+    (True, None), (False, None), (True, "before_persistence"), (True, "after_persistence"),
+])
 def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
-    monkeypatch: object, optional_hooks: bool,
+    monkeypatch: object, optional_hooks: bool, stale_at: str | None,
 ) -> None:
+    executed = []
+
     class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
@@ -4140,6 +4146,7 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
             return {"automation.hvac": "on"}, {"switch.zone": "off"}
 
         async def async_execute(self, action: PlanAction) -> object:
+            executed.append(action)
             assert "hvac_control" in store.data["ownership"]
             return SimpleNamespace(
                 applied=False,
@@ -4197,10 +4204,21 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
     )
     _arm_store(store, executor)
 
-    asyncio.run(executor.async_evaluate(plan))
+    def plan_is_current() -> bool:
+        return stale_at == "after_persistence" and store.flush_count == 0
+
+    asyncio.run(executor.async_evaluate(plan, plan_is_current=plan_is_current if stale_at else None))
 
     assert store.data["ownership"] == {"enphase_profile": "AI Optimisation"}
-    assert store.data["outcomes"][0].reason == "hvac_control_service_failed"
+    if stale_at:
+        assert executed == []
+        assert not store.data.get("command_rate_limits")
+        assert not store.data.get("control_pause")
+        assert store.data["outcomes"][0].result == OutcomeResult.REJECTED
+        assert store.data["outcomes"][0].reason == "plan_superseded_before_dispatch"
+    else:
+        assert executed == [action]
+        assert store.data["outcomes"][0].reason == "hvac_control_service_failed"
 
 
 @pytest.mark.parametrize("manual_supersession", [True, False])

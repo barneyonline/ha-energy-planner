@@ -43,50 +43,50 @@ def reserve_ev_grid_capacity(
     now: datetime,
     options: Mapping[str, Any],
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """Atomically reserve projected load, restoring the previous record on rejection."""
+    """Atomically reserve projected load and preserve the previous record on rejection."""
     previous = reservations.get(entry_id)
     if not _ev_action_wants_power(action):
         return None, previous
     if context is None or not context.slots:
         return "ev_grid_projection_unavailable", previous
-    reservations.pop(entry_id, None)
-
-    load_kw = _positive_float(action.desired_state.get("projected_load_kw_now"))
-    if load_kw <= 0:
-        load_kw = max(float(options.get(CONF_EV_CHARGE_RATE_KW, 0.0)), 0.0)
+    load_kw = ev_requested_load_kw(action, options)
     if isinstance(previous, dict):
         # A model/options update cannot prove that an already-running charger
         # has reduced its physical draw. Only a confirmed stop releases the
         # prior reservation, so subsequent start/no-op actions retain the
         # larger of the observed reservation and newly requested load.
         load_kw = max(load_kw, _positive_float(previous.get("load_kw")))
-    other_load_kw = sum(
-        _positive_float(item.get("load_kw")) for item in reservations.values() if isinstance(item, dict)
-    )
-    projected_import_kw, _projected_export_kw = _projected_grid_flows_kw(context.slots[0])
-    represented_ev_load_kw = _positive_float(context.slots[0].projected_ev_load_kw)
-    additional_requested_load_kw = max(load_kw - represented_ev_load_kw, 0.0)
-    if projected_import_kw is None:
-        if previous is not None:
-            reservations[entry_id] = previous
-        reason = "multi_ev_grid_projection_unavailable" if other_load_kw > 0 else "ev_grid_projection_unavailable"
-        return reason, previous
     configured_limit_kw = max(float(options.get(CONF_GRID_IMPORT_LIMIT_KW, 0.0)), 0.0)
-    limits = [configured_limit_kw]
-    limits.extend(
-        max(_positive_float(item.get("limit_kw")), 0.0) for item in reservations.values() if isinstance(item, dict)
-    )
-    household_limit_kw = min(limits)
-    if (
-        projected_import_kw is not None
-        and projected_import_kw + additional_requested_load_kw + other_load_kw > household_limit_kw + 1e-6
-    ):
-        if previous is not None:
-            reservations[entry_id] = previous
-        return "multi_ev_grid_import_limit_exceeded", previous
+    if reason := ev_grid_headroom_reason(reservations, entry_id, context, load_kw, configured_limit_kw):
+        return reason, previous
     reservation = EVGridReservation(load_kw, configured_limit_kw, now)
     reservations[entry_id] = reservation.to_record()
     return None, previous
+
+
+def ev_requested_load_kw(action: ControlAction, options: Mapping[str, Any]) -> float:
+    """Return the load an EV start must have reserved before dispatch."""
+    return _positive_float(action.desired_state.get("projected_load_kw_now")) or max(
+        float(options.get(CONF_EV_CHARGE_RATE_KW, 0.0)), 0.0,
+    )
+
+
+def ev_grid_headroom_reason(
+    reservations: Mapping[str, dict[str, Any]], entry_id: str, context: DecisionContext,
+    load_kw: float, configured_limit_kw: float,
+) -> str | None:
+    """Check fresh shared capacity without modifying an existing reservation."""
+    others = [item for key, item in reservations.items() if key != entry_id and isinstance(item, dict)]
+    other_load_kw = sum(_positive_float(item.get("load_kw")) for item in others)
+    slot = context.slots[0]
+    projected_import_kw, _projected_export_kw = _projected_grid_flows_kw(slot)
+    if projected_import_kw is None:
+        return "multi_ev_grid_projection_unavailable" if other_load_kw > 0 else "ev_grid_projection_unavailable"
+    additional_requested_load_kw = max(load_kw - _positive_float(slot.projected_ev_load_kw), 0.0)
+    household_limit_kw = min([configured_limit_kw, *(_positive_float(item.get("limit_kw")) for item in others)])
+    if projected_import_kw + additional_requested_load_kw + other_load_kw > household_limit_kw + 1e-6:
+        return "multi_ev_grid_import_limit_exceeded"
+    return None
 
 
 def _ev_action_wants_power(action: ControlAction) -> bool:

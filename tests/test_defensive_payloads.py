@@ -33,9 +33,9 @@ NOW = datetime(2026, 11, 6, tzinfo=UTC)
 
 
 def test_forecast_metadata_skips_invalid_earlier_keys_and_out_of_order_points():
-    assert (
-        forecasts._explicit_interval_minutes({"forecast_interval_minutes": 0, "interval_minutes": float("nan")}) is None
-    )
+    attributes = {"forecast_interval_minutes": 0, "interval_minutes": float("nan"),
+                  "resolution_minutes": -(10**400)}
+    assert list(forecasts._declared_interval_minutes(attributes)) == []
     points = [
         {"valid_at": "invalid", "period_start": (NOW + timedelta(hours=1)).isoformat(), "value": 1},
         {"valid_at": NOW.isoformat(), "value": 2},

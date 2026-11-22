@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import product
 from time import perf_counter
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -77,6 +78,50 @@ def test_partial_current_and_deadline_do_not_create_energy():
     assert len(schedule.allocations) == 2
     assert schedule.allocations[0].added_soc_percent == pytest.approx(2)
     assert sum(a.added_soc_percent for a in schedule.allocations) == pytest.approx(5)
+
+
+def test_only_winning_candidate_materializes_partial_allocations(monkeypatch):
+    from custom_components.ha_energy_planner import ev_optimization
+
+    construct = Mock(wraps=ev_optimization.EVChargeAllocation)
+    monkeypatch.setattr(ev_optimization, "EVChargeAllocation", construct)
+    ctx = context((0.01, 0.2, 0.3, 0.4))
+    ctx.created_at = NOW + timedelta(minutes=3)
+    schedule, evidence = solve(ctx)
+
+    assert evidence["candidate_evaluations"] > len(schedule.allocations)
+    assert construct.call_count == len(schedule.allocations) == 2
+    assert schedule.allocations[0].valid_at == NOW
+    assert schedule.allocations[0].added_soc_percent == pytest.approx(2)
+    assert sum(item.added_soc_percent for item in schedule.allocations) == pytest.approx(5)
+    assert evidence["latest_validated_start"] == (NOW + timedelta(minutes=15)).isoformat()
+
+
+@pytest.mark.parametrize(("performance", "learned"), [
+    ({}, False),
+    ({"bands": {}, "aggregate": {}}, False),
+    ({"bands": {"0": {"minutes": 60, "sessions": 2, "soc_per_kwh": 10}},
+      "aggregate": {"minutes": 59, "soc_per_kwh": 10}}, False),
+    ({"bands": {"0": {"minutes": 60, "sessions": 3, "soc_per_kwh": 10}}}, True),
+    ({"aggregate": {"minutes": 60, "soc_per_kwh": 10}}, True),
+])
+def test_ev_search_reuses_delivery_projection_when_rates_match(monkeypatch, performance, learned):
+    from custom_components.ha_energy_planner import ev_optimization
+
+    integrate = Mock(wraps=ev_optimization._charge_interval)
+    monkeypatch.setattr(ev_optimization, "_charge_interval", integrate)
+    ctx = context((0.1, 0.2))
+    ctx.ev_evidence["performance"] = performance
+    schedule, evidence = solve(ctx, ev_charging_strategy="split")
+
+    assert not schedule.infeasible
+    assert evidence["expected_completion"] == (NOW + timedelta(minutes=5)).isoformat()
+    expected_calls = [call for call in integrate.call_args_list if call.kwargs.get("expected")]
+    assert bool(expected_calls) is learned
+    if learned:
+        assert evidence["conservative_completion"] == (NOW + timedelta(minutes=5, seconds=33.333333)).isoformat()
+    else:
+        assert evidence["conservative_completion"] == evidence["expected_completion"]
 
 
 def test_buffer_is_soft_but_earlier_completion_wins():

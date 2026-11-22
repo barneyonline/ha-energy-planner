@@ -337,7 +337,7 @@ def test_preflight_button_creates_notification(monkeypatch: object) -> None:
     monkeypatch.setattr(
         button_module,
         "build_preflight_report",
-        lambda hass, coordinator_arg: {
+        lambda hass, coordinator_arg, **kwargs: {
             "ok": False,
             "active_control_ready": False,
             "checks": [
@@ -381,7 +381,7 @@ def test_preflight_notification_is_deferred_during_startup(monkeypatch: object) 
         entity_description=next(description for description in BUTTONS if description.key == "run_preflight"),
     )
 
-    def preflight_report(hass: object, coordinator_arg: object) -> dict[str, object]:
+    def preflight_report(hass: object, coordinator_arg: object, **kwargs: object) -> dict[str, object]:
         return {"ok": report_ok, "active_control_ready": report_ok, "checks": []}
 
     monkeypatch.setattr(
@@ -423,7 +423,7 @@ def test_successful_preflight_returns_passed_notification(monkeypatch: object) -
     monkeypatch.setattr(
         button_module,
         "build_preflight_report",
-        lambda hass, coordinator_arg: {"ok": True, "active_control_ready": True, "checks": []},
+        lambda hass, coordinator_arg, **kwargs: {"ok": True, "active_control_ready": True, "checks": []},
     )
 
     asyncio.run(PlannerButton.async_press(button))

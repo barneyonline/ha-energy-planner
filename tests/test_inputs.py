@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_HOUSEHOLD_LOAD,
     CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_PERSON_ENTITIES,
+    CONF_PRICE_FRESHNESS_MINUTES,
     CONF_PV_FORECAST,
     CONF_PV_FORECAST_SECONDARY,
     CONF_PV_OBSERVED,
@@ -926,6 +928,8 @@ def test_pv_today_and_tomorrow_are_stitched_across_dst_boundary() -> None:
     ("secondary_attributes", "expected_status"),
     [
         ({"forecast": [3.0, 4.0]}, "untimestamped"),
+        ({"forecast": [{"period_start": "0001-01-01T00:00:00+01:00", "power": 1.0}, 8, 8, 8]}, "untimestamped"),
+        ({"forecast": [{"period_start": "2026-07-12T02:00:00+00:00", "power": "unknown"}, 8, 8, 8]}, "untimestamped"),
         (
             {
                 "forecast": [
@@ -2253,6 +2257,47 @@ def test_retained_climate_tariff_evidence_fails_closed() -> None:
     assert slots and slots[0].import_price == 0.1
 
 
+@pytest.mark.parametrize("worker", [False, True])
+def test_retained_climate_reuses_parsed_import_forecast(monkeypatch, worker):
+    import asyncio
+
+    now = datetime(2026, 9, 17, 5, 4, tzinfo=UTC)
+    valid_at = now.replace(minute=0)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    forecast = [
+        {"valid_at": valid_at, "importPrice": 30, "general_price": 60},
+        {"valid_at": valid_at + timedelta(minutes=30), "importPrice": 40, "general_price": 70},
+    ]
+    hass = FakeHass({"sensor.tariff": FakeState("0.30", {
+        "detailedForecast": forecast, "forecast": [1.0], "unit": "c/kWh",
+    }, last_updated=now)})
+    hass.async_add_executor_job = asyncio.to_thread
+    manager = _RawInputManager(
+        hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"},
+        {**DEFAULT_OPTIONS, "planning_interval_minutes": 5},
+    )
+    source_calls = []
+    source = inputs_module.TariffForecast.source
+
+    def count_source(tariff, interval, keys, *, boundaries=False):
+        source_calls.append(boundaries)
+        return source(tariff, interval, keys, boundaries=boundaries)
+
+    monkeypatch.setattr(inputs_module.TariffForecast, "source", count_source)
+    context = asyncio.run(manager.async_build_context()) if worker else manager.build_context()
+    assert context is not None
+    assert context.slots[0].import_price == 0.30
+    assert source_calls == [True, False]
+    context.hvac_control = {"period_start": valid_at.isoformat()}
+    context.climate_inputs["tariff_intervals"] = []
+
+    slots = manager.retained_hvac_tariff_slots(context)
+
+    assert slots and slots[0].valid_at == valid_at
+    assert slots[0].import_price == 0.30
+    assert source_calls == [True, False]
+
+
 def test_default_outage_covers_six_hours_with_added_capacity_margin_and_expires() -> None:
     now = datetime(2026, 9, 22, tzinfo=UTC)
     manager = _RawInputManager(
@@ -2402,8 +2447,25 @@ def test_native_grid_retains_partial_intervals_and_exact_horizon(monkeypatch):
     assert relative.retained_hvac_tariff_slots(relative_context) == []
 
 
-def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monkeypatch):
+def test_stale_carbon_state_uses_current_final_forecast_bucket():
+    now = datetime(2026, 10, 19, tzinfo=UTC)
+    state = FakeState("200", {
+        "forecast_interval_minutes": 30,
+        "forecast": [{"valid_at": (now - timedelta(minutes=10)).isoformat(), "value": 200}],
+    }, now - timedelta(hours=6))
+    manager = InputManager(FakeHass({"sensor.carbon": state}),
+                           {CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon"}, DEFAULT_OPTIONS)
+    issue = f"advisory_{CONF_CARBON_INTENSITY_FORECAST}_stale"
+    assert issue not in manager._freshness_issues(now)
+    assert issue in manager._freshness_issues(now + timedelta(minutes=20))
+
+
+@pytest.mark.parametrize("use_secondary", [False, True])
+@pytest.mark.parametrize("stale_primary", [False, True])
+def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monkeypatch, use_secondary, stale_primary):
     from unittest.mock import Mock
+
+    from custom_components.ha_energy_planner import forecasts
 
     now = datetime(2026, 10, 19, 20, 3, tzinfo=UTC)
     monkeypatch.setattr(inputs_module.dt_util, 'utcnow', lambda: now)
@@ -2420,6 +2482,20 @@ def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monke
                      'sensor.house': FakeState('1', {}, now), 'sensor.battery': FakeState('50', {}, now),
                      'sensor.soc': FakeState('40', {}, now), 'binary_sensor.connected': FakeState('on', {}, now),
                      'sensor.target': FakeState('80', {}, now)})
+    if use_secondary:
+        data[CONF_PV_FORECAST_SECONDARY] = "sensor.pv_secondary"
+        hass.states.values["sensor.pv"] = FakeState("1", {"forecast": [
+            {"valid_at": (now + timedelta(minutes=15)).isoformat(), "value": 1},
+        ]}, now)
+        hass.states.values["sensor.pv_secondary"] = FakeState("2", {
+            "forecast_interval_minutes": 30,
+            "forecast": [{"valid_at": (now - timedelta(minutes=2)).isoformat(), "value": 2}],
+        }, now - timedelta(hours=6))
+    if stale_primary:
+        hass.states.values["sensor.pv"] = FakeState("1", {
+            "forecast_interval_minutes": 30,
+            "forecast": [{"valid_at": (now - timedelta(minutes=2)).isoformat(), "value": 1}],
+        }, now - timedelta(hours=6))
     model = _constant_load_model('sensor.house', 1, now)
     for profile in model['profiles'].values():
         profile['expected'][21 * 4 + 1] = profile['upper'][21 * 4 + 1] = 10
@@ -2427,13 +2503,21 @@ def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monke
                 'planning_horizon_hours': 1, 'default_ready_by': '23:00'}, load_forecast_model=model)
     parse = Mock(wraps=inputs_module.parse_forecast_source)
     monkeypatch.setattr(inputs_module, "parse_forecast_source", parse)
+    prepare_tariff = Mock(wraps=forecasts._prepare_tariff_rows)
+    monkeypatch.setattr(forecasts, "_prepare_tariff_rows", prepare_tariff)
+    classify = Mock(wraps=inputs_module.forecast_timestamp_status_from_state)
+    monkeypatch.setattr(inputs_module, "forecast_timestamp_status_from_state", classify)
     read = Mock(wraps=hass.states.get)
     monkeypatch.setattr(hass.states, "get", read)
     context = manager.build_context()
     tail = next(s for s in context.slots if s.valid_at == now.replace(hour=21, minute=2))
     assert tail.end_at == now.replace(hour=21, minute=17)
     assert tail.baseline_load_forecast_kw == 2.2
-    assert parse.call_count == 3  # Import, export and PV across both grids.
+    # Boundary and slot prices share one row preparation per tariff entity.
+    assert prepare_tariff.call_count == 2
+    assert parse.call_count == 1 + use_secondary
+    assert classify.call_count == use_secondary
+    assert context.slots[0].pv_forecast_kw == (2.0 if use_secondary and not stale_primary else 1.0)
     assert read.call_args_list.count((("sensor.import",), {})) == 1
     assert read.call_args_list.count((("sensor.pv",), {})) == 1
 
@@ -2573,3 +2657,415 @@ def test_stale_captured_amber_payload_cannot_make_inputs_healthy(monkeypatch):
     detail = next(row for row in manager.forecast_coverage_details if row["config_key"] == CONF_AMBER_IMPORT_PRICE)
     assert detail["source_freshness"] == "stale"
     assert detail["next_retry_at"] is None
+
+
+@pytest.mark.parametrize("reorder_aliases", [False, True])
+def test_async_tariff_capture_handles_subclass_containers(monkeypatch, reorder_aliases):
+    import asyncio
+
+    from homeassistant.core import State
+
+    class ProviderRows(list):
+        def __init__(self, rows, *, provider):
+            super().__init__(rows)
+            self.provider = provider
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    debug = {}
+    for _ in range(800):
+        debug = {"nested": debug}
+    row = OrderedDict([
+        ("valid_at", now), ("Import Price", 0.25), ("importPrice", 0.50), ("debug", debug),
+    ])
+    tariff = State("sensor.tariff", "0.15", {"forecast": ProviderRows([row], provider="test")}, last_updated=now)
+    hass = FakeHass({tariff.entity_id: tariff})
+
+    async def async_add_executor_job(function, *args):
+        if reorder_aliases:
+            row.move_to_end("Import Price")
+        return await asyncio.to_thread(function, *args)
+
+    hass.async_add_executor_job = async_add_executor_job
+    manager = InputManager(hass, {CONF_AMBER_IMPORT_PRICE: tariff.entity_id}, DEFAULT_OPTIONS)
+    context = asyncio.run(manager.async_build_context())
+
+    if reorder_aliases:
+        assert context is None
+    else:
+        assert context is not None
+        assert context.slots[0].import_price == 0.25
+
+
+@pytest.mark.parametrize(("field", "malformed"), [
+    ("debug", "read_only_mapping"),
+    ("import_price", "read_only_mapping"),
+    ("import_price", "identity_only"),
+    ("import_price", "broken_copy"),
+])
+def test_async_tariff_capture_handles_malformed_row_attributes(monkeypatch, field, malformed):
+    import asyncio
+
+    from homeassistant.core import State
+
+    class BrokenCopy:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("provider value cannot be copied")
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    row = {
+        "start_time": now, "end_time": now + timedelta(minutes=30), "duration": 30,
+        "per_kwh": 0.25, "import_price": 0.25,
+    }
+    row[field] = {
+        "read_only_mapping": lambda: MappingProxyType({"details": "from provider"}),
+        "identity_only": object,
+        "broken_copy": BrokenCopy,
+    }[malformed]()
+    tariff = State("sensor.tariff", "0.15", {"forecast": [row]}, last_updated=now)
+    hass = FakeHass({tariff.entity_id: tariff})
+
+    async def async_add_executor_job(function, *args):
+        captured = args[0][tariff.entity_id].attributes["forecast"][0]
+        assert "debug" not in captured
+        assert captured["import_price"] is not row[field]
+        return await asyncio.to_thread(function, *args)
+
+    hass.async_add_executor_job = async_add_executor_job
+    manager = InputManager(hass, {CONF_AMBER_IMPORT_PRICE: tariff.entity_id}, DEFAULT_OPTIONS)
+    context = asyncio.run(manager.async_build_context())
+
+    assert context is not None
+    assert context.slots[0].import_price == (0.25 if field == "debug" else None)
+    assert manager.tariff_inputs_current()
+    if field == "import_price":
+        row[field] = 0.30
+        assert not manager.tariff_inputs_current()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_async_tariff_checks_read_only_configured_entities(monkeypatch, configured):
+    import asyncio
+
+    entity_id = "sensor.tariff"
+    hass = FakeHass({entity_id: FakeState("0.25")} if configured else {})
+    hass.async_add_executor_job = asyncio.to_thread
+    read_state = hass.states.get
+    reads = []
+
+    def count_read(entity):
+        reads.append(entity)
+        return read_state(entity)
+
+    monkeypatch.setattr(hass.states, "get", count_read)
+    manager = InputManager(hass, {CONF_AMBER_IMPORT_PRICE: entity_id} if configured else {}, DEFAULT_OPTIONS)
+    assert asyncio.run(manager.async_build_context()) is not None
+    assert manager.tariff_inputs_current()
+    assert "None" not in reads
+    assert reads.count(entity_id) == (3 if configured else 0)
+
+
+@pytest.mark.parametrize(("age_at_sample", "elapsed", "current"), [
+    (59, 2, False), (61, 2, True), (30, 2, True), (-1, 2, False), (59, 1, True),
+])
+def test_tariff_freshness_rechecked_after_sampling_same_state(monkeypatch, age_at_sample, elapsed, current):
+    import asyncio
+
+    from homeassistant.core import State
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    entity = "sensor.tariff"
+    state = State(entity, "0.25", last_updated=now - timedelta(seconds=age_at_sample))
+    hass = FakeHass({entity: state})
+    hass.async_add_executor_job = asyncio.to_thread
+    entry_data = {CONF_AMBER_IMPORT_PRICE: entity}
+    options = {**DEFAULT_OPTIONS, CONF_PRICE_FRESHNESS_MINUTES: 1}
+    manager = InputManager(hass, entry_data, options)
+    context = asyncio.run(manager.async_build_context())
+    assert context is not None
+    assert (f"{CONF_AMBER_IMPORT_PRICE}_stale" in context.input_issues) is (age_at_sample > 60)
+    assert manager.tariff_inputs_current()
+
+    now += timedelta(seconds=elapsed)
+    assert hass.states.get(entity) is state
+    assert manager.tariff_inputs_current() is current
+
+
+@pytest.mark.parametrize("during_worker", [False, True])
+@pytest.mark.parametrize(("change", "expected_current"), [
+    ("provider_metadata", True),
+    ("payload_last_updated", True),
+    ("same_update_time", True),
+    ("stale_point_source", False),
+    ("future_point_source", False),
+    ("export_update_time_fallback", False),
+    ("provider_issued_at", False),
+    ("scalar", False),
+    ("row", False),
+    ("missing", False),
+    ("appeared", False),
+])
+def test_async_tariff_state_replacement_compares_decision_evidence(
+    monkeypatch, during_worker, change, expected_current,
+):
+    import asyncio
+
+    from homeassistant.core import State
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    entity = "sensor.tariff"
+    attributes = {"provider_diagnostics": "initial"}
+    point_source = change in {"stale_point_source", "future_point_source"}
+    if not point_source:
+        attributes["forecast"] = [{
+            "start_time": now, "end_time": now + timedelta(minutes=30), "per_kwh": 0.25,
+        }]
+        if change != "export_update_time_fallback":
+            attributes["lastUpdated" if change == "payload_last_updated" else "Issued At"] = now.isoformat()
+    original_time = now - timedelta(seconds=1)
+    original = State(entity, "0.25", attributes, last_updated=original_time)
+    hass = FakeHass({} if change == "appeared" else {entity: original})
+    hass.services = SimpleNamespace(has_service=lambda *_args: False)
+
+    def publish_replacement():
+        if change == "missing":
+            del hass.states.values[entity]
+            return
+        updated = {**attributes, "provider_diagnostics": "changed"}
+        if change == "provider_issued_at":
+            updated["Issued At"] = original_time.isoformat()
+        if change == "row":
+            updated["forecast"] = [{**attributes["forecast"][0], "per_kwh": 0.1}]
+        timestamp = {
+            "same_update_time": original_time,
+            "stale_point_source": now - timedelta(hours=1),
+            "future_point_source": now + timedelta(seconds=1),
+        }.get(change, now)
+        hass.states.values[entity] = State(
+            entity, "0.1" if change == "scalar" else "0.25", updated, last_updated=timestamp,
+        )
+
+    async def finish_worker(function, *args):
+        if during_worker:
+            publish_replacement()
+        return await asyncio.to_thread(function, *args)
+
+    hass.async_add_executor_job = finish_worker
+    # Observing Export makes the state update time significant when its payload has no issue time.
+    manager = InputManager(hass, {CONF_AMBER_EXPORT_PRICE: entity}, DEFAULT_OPTIONS,
+                           observe_export_limit=not point_source)
+    context = asyncio.run(manager.async_build_context())
+    if during_worker:
+        assert (context is not None) is expected_current
+    else:
+        assert context is not None
+        publish_replacement()
+        assert manager.tariff_inputs_current() is expected_current
+
+
+@pytest.mark.parametrize("async_capture", [False, True])
+@pytest.mark.parametrize("has_alias", [False, True])
+def test_oversized_declared_tariff_price_leaves_planning_inputs_unavailable(monkeypatch, async_capture, has_alias):
+    import asyncio
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    entity_id = "sensor.tariff"
+    row = {"start_time": now, "end_time": now + timedelta(minutes=30), "duration": 30, "per_kwh": 10**400}
+    if has_alias:
+        row["import_price"] = 0.25
+    hass = FakeHass({entity_id: FakeState("0.15", {"forecast": [row]}, last_updated=now)})
+    hass.async_add_executor_job = asyncio.to_thread
+    manager = InputManager(hass, {CONF_AMBER_IMPORT_PRICE: entity_id}, DEFAULT_OPTIONS)
+
+    context = asyncio.run(manager.async_build_context()) if async_capture else manager.build_context()
+
+    assert context is not None
+    assert all(slot.import_price is None for slot in context.slots)
+    assert f"{CONF_AMBER_IMPORT_PRICE}_incomplete_horizon" in context.input_issues
+
+
+@pytest.mark.parametrize("available,invalid_tail", [(True, False), (True, True), (False, False)])
+@pytest.mark.parametrize("mutation", [None, "value", "type", "alias_order", "ignored_metadata", "ignored_row_metadata"])
+def test_async_tariff_capture_is_detached_and_validates_beyond_planning_horizon(
+    monkeypatch, available, invalid_tail, mutation,
+):
+    import asyncio
+    from threading import get_ident
+
+    from homeassistant.core import State
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    rows = [
+        {
+            "start_time": (now + timedelta(minutes=index * 30)).isoformat(),
+            "end_time": (now + timedelta(minutes=(index + 1) * 30)).isoformat(),
+            "duration": 30,
+            "per_kwh": 0.1,
+            "import_price": 0.3,
+            "export_price": 0.2,
+        }
+        for index in range(4)
+    ]
+    if invalid_tail:
+        rows[-1]["duration"] = "30"
+    first_row = rows[0]
+    if mutation == "type":
+        first_row["per_kwh"] = 1
+    if mutation == "alias_order":
+        first_row["Import Price"] = first_row.pop("import_price")
+        first_row["importPrice"] = 0.4
+    attributes = {"forecast": rows}
+    if mutation in {"ignored_metadata", "ignored_row_metadata"}:
+        debug = {}
+        (attributes if mutation == "ignored_metadata" else first_row)["debug"] = debug
+        for _ in range(600):
+            debug["nested"] = {}
+            debug = debug["nested"]
+    state = State("sensor.tariff", "0.15" if available else "unavailable", attributes, last_updated=now)
+    states = {"sensor.tariff": state}
+    hass = FakeHass(states)
+    main_thread = get_ident()
+    real_get = hass.states.get
+    reads = []
+    preparations = []
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 5}
+
+    def only_loop_reads(entity_id):
+        assert get_ident() == main_thread
+        reads.append(entity_id)
+        return real_get(entity_id)
+
+    real_tariff = inputs_module.TariffForecast
+
+    def only_worker_parses(attributes):
+        assert get_ident() != main_thread
+        preparations.append(attributes)
+        return real_tariff(attributes)
+
+    async def async_add_executor_job(fn, *args):
+        if mutation == "value":
+            first_row["import_price"] = 99
+        if mutation == "type":
+            first_row["per_kwh"] = True
+        if mutation == "alias_order":
+            first_row["Import Price"] = first_row.pop("Import Price")
+        if mutation in {"ignored_metadata", "ignored_row_metadata"}:
+            debug["changed"] = True
+        options["planning_interval_minutes"] = 15
+        return await asyncio.to_thread(fn, *args)
+
+    monkeypatch.setattr(inputs_module, "TariffForecast", only_worker_parses)
+    monkeypatch.setattr(hass.states, "get", only_loop_reads)
+    hass.async_add_executor_job = async_add_executor_job
+    manager = InputManager(
+        hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff", CONF_AMBER_EXPORT_PRICE: "sensor.tariff"},
+        options,
+    )
+    context = asyncio.run(manager.async_build_context())
+    assert len(preparations) == 1
+    original_row = preparations[0]["forecast"][0]
+    if mutation == "alias_order":
+        assert list(original_row)[-2:] == ["Import Price", "importPrice"]
+    else:
+        assert original_row["import_price"] == 0.3
+    if mutation == "type":
+        assert type(original_row["per_kwh"]) is int
+    assert "debug" not in preparations[0]
+    assert reads.count("sensor.tariff") == 2  # Capture and verify the same State after the worker.
+    if mutation in {"value", "type", "alias_order"}:
+        assert context is None
+        return
+    assert context is not None
+    assert context.slots[0].end_at == now + timedelta(minutes=5)
+    assert context.slots[0].import_price == (0.3 if available and not invalid_tail else None)
+    assert context.slots[0].export_price == (0.2 if available and not invalid_tail else None)
+    context.hvac_control["period_start"] = now.isoformat()
+    context.climate_inputs["tariff_intervals"] = []
+
+    def reject_live_reparse(*_args, **_kwargs):
+        pytest.fail("Legacy HVAC reads from the prepared worker result")
+
+    monkeypatch.setattr(inputs_module, "forecast_series_from_state", reject_live_reparse)
+    monkeypatch.setattr(inputs_module, "parse_forecast_source", reject_live_reparse)
+    legacy_slots = manager.retained_hvac_tariff_slots(context)
+    assert legacy_slots is not None
+    if available and not invalid_tail:
+        assert legacy_slots[0].import_price == 0.3
+    else:
+        assert not legacy_slots or legacy_slots[0].import_price is None
+
+
+@pytest.mark.parametrize("tariff_state", ["available", "unavailable", "missing"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_async_tariff_worker_samples_current_block_and_fresh_export_readback(monkeypatch, tariff_state, enabled):
+    import asyncio
+    from threading import get_ident
+
+    from custom_components.ha_energy_planner import enphase_export_limit
+    from custom_components.ha_energy_planner.const import (
+        CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+        CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
+    )
+
+    boundary = datetime(2026, 11, 4, 8, 30, tzinfo=UTC)
+    clock = boundary - timedelta(milliseconds=5)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: clock)
+    tariff = "sensor.tariff"
+    feedback = "sensor.export_limit"
+    rows = [
+        {"start_time": start.isoformat(), "end_time": (start + timedelta(minutes=30)).isoformat(),
+         "duration": 30, "per_kwh": price}
+        for start, price in ((boundary - timedelta(minutes=30), 0.1), (boundary, -0.1))
+    ]
+    states = {}
+    if tariff_state != "missing":
+        state = "0.1" if tariff_state == "available" else "unavailable"
+        states[tariff] = FakeState(state, {"forecasts": rows}, last_updated=clock)
+    hass = FakeHass(states)
+    hass.services = SimpleNamespace(has_service=lambda *_args: True)
+    registration = SimpleNamespace(platform="enphase_ev", domain="sensor", config_entry_id="site",
+                                   unique_id="site_export_limit", device_id="gateway")
+    monkeypatch.setattr(enphase_export_limit.er, "async_get", lambda _: SimpleNamespace(
+        async_get=lambda _: registration,
+    ))
+    main_thread = get_ident()
+    strict_parser = inputs_module.parse_export_tariff
+    parsed = []
+
+    def parse_in_worker(attributes, last_updated):
+        assert get_ident() != main_thread
+        parsed.append(last_updated)
+        return strict_parser(attributes, last_updated)
+
+    monkeypatch.setattr(inputs_module, "parse_export_tariff", parse_in_worker)
+
+    async def finish_worker(function, *args):
+        nonlocal clock
+        clock = boundary + timedelta(milliseconds=15)
+        hass.states.values[feedback] = FakeState("disabled", {
+            "confirmed_watts": None, "slew_rate": 1.0, "pending": False,
+            "last_successful_readback": clock.timestamp(),
+        }, last_updated=clock)
+        return await asyncio.to_thread(function, *args)
+
+    hass.async_add_executor_job = finish_worker
+    manager = InputManager(hass, {CONF_AMBER_EXPORT_PRICE: tariff, CONF_ENPHASE_EXPORT_LIMIT_ENTITY: feedback},
+                           {**DEFAULT_OPTIONS, CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: enabled},
+                           observe_export_limit=not enabled)
+    context = asyncio.run(manager.async_build_context())
+
+    assert context.created_at == clock
+    if tariff_state == "available":
+        assert context.slots[0].export_price == -0.1
+        assert context.export_limit["ready"]
+        assert context.export_limit["blocks"][0]["start"] == boundary.isoformat()
+        assert parsed == [boundary - timedelta(milliseconds=5)]
+    else:
+        assert context.slots[0].export_price is None
+        assert context.export_limit["reason"] == "export_tariff_unavailable"
+        assert not parsed

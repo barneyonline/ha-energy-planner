@@ -5,6 +5,7 @@ No Home Assistant I/O, speculative battery dispatch, or shared-EV scheduling.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -19,6 +20,9 @@ from .models import DecisionContext
 from .planning_grid import slot_end as interval_end
 
 MAX_EVALUATIONS = 2000
+_SOC_BAND_BOUNDARIES = (0, 60, 80, 90, 100)
+_SOC_BAND_STARTS = _SOC_BAND_BOUNDARIES[:-1]
+_SOC_BANDS = tuple((end, str(start)) for start, end in zip(_SOC_BAND_STARTS, _SOC_BAND_BOUNDARIES[1:], strict=True))
 
 
 class EVDecisionEvidence(TypedDict):
@@ -92,7 +96,7 @@ class Simulation:
 
 def _rate(context: DecisionContext, soc: float, fallback: float, *, expected: bool = False) -> float:
     model = context.ev_evidence.get("performance", {})
-    key = "0" if soc < 60 else "60" if soc < 80 else "80" if soc < 90 else "90"
+    _, key = _SOC_BANDS[bisect_right(_SOC_BAND_STARTS, soc, lo=1) - 1]
     band = model.get("bands", {}).get(key, {})
     aggregate = model.get("aggregate", {})
     row = band if band.get("sessions", 0) >= 3 and band.get("minutes", 0) >= 60 else aggregate
@@ -117,7 +121,7 @@ def _charge_interval(
     """Integrate delivered power and efficiency through learned SOC bands."""
     energy = duration = 0.0
     model = context.ev_evidence.get("performance", {})
-    for boundary, key in ((60.0, "0"), (80.0, "60"), (90.0, "80"), (100.0, "90")):
+    for boundary, key in _SOC_BANDS:
         endpoint = min(boundary, target)
         if endpoint <= soc:
             continue
@@ -317,12 +321,20 @@ def optimise_ev(
 
     daylight_enabled = bool(options.get("ev_daylight_lowest_cost_charging_enabled"))
     daylight_available = daylight_enabled and any(slot.daylight for slot in slots)
+    # Telemetry can carry an empty or immature model. Only a rate difference
+    # can make the two projections diverge; both apply the same delivery fraction.
+    projections_differ = any(
+        _rate(context, start, soc_per_kwh, expected=True) != _rate(context, start, soc_per_kwh)
+        for start in _SOC_BAND_STARTS
+    )
 
-    def delivery_power(index: int, power: float) -> float:
-        if (index == 0 and context.ev_charging is True
+    def project_delivery(soc: float, item: ChargeSlot, power: float) -> tuple[float, float, float, float]:
+        """Project conservative delivery for candidate ranking and final allocations."""
+        if (item.index == 0 and context.ev_charging is True
                 and context.ev_evidence.get("delivery_status") in {"stalled", "unavailable"}):
-            return 0.0
-        return power
+            power = 0.0
+        after, energy, hours = _charge_interval(context, soc, target, power, item.hours, soc_per_kwh)
+        return power, after, energy, hours
 
     def simulate(signature: tuple[tuple[int, float], ...]) -> Simulation | None:
         nonlocal action_limited_feasible
@@ -359,9 +371,10 @@ def optimise_ev(
             if continuous and started and not contiguous:
                 return None
             if previous_active and not contiguous:
-                dwell = timedelta(minutes=float(options.get("ev_min_dwell_minutes", 15)))
-                gap_eligible = all(i in by_index for i in range(max(powers, default=-1) + 1, index))
-                if selected_strategy == "adaptive" and gap_eligible:
+                if selected_strategy == "adaptive" and all(
+                    i in by_index for i in range(max(powers, default=-1) + 1, index)
+                ):
+                    dwell = timedelta(minutes=float(options.get("ev_min_dwell_minutes", 15)))
                     dwell_violations += int(previous_end - run_start < dwell)
                     dwell_violations += int(item.start - previous_end < dwell)
                 transitions += 1
@@ -374,14 +387,14 @@ def optimise_ev(
             previous_power = power
             previous_active = True
             started = True
-            prediction_power = delivery_power(index, power)
-            after, energy, duration_hours = _charge_interval(
-                context, soc, target, prediction_power, item.hours, soc_per_kwh
-            )
+            prediction_power, after, energy, duration_hours = project_delivery(soc, item, power)
             physical_end = item.start + timedelta(hours=duration_hours) if after >= target - 1e-6 else item.end
-            expected_after, expected_energy, expected_hours = _charge_interval(
-                context, expected_soc, target, prediction_power, item.hours, soc_per_kwh, expected=True
-            )
+            if projections_differ:
+                expected_after, expected_energy, expected_hours = _charge_interval(
+                    context, expected_soc, target, prediction_power, item.hours, soc_per_kwh, expected=True
+                )
+            else:
+                expected_after, expected_energy, expected_hours = after, energy, duration_hours
             if expected_completion is None and expected_after >= target - 1e-6:
                 expected_completion = item.start + timedelta(hours=expected_hours)
             # Missing delivery evidence cannot credit readiness, but a live
@@ -390,15 +403,16 @@ def optimise_ev(
             if prediction_power == 0:
                 expected_energy, expected_hours = power * item.hours, item.hours
             source = context.slots[index]
-            exposure_energy = expected_energy if prediction_power == 0 else energy
-            exposure_hours = expected_hours if prediction_power == 0 else duration_hours
-            _, _, exposure_grid = _charge_cost_components(
-                source, exposure_energy / exposure_hours if exposure_hours else 0,
-            )
-            increment = exposure_grid * exposure_hours * max(item.import_price - normal_limit, 0)
-            if extra + increment > budget + 1e-8:
-                return None
-            extra += increment
+            if not item.normal_price:
+                exposure_energy = expected_energy if prediction_power == 0 else energy
+                exposure_hours = expected_hours if prediction_power == 0 else duration_hours
+                _, _, exposure_grid = _charge_cost_components(
+                    source, exposure_energy / exposure_hours if exposure_hours else 0,
+                )
+                increment = exposure_grid * exposure_hours * (item.import_price - normal_limit)
+                if extra + increment > budget + 1e-8:
+                    return None
+                extra += increment
             expected_effective, _, expected_grid = _charge_cost_components(
                 source, expected_energy / expected_hours if expected_hours else 0
             )
@@ -670,9 +684,7 @@ def optimise_ev(
     soc = current_soc
     for index, power in best.powers.items():
         item = by_index[index]
-        after, energy, duration = _charge_interval(
-            context, soc, target, delivery_power(index, power), item.hours, soc_per_kwh,
-        )
+        _, after, energy, duration = project_delivery(soc, item, power)
         source = context.slots[index]
         effective, solar, grid = _charge_cost_components(source, energy / duration if duration else 0)
         best.schedule.allocations.append(EVChargeAllocation(

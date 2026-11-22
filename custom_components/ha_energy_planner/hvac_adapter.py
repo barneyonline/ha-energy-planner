@@ -147,6 +147,7 @@ class DaikinHVACAdapter:
         self._prior_mode_intent: dict[str, Any] | None = None
         self._async_cycle_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._command_callback: Callable[[dict[str, Any]], None] | None = None
+        self._acquisition_guard: Callable[[], str | None] | None = None
         self._last_commands: dict[str, dict[str, Any]] = {}
         self._abort_main_state: dict[str, Any] = {}
         self._command_started: dict[str, float] = {}
@@ -453,6 +454,16 @@ class DaikinHVACAdapter:
         finally:
             self._checking_takeover_readback = False
 
+    def set_acquisition_guard(self, guard: Callable[[], str | None]) -> None:
+        """Check plan authority immediately before the first takeover write."""
+        self._acquisition_guard = guard
+
+    def _authorize_acquisition(self) -> None:
+        if self._acquisition_guard is not None:
+            if (reason := self._acquisition_guard()) is not None:
+                raise _HVACTakeoverBlocked([], pre_dispatch_reason=reason)
+            self._acquisition_guard = None
+
     async def _async_command(
         self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any],
         *, emergency_off: bool = False, respect_manual_override: bool = True,
@@ -538,10 +549,13 @@ class DaikinHVACAdapter:
         tracks_confirmation = domain == "climate" or entity_id in pairs
         unconfirmed_before = self._unconfirmed_main_mode
         prior_confirmation = self._recovery_confirmation
+        acquiring = respect_manual_override and not scheduler_guard and not self._restoring_main_state
         if not tracks_confirmation and not scheduler_guard:
             self._check_pending_takeover_capability(respect_manual_override)
             if takeover_write:
                 self._check_followup_takeover(service)
+            if acquiring and (domain == "automation" or entity_id in self._zone_entities()):
+                self._authorize_acquisition()
         self._last_commands[entity_id] = record
         self._command_started[entity_id] = asyncio.get_running_loop().time()
         if tracks_confirmation:
@@ -592,6 +606,8 @@ class DaikinHVACAdapter:
                 self._check_pending_takeover_capability(respect_manual_override)
                 if takeover_write:
                     self._check_followup_takeover(service)
+                if acquiring:
+                    self._authorize_acquisition()
             except BaseException as error:  # Cancellation before dispatch is an unsent intent too.
                 self._unconfirmed_main_mode = unconfirmed_before
                 if isinstance(error, _HVACTakeoverBlocked):
@@ -981,6 +997,7 @@ class DaikinHVACAdapter:
         try:
             return await self._async_execute(action, automation_states)
         except _HVACTakeoverBlocked as blocked:
+            self._acquisition_guard = None
             suppression_failed = blocked.failed_suppression_pre_state is not None
             observed = blocked.failed_suppression_pre_state if suppression_failed else self._snapshot()
             assert observed is not None
@@ -1082,6 +1099,7 @@ class DaikinHVACAdapter:
                         )
             raise
         finally:
+            self._acquisition_guard = None
             self._awaiting_hvac_actuator = False
             self._deferred_zone_entities = None
 
@@ -1480,6 +1498,7 @@ class DaikinHVACAdapter:
         saved_main_state: dict[str, Any] | None = None,
     ) -> HVACCommandResult:
         """Restore transactionally, with independent off cleanup on every exception."""
+        self._acquisition_guard = None
         try:
             return await self._async_restore(saved_automation_states, saved_zone_states, saved_main_state)
         except BaseException as error:
@@ -2060,6 +2079,7 @@ class DaikinHVACAdapter:
         restore_main: bool = True,
     ) -> tuple[bool, dict[str, str], dict[str, Any], dict[str, Any]]:
         """Release every actuator acquired before a climate command failed."""
+        self._acquisition_guard = None
         await self._async_persist_requested_manual_supersessions()
         # Supersession persistence can deliver the first Dry feedback.
         self._observe_followup_takeover()

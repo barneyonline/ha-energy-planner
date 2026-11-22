@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 
 from .enphase_adapter import EnphaseCommandResult, EnphaseProfileAdapter
@@ -18,15 +19,26 @@ class EnphaseControlTransaction:
         self.now = now
         self.previous = EnphaseOwnership.from_mapping(store.data.get("ownership", {}))
 
-    async def _async_prepare(self, profile: str) -> None:
-        ownership = dict(self.store.data.get("ownership", {}))
-        EnphaseOwnership(self.previous.profile or profile, self.now).apply_to(ownership)
-        await self.store.async_save_ownership(ownership)
-        await self.store.async_flush()
-
-    async def async_execute(self, action: PlanAction) -> EnphaseCommandResult:
+    async def async_execute(
+        self,
+        action: PlanAction,
+        *,
+        dispatch_guard: Callable[[], str | None] | None = None,
+    ) -> EnphaseCommandResult:
         """Persist before dispatch; cancellation deliberately leaves recovery evidence."""
-        self.adapter.before_dispatch = self._async_prepare
+        rejected_before_dispatch = False
+
+        async def prepare(profile: str) -> str | None:
+            nonlocal rejected_before_dispatch
+            ownership = dict(self.store.data.get("ownership", {}))
+            EnphaseOwnership(self.previous.profile or profile, self.now).apply_to(ownership)
+            await self.store.async_save_ownership(ownership)
+            await self.store.async_flush()
+            reason = dispatch_guard() if dispatch_guard is not None else None
+            rejected_before_dispatch = reason is not None
+            return reason
+
+        self.adapter.before_dispatch = prepare
         try:
             result = await self.adapter.async_execute(action)
         finally:
@@ -45,4 +57,6 @@ class EnphaseControlTransaction:
         elif result.command_sent and result.saved_profile is not None:
             EnphaseOwnership(self.previous.profile or result.saved_profile, self.now).apply_to(ownership)
         await self.store.async_save_ownership(ownership)
+        if rejected_before_dispatch:
+            await self.store.async_flush()
         return result

@@ -17,6 +17,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
 )
 from custom_components.ha_energy_planner.models import (
@@ -92,6 +93,43 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     assert [event.uid for event in events] == ["ev-start", "climate-precondition"]
     assert "Planned state\n" in (events[1].description or "")
     assert "• Expected load: 2.20 kW\n• Conservative load: 2.70 kW" in (events[1].description or "")
+
+
+@pytest.mark.parametrize("explicit_plan", [False, True])
+def test_calendar_reuses_live_inputs_per_build(explicit_plan) -> None:
+    now = datetime.now(UTC)
+    actions = [
+        _action(f"ev-{index}", now + timedelta(minutes=index * 10), now + timedelta(minutes=index * 10 + 5))
+        for index in range(1, 9)
+    ]
+    plan = _plan(actions)
+
+    class CountedCoordinator(SimpleNamespace):
+        mapping_reads = 0
+        option_reads = 0
+        state_reads = 0
+
+        @property
+        def entry_data(self):
+            self.mapping_reads += 1
+            return {CONF_EV_CHARGING: "binary_sensor.charging"}
+
+        @property
+        def options(self):
+            self.option_reads += 1
+            return {CONF_EV_CONTROL_ENABLED: True}
+
+        def read_state(self, entity_id):
+            assert entity_id == "binary_sensor.charging"
+            self.state_reads += 1
+            return SimpleNamespace(state="off")
+
+    coordinator = CountedCoordinator(data=plan, store=SimpleNamespace(data={}))
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(get=coordinator.read_state))
+    for build_count in (1, 2):
+        events = calendar_module.calendar_event_records(coordinator, plan if explicit_plan else None)
+        assert [event["uid"] for event in events] == [action.action_id for action in actions]
+        assert (coordinator.mapping_reads, coordinator.option_reads, coordinator.state_reads) == (build_count,) * 3
 
 
 def test_calendar_handles_empty_plan_and_requested_ranges() -> None:

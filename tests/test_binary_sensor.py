@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityPlatformState
 
 from custom_components.ha_energy_planner import binary_sensor as binary_sensor_module
 from custom_components.ha_energy_planner.binary_sensor import (
@@ -18,6 +20,7 @@ from custom_components.ha_energy_planner.binary_sensor import (
 )
 from custom_components.ha_energy_planner.entity import RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
 from custom_components.ha_energy_planner.models import InputHealth
+from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
 
 class _AvailableStates:
@@ -48,6 +51,7 @@ def _armed_runtime(
 ) -> dict[str, object]:
     now = datetime.now(UTC)
     return {
+        "entry": SimpleNamespace(data=entry_data),
         "hass": SimpleNamespace(
             states=_AvailableStates(entry_data),
             services=_AvailableServices(),
@@ -99,6 +103,50 @@ def test_binary_sensor_setup_and_entity_state(monkeypatch: object) -> None:
     assert entity.extra_state_attributes["mode"] == "review"
 
 
+def test_armed_state_write_shares_fresh_readiness_with_attributes(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        reads = []
+
+        def armed_attrs(_coordinator):
+            armed = len(reads) % 2 == 0
+            reads.append(armed)
+            return {"armed": armed}
+
+        monkeypatch.setattr(binary_sensor_module, "_armed_attrs", armed_attrs)
+        coordinator = SimpleNamespace(
+            entry=SimpleNamespace(entry_id="entry-1"), last_update_success=True,
+            store=SimpleNamespace(data={}),
+        )
+
+        def make_entity(description):
+            entity = PlannerBinarySensor(coordinator, replace(description, translation_key=None))
+            entity.hass = hass
+            entity.platform = SimpleNamespace(platform_name="ha_energy_planner", domain="binary_sensor")
+            entity._platform_state = EntityPlatformState.ADDED
+            entity.entity_id = f"binary_sensor.{description.key}"
+            return entity
+
+        entity = make_entity(BINARY_SENSORS[0])
+        try:
+            for expected in (True, False):
+                entity.async_write_ha_state()
+                state = hass.states.get(entity.entity_id)
+                assert state is not None
+                assert state.state == ("on" if expected else "off")
+                assert state.attributes["armed"] is expected
+            climate = make_entity(BINARY_SENSORS[1])
+            climate.async_write_ha_state()
+            assert hass.states.get(climate.entity_id).state == "off"
+            assert reads == [True, False]
+            assert entity.is_on is True
+            assert entity.extra_state_attributes["armed"] is False
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
 def test_binary_sensor_attributes_use_shared_recorder_budget() -> None:
     coordinator = SimpleNamespace(entry=SimpleNamespace(entry_id="entry-1"))
     description = replace(
@@ -122,7 +170,7 @@ def test_armed_sensor_exposes_active_gate_and_pause_reason() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -162,7 +210,7 @@ def test_armed_sensor_keeps_unpaused_control_area_active() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -186,7 +234,7 @@ def test_armed_sensor_keeps_unpaused_control_area_active() -> None:
     assert attrs["available_control_areas"] == ["hvac"]
     assert attrs["paused_control_areas"] == ["ev"]
 
-    coordinator.effective_control = False
+    coordinator.active_control = False
     blocked_attrs = BINARY_SENSORS[0].attrs_fn(coordinator)
     assert blocked_attrs["armed"] is False
     assert blocked_attrs["reason"] == "active_control_not_ready"
@@ -201,7 +249,7 @@ def test_armed_sensor_rejects_unsafe_current_plan() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -236,7 +284,7 @@ def test_armed_sensor_rejects_stale_or_failed_refresh_evidence() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -282,7 +330,7 @@ def test_armed_sensor_does_not_treat_an_unavailable_area_as_unpaused_authority()
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -327,7 +375,7 @@ def test_armed_sensor_ignores_unrelated_optional_entity_availability() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -365,7 +413,7 @@ def test_armed_sensor_applies_keep_on_persistent_control_capability() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -398,7 +446,7 @@ def test_armed_sensor_requires_confidence_eligible_available_area() -> None:
                 "production": {
                     "armed": True,
                     "dry_run_ready_cycles": 3,
-                    "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                         entry_data,
                         options,
                     ),
@@ -553,7 +601,7 @@ def test_armed_sensor_explains_disarmed_and_armed_active_states() -> None:
     coordinator.store.data["production"] = {
         "armed": True,
         "dry_run_ready_cycles": 3,
-        "dry_run_evidence_fingerprint": binary_sensor_module.production_evidence_fingerprint(
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(
             entry_data,
             options,
         ),

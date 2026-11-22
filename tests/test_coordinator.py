@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ import pytest
 from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from custom_components.ha_energy_planner import advice_runtime as advice_runtime_module
@@ -28,6 +30,7 @@ from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
+    CONF_AMBER_IMPORT_PRICE,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
@@ -36,6 +39,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CHARGING,
@@ -49,6 +53,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
+    CONF_PRICE_FRESHNESS_MINUTES,
+    CONF_PV_FORECAST,
     HVAC_DRY_RELEASE_DURING_OFF_START,
     HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
@@ -80,6 +86,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _overrides_from_store,
     _parse_datetime_or_none,
     _pending_zone_hvac_manual_change_entity_id,
+    _PlanExecution,
     _seconds_until_next_interval_boundary,
     _snapshot_action_load_forecasts,
     _snapshot_actions,
@@ -774,7 +781,9 @@ class FakeHass:
 
     def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.state = CoreState.running
-        self.data = {}
+        self.data = {
+            "entity_registry": SimpleNamespace(async_get=lambda _: None, async_get_entity_id=lambda *_: None),
+        }
         self.states = FakeStates(values or {})
         self.services = SimpleNamespace(calls=[], async_call=self._async_call_service)
         self.created_tasks: list[object] = []
@@ -809,8 +818,15 @@ class FakeHass:
 class FakeStore:
     """Minimal planner store."""
 
+    async def async_publish_plan(self, stage, is_current):
+        if not is_current():
+            return None
+        result = stage()
+        return result if is_current() else None
+
     def __init__(self, data: dict[str, object] | None = None) -> None:
         self.data = data or {}
+        self.calendar_plan: EnergyPlan | None = None
         self.saved_plans: list[EnergyPlan] = []
         self.discovery: list[dict[str, object]] = []
         self.ev_charge_calibrations: list[dict[str, object]] = []
@@ -828,6 +844,9 @@ class FakeStore:
     async def async_save_plan(
         self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None = None,
     ) -> None:
+        self.record_plan(plan, calendar_events=calendar_events)
+
+    def record_plan(self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None) -> None:
         self.saved_plans.append(plan)
         self.data["saved_calendar_events"] = calendar_events
         if calendar_events is not None:
@@ -845,15 +864,21 @@ class FakeStore:
         self.record_calendar_events(events, now=now)
         return self.data["calendar_history"]
 
-    def record_calendar_events(self, events, *, now=None, location=None) -> None:
+    def record_calendar_events(self, events, *, now=None, location=None) -> bool:
         from custom_components.ha_energy_planner.calendar_history import update_calendar_history
 
-        self.data["calendar_history"] = update_calendar_history(
-            self.data.get("calendar_history"), events, now or datetime.now(UTC), replace_plan=False, location=location,
+        previous = self.data.get("calendar_history")
+        history = update_calendar_history(
+            previous, events, now or datetime.now(UTC), replace_plan=False, location=location,
         )
+        if history == previous:
+            return False
+        self.data["calendar_history"] = history
+        return True
 
     async def async_flush(self) -> None:
         pass
+
 
     async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
         self.data["restore_notification_failures"] = failures
@@ -910,13 +935,22 @@ class FakeStore:
         self.snapshot_ai.append((plan_id, metadata))
 
     async def async_add_forecast_snapshot(self, snapshot: dict[str, object]) -> None:
+        self.record_forecast_snapshot(snapshot)
+
+    def record_forecast_snapshot(self, snapshot: dict[str, object]) -> None:
         self.forecast_snapshots.append(snapshot)
 
     async def async_add_dry_run_comparison(self, comparison: dict[str, object]) -> None:
+        self.record_dry_run_comparison(comparison)
+
+    def record_dry_run_comparison(self, comparison: dict[str, object]) -> None:
         self.dry_run_comparisons.append(comparison)
         self.data["dry_run_comparisons"] = [comparison]
 
     async def async_save_production(self, production: dict[str, object]) -> None:
+        self.record_production(production)
+
+    def record_production(self, production: dict[str, object]) -> None:
         self.production_saves.append(production)
         self.data["production"] = production
 
@@ -924,11 +958,19 @@ class FakeStore:
         self.control_pause_saves.append(pause)
         self.data["control_pause"] = pause
 
-    @asynccontextmanager
-    async def async_delay_save(self) -> object:
+    @contextmanager
+    def defer_save(self):
         self.delay_entered = True
         yield
         self.delay_exited = True
+
+    @asynccontextmanager
+    async def async_delay_save(self):
+        with self.defer_save():
+            yield
+
+    async def async_flush_deferred(self) -> None:
+        pass
 
 
 class FakeExecutor:
@@ -956,7 +998,7 @@ class FakeExecutor:
         self.startup_recovery_dismissals = 0
         self.notification_grace_until: datetime | None = None
 
-    async def async_evaluate(self, plan: EnergyPlan, context: object) -> PlanAction | None:
+    async def async_evaluate(self, plan: EnergyPlan, context: object, *, plan_is_current=None) -> PlanAction | None:
         self.evaluated.append((plan, context))
         return None
 
@@ -1282,12 +1324,13 @@ def test_keep_on_option_accepts_persistent_control_and_runs_option_update() -> N
 
 def test_coordinator_records_refresh_duration_in_memory() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._refresh_generation = 0
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
     expected = _plan("refresh-duration")
 
-    async def update_locked(*, defer_execution: bool = False) -> EnergyPlan:
-        assert defer_execution is True
+    async def update_locked(*, defer_execution: bool, defer_publication: bool) -> EnergyPlan:
+        assert defer_execution and defer_publication
         coordinator._pending_refresh_trigger = "newer_request"
         return expected
 
@@ -1352,8 +1395,8 @@ def test_coordinator_records_failed_refresh() -> None:
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
 
-    async def update_locked(*, defer_execution: bool = False) -> EnergyPlan:
-        assert defer_execution is True
+    async def update_locked(*, defer_execution: bool, defer_publication: bool) -> EnergyPlan:
+        assert defer_execution and defer_publication
         raise RuntimeError("failed refresh")
 
     coordinator._async_update_data_locked = update_locked
@@ -1561,6 +1604,8 @@ def test_material_state_change_canonicalizes_camel_case_forecast_attributes() ->
         ("intervalMinutes", 30, 15),
         ("resolutionMinutes", 30, 15),
         ("detailedForecast", [{"value": 1.0}], [{"value": 2.0}]),
+        ("importPrice", {"2026-06-27T10:00:00+00:00": 0.2}, {"2026-06-27T10:00:00+00:00": 0.3}),
+        ("exportPrice", {"2026-06-27T10:00:00+00:00": 0.1}, {"2026-06-27T10:00:00+00:00": 0.05}),
     )
 
     for key, old_value, new_value in changes:
@@ -1574,6 +1619,78 @@ def test_material_state_change_canonicalizes_camel_case_forecast_attributes() ->
             ),
             {"material_change_threshold_percent": 5},
         ), key
+
+
+@pytest.mark.parametrize(("attributes", "update"), [
+    ({"interval_minutes": 30, "intervalMinutes": 30}, {"intervalMinutes": 15}),
+    (
+        {"detailed_forecast": [0.2], "detailedForecast": [0.2]},
+        {"detailedForecast": [0.3]},
+    ),
+])
+def test_tariff_alias_change_is_material_even_if_other_spelling_is_unchanged(attributes, update):
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    old = FakeState("0.2", attributes, last_updated=now)
+    new = FakeState("0.2", {**attributes, **update}, last_updated=now)
+    data = {CONF_AMBER_IMPORT_PRICE: "sensor.price"}
+    hass = FakeHass({"sensor.price": old})
+    baseline = _decision_input_fingerprint(hass, data, {}, [], now=now)
+
+    hass.states.values["sensor.price"] = new
+    assert coordinator_module._material_attributes_changed(old, new)
+    assert _decision_input_fingerprint(hass, data, {}, [], now=now) != baseline
+
+
+@pytest.mark.parametrize(("before", "after", "material"), [
+    (
+        {"forecasts": [{"Import Price": 0.2, "importPrice": 0.4}]},
+        {"forecasts": [{"importPrice": 0.4, "Import Price": 0.2}]},
+        True,
+    ),
+    ({"forecasts": [{"per_kwh": 1}]}, {"forecasts": [{"per_kwh": True}]}, True),
+    ({"forecasts": [{"per_kwh": 1}]}, {"forecasts": ({"per_kwh": 1},)}, True),
+    ({"issuedAt": "2026-06-27T00:00:00Z"}, {"issuedAt": "2026-06-26T23:20:00Z"}, True),
+    ({}, {"forecastIssuedAt": "2026-06-27T00:00:00Z"}, True),
+    ({"generated_at": "2026-06-27T00:00:00Z"}, {}, True),
+    (
+        {"generatedTime": "2026-06-27T00:00:00Z"},
+        {"generatedTime": "2026-06-26T23:20:00Z"},
+        True,
+    ),
+    (
+        {"forecast_generated_at": "2026-06-27T00:00:00Z"},
+        {"forecast_generated_at": "2026-06-26T23:20:00Z"},
+        True,
+    ),
+    (
+        {"forecasts": [{"per_kwh": 1, "diagnostic": "previous"}], "friendly_name": "previous"},
+        {"forecasts": [{"per_kwh": 1, "diagnostic": "current"}], "friendly_name": "current"},
+        False,
+    ),
+])
+def test_tariff_fingerprint_and_listener_track_validation_inputs(monkeypatch, before, after, material):
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    data = {CONF_AMBER_IMPORT_PRICE: "sensor.price"}
+    old = FakeState("0.2", before, last_updated=now)
+    new = FakeState("0.2", after, last_updated=now)
+    hass = FakeHass({"sensor.price": old})
+    baseline = _decision_input_fingerprint(hass, data, {}, [], now=now)
+    coordinator = _coordinator_for_runtime_services(entry_data=data, hass=hass)
+    coordinator._schedule_next_boundary_refresh = Mock()
+    coordinator._schedule_debounced_refresh = Mock()
+    track = Mock(return_value=lambda: None)
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event", track)
+    coordinator.async_start_listeners()
+
+    hass.states.values["sensor.price"] = new
+    track.call_args.args[2](FakeEvent(
+        "sensor.price", "0.2", "0.2", old_attributes=old.attributes, new_attributes=new.attributes,
+    ))
+    if material:
+        coordinator._schedule_debounced_refresh.assert_called_once_with("state_change")
+    else:
+        coordinator._schedule_debounced_refresh.assert_not_called()
+    assert (_decision_input_fingerprint(hass, data, {}, [], now=now) != baseline) is material
 
 
 def test_overrides_restored_only_when_active() -> None:
@@ -1957,11 +2074,12 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
 
 def test_async_update_data_uses_lock_and_delay_save() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._refresh_generation = 0
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
 
-    async def fake_locked(*, defer_execution: bool = False) -> EnergyPlan:
-        assert defer_execution is True
+    async def fake_locked(*, defer_execution: bool, defer_publication: bool) -> EnergyPlan:
+        assert defer_execution and defer_publication
         return _plan("locked")
 
     coordinator._async_update_data_locked = fake_locked
@@ -1975,15 +2093,16 @@ def test_async_update_data_uses_lock_and_delay_save() -> None:
 
 def test_async_update_data_schedules_device_execution_after_refresh_scopes_exit() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._refresh_generation = 1
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
     plan = _plan("deferred-execution")
     context = object()
-    request = (1, plan, context, {"planner_enabled": True})
+    request = _PlanExecution(1, plan, context, {"planner_enabled": True})
     scheduled: list[object] = []
 
-    async def fake_locked(*, defer_execution: bool = False) -> EnergyPlan:
-        assert defer_execution is True
+    async def fake_locked(*, defer_execution: bool, defer_publication: bool) -> EnergyPlan:
+        assert defer_execution and defer_publication
         assert coordinator._planner_lock.locked() is True
         assert coordinator.store.delay_entered is True
         assert not hasattr(coordinator.store, "delay_exited")
@@ -2018,6 +2137,8 @@ def test_plan_execution_releases_refresh_lock_and_coalesces_newer_plans() -> Non
                 self,
                 plan: EnergyPlan,
                 context: object,
+                *,
+                plan_is_current=None,
             ) -> PlanAction | None:
                 self.evaluated.append((plan, context))
                 if plan.plan_id == "first":
@@ -2040,7 +2161,7 @@ def test_plan_execution_releases_refresh_lock_and_coalesces_newer_plans() -> Non
         skipped = _plan("skipped")
         newest = _plan("newest")
 
-        coordinator._schedule_plan_execution((1, first, object(), {}))
+        coordinator._schedule_plan_execution(_PlanExecution(1, first, object(), {}))
         execution_task = coordinator._plan_execution_task
         assert execution_task is not None
         await asyncio.wait_for(started.wait(), timeout=1)
@@ -2051,9 +2172,9 @@ def test_plan_execution_releases_refresh_lock_and_coalesces_newer_plans() -> Non
         coordinator._planner_lock.release()
 
         coordinator._refresh_generation = 2
-        coordinator._schedule_plan_execution((2, skipped, object(), {}))
+        coordinator._schedule_plan_execution(_PlanExecution(2, skipped, object(), {}))
         coordinator._refresh_generation = 3
-        coordinator._schedule_plan_execution((3, newest, object(), {}))
+        coordinator._schedule_plan_execution(_PlanExecution(3, newest, object(), {}))
         release.set()
         await asyncio.wait_for(execution_task, timeout=1)
         return [plan.plan_id for plan, _context in coordinator.executor.evaluated]
@@ -2070,11 +2191,13 @@ def test_plan_execution_failure_does_not_strand_newer_plan_and_notifies() -> Non
                 self,
                 plan: EnergyPlan,
                 context: object,
+                *,
+                plan_is_current=None,
             ) -> PlanAction | None:
                 self.evaluated.append((plan, context))
                 if plan.plan_id == "failed":
                     coordinator._refresh_generation = 2
-                    coordinator._pending_plan_execution = (
+                    coordinator._pending_plan_execution = _PlanExecution(
                         2,
                         _plan("newer"),
                         object(),
@@ -2088,7 +2211,7 @@ def test_plan_execution_failure_does_not_strand_newer_plan_and_notifies() -> Non
         coordinator.executor = FailingExecutor()
         coordinator._command_lock = asyncio.Lock()
         coordinator._plan_execution_task = object()
-        coordinator._pending_plan_execution = (1, _plan("failed"), object(), {})
+        coordinator._pending_plan_execution = _PlanExecution(1, _plan("failed"), object(), {})
         coordinator._tearing_down = False
         coordinator._refresh_generation = 1
         coordinator.async_update_listeners = lambda: updates.append("updated")
@@ -2162,7 +2285,11 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     coordinator.store.data["execution_audit"] = []
     callback(FakeEvent("climate.daikin", "off", "heat"))
     callback(FakeEvent("sensor.ev_soc", "50", "51"))
-    callback(FakeEvent("sensor.price", "100", "110"))
+    callback(FakeEvent(
+        "sensor.price", "100", "100",
+        old_attributes={"importPrice": {"2026-06-27T10:00:00+00:00": 0.2}},
+        new_attributes={"importPrice": {"2026-06-27T10:00:00+00:00": 0.3}},
+    ))
 
     assert len(coordinator.hass.created_tasks) == 1
     assert coordinator._refresh_generation == 1
@@ -2692,12 +2819,12 @@ def test_current_planner_result_can_defer_execution_until_refresh_scopes_exit() 
     assert result is plan
     assert coordinator.store.saved_plans == [plan]
     assert coordinator.executor.evaluated == []
-    assert coordinator._deferred_plan_execution == (3, plan, context, options)
+    assert coordinator._deferred_plan_execution == _PlanExecution(3, plan, context, options)
 
 
 def test_plan_execution_scheduler_handles_teardown_and_tracks_admitted_task() -> None:
     plan = _plan("scheduled")
-    request = (1, plan, object(), {})
+    request = _PlanExecution(1, plan, object(), {})
     coordinator = _coordinator_for_runtime_services()
     coordinator._plan_execution_task = None
     coordinator._pending_plan_execution = None
@@ -2715,7 +2842,7 @@ def test_plan_execution_scheduler_handles_teardown_and_tracks_admitted_task() ->
 def test_plan_execution_drain_and_executor_drop_stale_generations() -> None:
     coordinator = _coordinator_for_runtime_services()
     coordinator._plan_execution_task = object()
-    coordinator._pending_plan_execution = (1, _plan("stale-drain"), object(), {})
+    coordinator._pending_plan_execution = _PlanExecution(1, _plan("stale-drain"), object(), {})
     coordinator._refresh_generation = 2
 
     asyncio.run(coordinator._async_drain_plan_execution())
@@ -2732,6 +2859,85 @@ def test_plan_execution_drain_and_executor_drop_stale_generations() -> None:
         )
     )
     assert coordinator.executor.evaluated == []
+
+
+@pytest.mark.parametrize("plan_uses_current_options", [False, True])
+def test_queued_plan_rechecks_published_options_before_the_update_listener(plan_uses_current_options):
+    async def run():
+        owner = _coordinator_for_runtime_services(options={"grid_import_limit_kw": 10})
+        plan = _plan("queued-before-config-listener")
+        plan.actions = [_coordinated_action(plan, "ev-start", ActionAsset.EV, ActionKind.EV_START)]
+        context = object()
+        generation = owner._refresh_generation
+        async with owner._command_lock:
+            if plan_uses_current_options:
+                owner.entry.options["grid_import_limit_kw"] = 2
+            owner.data = await owner._async_commit_plan_if_current(
+                generation, plan, context, owner.planner_options, execute=False,
+            )
+            owner._pending_plan_execution = owner._deferred_plan_execution
+            drain = asyncio.create_task(owner._async_drain_plan_execution())
+            await asyncio.sleep(0)
+            assert not drain.done()
+            owner.entry.options["grid_import_limit_kw"] = 2
+            assert owner._refresh_generation == generation
+
+        await drain
+        assert owner.data is plan
+        assert owner.executor.evaluated == ([(plan, context)] if plan_uses_current_options else [])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["tariff_before_dispatch", "tariff_between_actions", "mapped_entity"])
+def test_deferred_plan_rechecks_decision_inputs_before_device_actions(change):
+    async def run():
+        rows = [0.10, 0.20]
+        tariff = FakeState("0.10", {"forecast": rows}, datetime.now(UTC))
+        owner = _coordinator_for_runtime_services(
+            entry_data={CONF_AMBER_IMPORT_PRICE: "sensor.tariff", CONF_EV_CHARGER: "switch.original_charger"},
+            hass=FakeHass({"sensor.tariff": tariff}),
+        )
+        owner._schedule_debounced_refresh = Mock()
+        generation = owner._refresh_generation
+        manager = coordinator_module.InputManager(owner.hass, owner.entry_data, owner.planner_options)
+        context = await manager.async_build_context()
+        assert context is not None
+        plan = _plan("deferred-inputs")
+        first = _coordinated_action(plan, "ev-start", ActionAsset.EV, ActionKind.EV_START)
+        second = _coordinated_action(plan, "hvac-start", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+        plan.actions = [first, second]
+
+        async def evaluate(action_plan, decision_context, *, plan_is_current=None):
+            owner.executor.evaluated.append((action_plan, decision_context))
+            rows[0] = 0.95
+            return first
+
+        if change == "tariff_between_actions":
+            owner.executor.async_evaluate = evaluate
+        async with owner._command_lock:
+            owner.data = await owner._async_commit_plan_if_current(
+                generation, plan, context, owner.planner_options, execute=False,
+                mapped_entry_data=owner.entry_data,
+                tariffs_current=manager.tariff_inputs_current,
+            )
+            assert owner.data is plan
+            owner._pending_plan_execution = owner._deferred_plan_execution
+            drain = asyncio.create_task(owner._async_drain_plan_execution())
+            await asyncio.sleep(0)
+            assert not drain.done()
+            if change == "tariff_before_dispatch":
+                rows[0] = 0.95
+            if change == "mapped_entity":
+                owner.entry.data[CONF_EV_CHARGER] = "switch.replacement_charger"
+            assert owner.hass.states.get("sensor.tariff") is tariff
+            assert owner._refresh_generation == generation
+
+        await drain
+        assert owner.executor.evaluated == ([(plan, context)] if change == "tariff_between_actions" else [])
+        owner._schedule_debounced_refresh.assert_called_once_with("execution_inputs_changed", force=True)
+
+    asyncio.run(run())
 
 
 def test_startup_recovery_validation_commits_without_executing() -> None:
@@ -2934,7 +3140,9 @@ def test_current_plan_skips_safety_action_consumed_ahead_of_next_action() -> Non
     coordinator = _coordinator_for_commit(None, current_generation=3)
 
     class SafetySelectingExecutor(FakeExecutor):
-        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> PlanAction | None:
+        async def async_evaluate(
+            self, evaluated_plan: EnergyPlan, evaluated_context: object, *, plan_is_current=None,
+        ) -> PlanAction | None:
             await super().async_evaluate(evaluated_plan, evaluated_context)
             return release_action if len(evaluated_plan.actions) > 1 else None
 
@@ -2965,7 +3173,9 @@ def test_current_plan_stops_coordinated_actions_after_generation_changes() -> No
     coordinator.hass = FakeHass()
 
     class InvalidatingExecutor(FakeExecutor):
-        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> None:
+        async def async_evaluate(
+            self, evaluated_plan: EnergyPlan, evaluated_context: object, *, plan_is_current=None,
+        ) -> None:
             await super().async_evaluate(evaluated_plan, evaluated_context)
             coordinator._refresh_generation += 1
 
@@ -3000,7 +3210,9 @@ def test_current_plan_stops_coordinated_actions_when_teardown_starts() -> None:
     coordinator = _coordinator_for_commit(None, current_generation=3)
 
     class TeardownExecutor(FakeExecutor):
-        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> None:
+        async def async_evaluate(
+            self, evaluated_plan: EnergyPlan, evaluated_context: object, *, plan_is_current=None,
+        ) -> None:
             await super().async_evaluate(evaluated_plan, evaluated_context)
             coordinator._tearing_down = True
 
@@ -3403,7 +3615,7 @@ def test_plan_refresh_never_starts_ai_and_cancels_an_obsolete_manual_request() -
     assert cancelled == [True]
     assert coordinator._ai_advice_pending_fingerprint is None
     assert coordinator._ai_current_plan_fingerprint == _material_plan_fingerprint(replacement)
-    assert updates == ["updated"]
+    assert updates == []
 
     coordinator._ai_advice_task = None
     unsafe = _plan("unsafe")
@@ -4614,13 +4826,13 @@ def test_decision_fingerprint_bounds_large_forecast_attributes() -> None:
             for index in range(MAX_FORECAST_SOURCE_ROWS + 300)]
     state = FakeState("0", {"forecast": rows}, last_updated=now)
     hass = FakeHass({"sensor.price": state})
-    entry_data = {"amber_import_price_entity": "sensor.price"}
+    entry_data = {CONF_PV_FORECAST: "sensor.price"}
     first = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
-    rows[0]["value"] = "outside-planning-input"
-    state.last_updated = now + timedelta(seconds=1)
+    rows[0]["value"] = "inside-fingerprint-limit"
     assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now) != first
     first = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
-    rows[MAX_FORECAST_SOURCE_ROWS + 10]["value"] = "inside-planning-input"
+    rows[MAX_FORECAST_SOURCE_ROWS + 10]["value"] = "outside-fingerprint-limit"
+    assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now) == first
     state.last_updated = now + timedelta(seconds=2)
     assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now) != first
     nested: Any = "leaf"
@@ -4640,84 +4852,221 @@ def test_material_change_detects_changed_tail_outside_fingerprint_row_cap() -> N
     assert coordinator_module._material_attributes_changed(old, new)
 
 
-def test_dry_zone_registry_changes_refresh_fingerprint_with_identical_states(monkeypatch: pytest.MonkeyPatch) -> None:
-    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
-    hass = FakeHass({
-        head: FakeState("dry", {"temperature": 22}),
-        main: FakeState("dry", {"zone_id": 0}),
-        bedroom: FakeState("dry", {"zone_id": 1}),
-    })
-    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
-    other = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="other")
-    registry = dict.fromkeys((head, main, bedroom), daikin)
-    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
-    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [main, bedroom]}
-    options = {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+@pytest.mark.parametrize("layout", ["long_list", "long_time_map", "nested_list"])
+def test_refresh_does_not_reuse_plan_with_incomplete_tariff_fingerprint(monkeypatch, layout):
+    from custom_components.ha_energy_planner.forecasts import MAX_FORECAST_SOURCE_ROWS
 
-    def fingerprint() -> str:
-        capabilities = coordinator_module.CapabilityDiscovery(hass, entry_data, options)
-        dry_hvac = capabilities.hvac_evidence_in_dry()
-        assert capabilities.inspect(hvac=dry_hvac).hvac is dry_hvac
-        return _decision_input_fingerprint(hass, entry_data, options, [], now=now, dry_hvac=dry_hvac)
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    current = {"valid_at": now.isoformat(), "price": 0.2}
+    if layout == "nested_list":
+        forecast = {"data": {"data": {"data": {"data": [current]}}}}
+    else:
+        history_times = [
+            (now - timedelta(minutes=30 * offset)).isoformat()
+            for offset in range(MAX_FORECAST_SOURCE_ROWS, 0, -1)
+        ]
+        if layout == "long_list":
+            forecast = [{"valid_at": at, "price": 0.1} for at in history_times] + [current]
+        else:
+            forecast = {**dict.fromkeys(history_times, 0.1), now.isoformat(): current}
 
-    both_zones = fingerprint()
-    assert fingerprint() == both_zones
-    registry[bedroom] = other
-    main_only = fingerprint()
-    registry[main] = other
-    no_zones = fingerprint()
-    assert len({both_zones, main_only, no_zones}) == 3
-    registry[bedroom] = daikin
-    assert fingerprint() not in {both_zones, main_only, no_zones}
-    registry[main] = daikin
-    assert fingerprint() == both_zones
-
-
-def test_dry_registry_verification_refreshes_rollback_faults_without_state_changes(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
-    switches = ["switch.main", "switch.bedroom"]
-    hass = FakeHass({
-        head: FakeState("dry", {"temperature": 22}),
-        main: FakeState("dry", {"zone_id": 0, "temperature": 10**5000}),
-        bedroom: FakeState("dry", {"zone_id": 1, "temperature": "malformed"}),
-        **dict.fromkeys(switches, "on"),
-    })
-    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
-    registry = dict.fromkeys([head, main, bedroom, switches[0]], daikin)
-    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
-    coordinator = _coordinator_for_runtime_services(
-        hass=hass,
-        entry_data={
-            CONF_DAIKIN_CLIMATE: head,
-            CONF_CLIMATE_ZONES: [main, bedroom, *switches],
-            "hvac_zone_control": {
-                "pairs": {switches[0]: main, switches[1]: bedroom},
-                "safe_open_sets": [switches],
-            },
-        },
-        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False},
+    entity = "sensor.import_tariff"
+    provider_state = FakeState("0.2", {"forecast": forecast}, now)
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: entity}, hass=FakeHass({entity: provider_state}),
     )
+    owner._schedule_plan_execution = Mock()
+    owner._schedule_tariff_validity_retry = Mock()
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
 
-    async def run() -> None:
-        coordinator.data = await coordinator._async_update_data_locked()
-        assert "climate_zone_target_unavailable" not in coordinator.data.input_issues
-        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_absent_in_dry_mode"] == []
+    async def refresh_twice():
+        owner.data = await owner._async_update_data()
+        assert owner._last_decision_context.slots[0].import_price == pytest.approx(0.2)
+        assert owner._last_decision_fingerprint is None
 
-        registry[switches[1]] = daikin
-        plan = await coordinator._async_update_data_locked()
-        assert "climate_zone_target_unavailable" in plan.input_issues
-        assert HVAC_DRY_ZONE_TARGETS_ABSENT not in plan.input_issues
-        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_unavailable"] == [main, bedroom]
-        assert coordinator.executor.fallback[0] is plan
+        # The provider changes a live row without issuing a new State event.
+        current["price"] = 0.6
+        assert owner.hass.states.get(entity) is provider_state
+        owner.data = await owner._async_update_data()
+        assert owner._last_decision_context.slots[0].import_price == pytest.approx(0.6)
+        assert owner._refresh_counters["computed"] == 2
 
-    asyncio.run(run())
-    assert f"issue=climate_zone_target_unavailable entities={main}" in caplog.text
-    assert f"issue=climate_zone_target_unavailable entities={bedroom}" in caplog.text
+    asyncio.run(refresh_twice())
+
+
+@pytest.mark.parametrize("excess", ["integer", "text", "fields"])
+def test_refresh_validates_keyed_tariffs_beyond_the_fingerprint_budget(monkeypatch, excess):
+    from custom_components.ha_energy_planner.forecasts import MAX_FORECAST_SOURCE_ROWS
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.import_tariff"
+
+    def row(start):
+        return {
+            "valid_at": start.isoformat(),
+            "start_time": start.isoformat(),
+            "end_time": (start + timedelta(minutes=30)).isoformat(),
+            "duration": 30,
+            "per_kwh": 0.2,
+            "import_price": 0.2,
+            "unit": "$/kWh",
+            "unit_of_measurement": "$/kWh",
+        }
+
+    current = row(now)
+    rows = [current]
+    if excess == "fields":
+        rows.extend(row(now - timedelta(minutes=30 * offset)) for offset in range(1, MAX_FORECAST_SOURCE_ROWS))
+    else:
+        current["duration"] = 1 << 15_000 if excess == "integer" else "9" * 257
+    state = FakeState("0.2", {"import_price": rows}, now)
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: entity}, hass=FakeHass({entity: state}),
+    )
+    owner._schedule_plan_execution = Mock()
+    owner._schedule_tariff_validity_retry = Mock()
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+
+    async def refresh():
+        owner.data = await owner._async_update_data()
+        assert owner.data is not None
+        assert owner._last_decision_fingerprint is None
+        expected_price = 0.2 if excess == "fields" else None
+        assert owner._last_decision_context.slots[0].import_price == expected_price
+
+    asyncio.run(refresh())
+
+
+def test_refresh_replans_when_native_tariff_price_becomes_an_enum(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PriceCode(IntEnum):
+        PRICE = 1
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.import_tariff"
+    row = {
+        "start_time": now,
+        "end_time": (now + timedelta(minutes=30)).isoformat(),
+        "duration": 30,
+        "per_kwh": 1,
+    }
+    state = FakeState("1", {"forecast": [row]}, now)
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: entity}, hass=FakeHass({entity: state}),
+    )
+    owner._schedule_plan_execution = Mock()
+    owner._schedule_tariff_validity_retry = Mock()
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+
+    async def refresh() -> None:
+        owner.data = await owner._async_update_data()
+        assert owner._last_decision_context.slots[0].import_price == 1
+        assert await owner._async_update_data() is owner.data
+
+        # JSON serializes an IntEnum as its integer, but native tariff rows
+        # require an exact numeric type. The provider changed the row in place.
+        row["per_kwh"] = PriceCode.PRICE
+        owner.data = await owner._async_update_data()
+        assert owner._last_decision_context.slots[0].import_price is None
+        assert owner._last_decision_fingerprint is None
+        assert owner._refresh_counters["computed"] == 2
+
+    asyncio.run(refresh())
+
+
+def test_decision_fingerprint_preserves_the_type_of_tariff_timestamp_keys() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.import_tariff"
+    state = FakeState("0.2", {"forecast": {now: 0.2}}, now)
+    hass = FakeHass({entity: state})
+    entry_data = {CONF_AMBER_IMPORT_PRICE: entity}
+
+    datetime_key = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
+    state.attributes["forecast"] = {str(now): 0.2}
+    string_key = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
+
+    assert datetime_key is not None
+    assert string_key is not None
+    assert datetime_key != string_key
+
+
+def test_refresh_fingerprint_replans_when_unchanged_tariff_expires(monkeypatch):
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.import_tariff"
+    state = FakeState("0.2", {"forecast": [{"valid_at": now.isoformat(), "price": 0.2}]},
+                      now - timedelta(seconds=59))
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: entity}, hass=FakeHass({entity: state}),
+        options={CONF_PRICE_FRESHNESS_MINUTES: 1},
+    )
+    owner._schedule_plan_execution = Mock()
+    owner._schedule_tariff_validity_retry = Mock()
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    stale_issue = f"{CONF_AMBER_IMPORT_PRICE}_stale"
+
+    async def refresh():
+        nonlocal now
+        owner.data = await owner._async_update_data()
+        assert stale_issue not in owner.data.input_issues
+        now += timedelta(seconds=1)
+        assert await owner._async_update_data() is owner.data
+
+        now += timedelta(seconds=1)
+        assert owner.hass.states.get(entity) is state
+        owner.data = await owner._async_update_data()
+        assert stale_issue in owner.data.input_issues
+        assert owner._refresh_counters["computed"] == 2
+        assert await owner._async_update_data() is owner.data
+        assert owner._refresh_counters["fingerprint_skipped"] == 2
+
+    asyncio.run(refresh())
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_refresh_fingerprint_matches_the_tariff_sampled_after_preparation(
+    monkeypatch: pytest.MonkeyPatch, oversized: bool,
+) -> None:
+    from custom_components.ha_energy_planner.forecasts import MAX_FORECAST_SOURCE_ROWS
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    row = {"valid_at": now.isoformat(), "price": 0.2}
+    entity = "sensor.import_tariff"
+    provider_state = FakeState("0.2", {"forecast": [row]}, now)
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: entity}, hass=FakeHass({entity: provider_state}),
+    )
+    owner._schedule_plan_execution = Mock()
+    owner._schedule_tariff_validity_retry = Mock()
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+
+    async def refresh_three_times() -> None:
+        entered, resume = asyncio.Event(), asyncio.Event()
+        save_discovery = owner.store.async_save_discovery
+
+        async def pause_discovery(report: dict[str, object]) -> None:
+            entered.set()
+            await resume.wait()
+            await save_discovery(report)
+
+        owner.store.async_save_discovery = pause_discovery
+        first = asyncio.create_task(owner._async_update_data())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        row["price"] = 0.6
+        if oversized:
+            provider_state.attributes["forecast"] = [row] * (MAX_FORECAST_SOURCE_ROWS + 1)
+        resume.set()
+        owner.data = await first
+        assert owner._last_decision_context.slots[0].import_price == pytest.approx(0.6)
+
+        # Changing the original State in place leaves its timestamp and generation intact.
+        row["price"] = 0.2
+        provider_state.attributes["forecast"] = [row]
+        owner.data = await owner._async_update_data()
+        assert owner._last_decision_context.slots[0].import_price == pytest.approx(0.2)
+        assert owner._refresh_counters["computed"] == 2
+        assert await owner._async_update_data() is owner.data
+        assert owner._refresh_counters["fingerprint_skipped"] == 1
+
+    asyncio.run(refresh_three_times())
 
 
 @pytest.mark.parametrize("through_refresh,disabled_export_mapping", [(False, False), (True, False), (True, True)])
@@ -4759,132 +5108,241 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
         assert getattr(coordinator, "_export_reconcile_task", None) is None
 
 
-@pytest.mark.parametrize(
-    ("stored_loss", "completion_during_refresh"),
-    [(None, False), (None, True), ("hvac_acquisition_rollback_failed", False)],
-)
-def test_refresh_queues_recheck_of_provisional_dry_only_release(
-    monkeypatch: pytest.MonkeyPatch, stored_loss: str | None, completion_during_refresh: bool,
-) -> None:
-    head, zone = "climate.daikin", "climate.zone"
-    hass = FakeHass({head: FakeState("dry", {"temperature": 22}), zone: FakeState("dry", {"zone_id": 0})})
-    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
-    registry = dict.fromkeys((head, zone), native)
-    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
-    monkeypatch.setattr(
-        coordinator_module.InputManager, "_health_from_issues", staticmethod(lambda _: InputHealth.HEALTHY),
+@pytest.mark.parametrize(("invalidation", "forced", "through_refresh"), [
+    ("generation", True, True), ("generation", False, True), ("generation", False, False),
+    ("teardown", True, True), ("tariff", False, True), ("first_tariff", False, True),
+])
+def test_tariff_worker_completion_does_not_plan_from_invalidated_context(invalidation, forced, through_refresh):
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: "sensor.price"},
+        hass=FakeHass({"sensor.price": FakeState("0.20", last_updated=datetime.now(UTC))}),
     )
-    main = {"hvac_mode": "off", "target_temperature": 22}
-    control = {"main_state": main, "attempt_snapshot": {"main_state": main, "zone_states": {}}}
-    if stored_loss:
-        control["required_evidence_lost"] = stored_loss
-    coordinator = _coordinator_for_runtime_services(
-        hass=hass,
-        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
-        options={CONF_PLANNER_ENABLED: True, CONF_CLIMATE_CONTROL_ENABLED: True,
-                 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
-        store_data={"ownership": {"hvac_control": control}},
-    )
+    owner.data = _plan("existing") if invalidation != "first_tariff" else None
+    owner._last_decision_fingerprint = None
+    owner._schedule_tariff_validity_retry = Mock()
+    followup = owner.async_request_refresh = AsyncMock()
+    direct_followup = owner.async_refresh = AsyncMock()
+    schedule_refresh = owner._schedule_debounced_refresh = Mock()
+    owner._force_next_refresh = forced
 
-    def confirm_off_start() -> None:
-        hass.states.values[head] = FakeState("cool", {"temperature": 21})
-        hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
-        coordinator.store.data["ownership"]["hvac_control"] = {"main_state": main, "main_state_committed": True}
-
-    save_discovery = coordinator.store.async_save_discovery
-
-    async def save_discovery_then_confirm(discovery: dict[str, Any]) -> None:
-        await save_discovery(discovery)
-        confirm_off_start()
-
-    if completion_during_refresh:
-        monkeypatch.setattr(coordinator.store, "async_save_discovery", save_discovery_then_confirm)
-
-    async def run() -> None:
-        plan = await coordinator._async_update_data_locked(defer_execution=True)
-        release = next(action for action in plan.actions if action.kind == ActionKind.RELEASE_HVAC)
-        assert HVAC_DRY_ZONE_TARGETS_ABSENT in plan.input_issues
-        assert release.desired_state.get(HVAC_DRY_RELEASE_DURING_OFF_START, False) is (stored_loss is None)
-        assert control.get("required_evidence_lost") == stored_loss
-
-        # The earlier transaction can finish under the command lock before
-        # this release reaches the executor. Keep unrelated release reasons.
-        if not completion_during_refresh:
-            confirm_off_start()
-        executor = coordinator_module.Executor(
-            coordinator.store, hass=hass, entry_data=coordinator.entry_data, options=coordinator.options,
-        )
-        executor.async_release_hvac_control = AsyncMock()
-        coordinator.store.async_add_outcome = AsyncMock()
-        assert await executor.async_evaluate(plan) is release
-        if stored_loss is None:
-            executor.async_release_hvac_control.assert_not_awaited()
-            outcome = coordinator.store.async_add_outcome.await_args.args[0]
-            assert outcome.reason == "hvac_off_start_confirmed"
+    async def executor(function, *args):
+        assert function.__name__ == "_prepare_tariff_sources"
+        if invalidation == "teardown":
+            owner._tearing_down = True
+        elif invalidation in {"tariff", "first_tariff"}:
+            # The scalar and event generation remain the same. This attribute
+            # can change the parsed evidence without being a material event.
+            replacement = FakeState("0.20", {"per_kwh": [0.2, "bad"]}, last_updated=datetime.now(UTC))
+            owner.hass.states.values["sensor.price"] = replacement
         else:
-            executor.async_release_hvac_control.assert_awaited_once()
+            owner._mark_replan_requested()
+        return function(*args)
 
-    asyncio.run(run())
+    owner.hass.async_add_executor_job = executor
+    refresh = owner._async_update_data if through_refresh else owner._async_update_data_locked
+    if invalidation == "first_tariff":
+        with pytest.raises(UpdateFailed, match="before the first plan was ready"):
+            asyncio.run(refresh())
+    else:
+        assert asyncio.run(refresh()) is owner.data
+    if through_refresh:
+        assert not owner.last_refresh_metadata["succeeded"]
+    owner._schedule_tariff_validity_retry.assert_not_called()
+    followup.assert_not_called()
+    assert direct_followup.call_count == int(not through_refresh)
+    if through_refresh and invalidation in {"generation", "tariff"}:
+        schedule_refresh.assert_called_once_with(
+            "refresh_superseded", mode=coordinator_module._RefreshMode.IMMEDIATE, force=True,
+        )
+    else:
+        schedule_refresh.assert_not_called()
+    assert owner._force_next_refresh is (invalidation != "teardown" and (forced or through_refresh))
+    assert owner._refresh_generation == (0 if invalidation == "teardown" else 1)
 
 
-@pytest.mark.parametrize("execution_observes_exit", [False, True])
-def test_transient_dry_refusal_invalidates_an_unchanged_plan(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, execution_observes_exit: bool,
-) -> None:
-    from custom_components.ha_energy_planner.preconditioning import current_status
+@pytest.mark.parametrize(("has_plan", "stage"), [
+    (False, "worker"), (True, "worker"), (True, "notification"),
+    (False, "flush"), (True, "flush"), (True, "shutdown"), (True, "calendar"),
+])
+def test_superseded_planner_result_does_not_certify_freshness(monkeypatch, has_plan, stage):
+    owner = _coordinator_for_runtime_services()
+    previous = _plan("published") if has_plan else None
+    owner.data = previous
+    owner.store.calendar_plan = previous
+    if has_plan:
+        owner.store.data["active_plan"] = {"plan_id": previous.plan_id}
+    previous_context = owner._last_decision_context = object()
+    owner._schedule_plan_execution = Mock()
+    clock = datetime(2026, 11, 21, 8, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock)
+    invalidated = False
+    schedule_refresh = owner._schedule_debounced_refresh = Mock()
+    record_plan = owner.store.record_plan
 
-    head, zone = "climate.daikin", "climate.zone"
-    cool_states = {
-        head: FakeState("cool", {"temperature": 22}),
-        zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
-    }
-    hass = FakeHass(dict(cool_states))
-    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
-    registry = dict.fromkeys(cool_states, daikin)
-    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
-    coordinator = _coordinator_for_runtime_services(
-        hass=hass,
-        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
-        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    def save_candidate(plan, *, calendar_events):
+        owner.store.data["active_plan"] = {"plan_id": plan.plan_id}
+        record_plan(plan, calendar_events=calendar_events)
+
+    async def notify(plan, violations):
+        if stage == "notification":
+            owner._mark_replan_requested()
+
+    async def worker(function, *args):
+        assert function.__name__ == "create_plan"
+        plan = function(*args)
+        if stage == "worker":
+            owner._mark_replan_requested()
+        return plan
+
+    publish_plan = owner.store.async_publish_plan
+
+    async def pause_publication(stage_plan, is_current):
+        nonlocal invalidated
+        if stage in {"flush", "shutdown"} and not invalidated:
+            await asyncio.sleep(0)
+            invalidated = True
+            assert owner._last_decision_context is previous_context
+            assert owner.store.calendar_plan is previous
+            assert not owner.store.production_saves
+            if stage == "shutdown":
+                owner._begin_shutdown()
+            else:
+                owner._mark_replan_requested()
+            owner.store.data["execution_audit"] = [{"reason": "confirmation_during_flush"}]
+        return await publish_plan(stage_plan, is_current)
+
+    owner.hass.async_add_executor_job = worker
+    owner.store.async_publish_plan = pause_publication
+    owner.store.record_plan = save_candidate
+    owner.executor.async_notify_plan_fallback = notify
+    if stage == "calendar":
+        from custom_components.ha_energy_planner import calendar
+
+        def invalidate_calendar(*_args):
+            owner._mark_replan_requested()
+            return []
+
+        monkeypatch.setattr(calendar, "calendar_event_records", invalidate_calendar)
+    if has_plan:
+        assert asyncio.run(owner._async_update_data()) is previous
+    else:
+        with pytest.raises(UpdateFailed, match="before the first plan was ready"):
+            asyncio.run(owner._async_update_data())
+    assert not owner.last_refresh_metadata["succeeded"]
+    assert owner._force_next_refresh is (stage != "shutdown")
+    assert owner._last_decision_context is previous_context
+    assert owner.store.calendar_plan is previous
+    assert owner.store.data.get("active_plan") == ({"plan_id": previous.plan_id} if has_plan else None)
+    assert not owner.store.production_saves
+    if has_plan and stage != "shutdown":
+        schedule_refresh.assert_called_once_with(
+            "refresh_superseded", mode=coordinator_module._RefreshMode.IMMEDIATE, force=True,
+        )
+    else:
+        schedule_refresh.assert_not_called()
+    owner._schedule_plan_execution.assert_not_called()
+    assert not owner.store.forecast_snapshots
+    assert not owner.store.dry_run_comparisons
+    if stage in {"flush", "shutdown"}:
+        assert owner.store.data["execution_audit"] == [{"reason": "confirmation_during_flush"}]
+    if stage == "flush":
+        assert asyncio.run(owner._async_update_data()) is not previous
+        assert owner.last_refresh_metadata["succeeded"]
+
+
+@pytest.mark.parametrize("timed", [False, True])
+def test_direct_refresh_keeps_fingerprint_if_inputs_change_during_save(timed):
+    owner = _coordinator_for_runtime_services()
+    owner.data = _plan("published")
+    owner._last_decision_fingerprint = ("previous",)
+    previous_context = owner._last_decision_context = object()
+    owner._async_create_listener_task = lambda coroutine: coroutine.close()
+
+    publish_plan = owner.store.async_publish_plan
+
+    async def invalidate(stage_plan, is_current):
+        await asyncio.sleep(0)
+        owner._mark_replan_requested()
+        return await publish_plan(stage_plan, is_current)
+
+    async def refresh():
+        token = coordinator_module.CURRENT_REFRESH.set(coordinator_module.RefreshTiming()) if timed else None
+        try:
+            return await owner._async_update_data_locked(defer_execution=True)
+        finally:
+            if token is not None:
+                coordinator_module.CURRENT_REFRESH.reset(token)
+
+    owner.store.async_publish_plan = AsyncMock(side_effect=invalidate)
+    assert asyncio.run(refresh()) is owner.data
+    owner.store.async_publish_plan.assert_awaited_once()
+    assert owner._last_decision_fingerprint == ("previous",)
+    assert owner._last_decision_context is previous_context
+    assert not owner.store.saved_plans
+    assert not owner.store.forecast_snapshots
+    assert not owner.store.production_saves
+
+
+def test_retained_plan_refresh_is_invalidated_during_operational_flush():
+    owner = _coordinator_for_runtime_services()
+    previous = owner.data = _plan("retained")
+    owner._async_update_data_locked = AsyncMock(return_value=previous)
+    owner._schedule_debounced_refresh = Mock()
+
+    async def flush():
+        owner._mark_replan_requested()
+
+    owner.store.async_flush_deferred = flush
+    assert asyncio.run(owner._async_update_data()) is previous
+    assert owner.last_refresh_metadata["succeeded"] is False
+    owner._schedule_debounced_refresh.assert_called_once_with(
+        "refresh_superseded", mode=coordinator_module._RefreshMode.IMMEDIATE, force=True,
     )
-    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
 
-    def observe_execution() -> None:
-        discovery = coordinator_module.CapabilityDiscovery(hass, coordinator.entry_data, coordinator.options)
-        coordinator._log_dry_takeover_transition(bool(discovery.dry_takeover_issues()))
 
-    async def run() -> None:
-        original = await coordinator._async_update_data_locked()
-        coordinator.data = original
-        original.device_plans.setdefault("climate", {})["preconditioning"] = {
-            "status": "scheduled", "reason": "preconditioning_planned",
-        }
-        hass.states.values[head] = FakeState("dry", {"temperature": 22})
-        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
-        observe_execution()
-        refusal = {
-            "plan_id": original.plan_id, "asset": "daikin", "kind": "set_hvac", "result": "rejected",
-            "reason": HVAC_DRY_ZONE_TARGETS_ABSENT, "capability_issues": [HVAC_DRY_ZONE_TARGETS_ABSENT],
-        }
-        coordinator.store.data["execution_audit"] = [refusal]
-        assert current_status(coordinator.store.data, original)["reason"] == HVAC_DRY_ZONE_TARGETS_ABSENT
+@pytest.mark.parametrize("forced", [False, True])
+def test_fingerprint_cannot_certify_generation_changed_during_preparation(monkeypatch, forced):
+    owner = _coordinator_for_runtime_services()
+    previous = owner.data = _plan("retained")
+    owner._force_next_refresh = forced
+    owner._last_decision_fingerprint = "unchanged"
+    owner._schedule_debounced_refresh = Mock()
+    fingerprint = Mock(return_value="unchanged")
+    monkeypatch.setattr(coordinator_module, "_decision_input_fingerprint", fingerprint)
 
-        hass.states.values.update(cool_states)
-        if execution_observes_exit:
-            observe_execution()
-        recovered = await coordinator._async_update_data_locked()
-        assert recovered.plan_id != original.plan_id
-        assert current_status(coordinator.store.data, recovered)["reason"] != HVAC_DRY_ZONE_TARGETS_ABSENT
-        assert refusal in coordinator.store.data["execution_audit"]
-        coordinator.data = recovered
-        assert await coordinator._async_update_data_locked() is recovered
+    async def prepare_outage(_outage):
+        owner._mark_replan_requested()
 
-    asyncio.run(run())
-    assert caplog.messages.count("Daikin Dry mode no longer blocks HVAC takeover") == 1
+    owner._async_save_load_source_outage = prepare_outage
+    assert asyncio.run(owner._async_update_data()) is previous
+    assert owner.last_refresh_metadata["succeeded"] is False
+    fingerprint.assert_not_called()
+    owner._schedule_debounced_refresh.assert_called_once_with(
+        "refresh_superseded", mode=coordinator_module._RefreshMode.IMMEDIATE, force=True,
+    )
+
+
+def test_tariff_worker_drops_overrides_expired_at_context_time(monkeypatch):
+    clock = datetime(2026, 11, 21, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock)
+    owner = _coordinator_for_runtime_services(
+        entry_data={CONF_AMBER_IMPORT_PRICE: "sensor.price"},
+        hass=FakeHass({"sensor.price": FakeState("0.20", last_updated=clock)}),
+    )
+    expiry = clock + timedelta(seconds=1)
+    expired = Override("manual_ev_charging", "user", expiry, "start")
+    retained = Override("manual_ev_charging", "user", expiry + timedelta(minutes=1), "stop")
+    owner.overrides = [expired, retained]
+
+    async def worker(function, *args):
+        nonlocal clock
+        if function.__name__ == "_prepare_tariff_sources":
+            clock = expiry
+        return function(*args)
+
+    owner.hass.async_add_executor_job = worker
+    asyncio.run(owner._async_update_data_locked(defer_execution=True))
+    assert owner._last_decision_context.active_overrides == [retained]
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -5094,7 +5552,7 @@ def test_update_data_locked_records_dry_run_comparison(
         "custom_components.ha_energy_planner.coordinator.InputManager",
         lambda *args, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {},
-            build_context=lambda overrides: context,
+            async_build_context=AsyncMock(return_value=context),
             retained_hvac_tariff_slots=lambda context: None,
             thermal_sample=lambda built_context: {},
             forecast_training_slots=[],
@@ -5478,6 +5936,7 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
         refreshes.append("refresh")
 
     coordinator.async_request_refresh = request_refresh
+    coordinator.async_refresh = request_refresh
     asyncio.run(coordinator.async_set_ready_by("08:10"))
     asyncio.run(coordinator.async_set_ev_low_price_threshold(0.07))
     asyncio.run(coordinator.async_manual_ev_charging(True))
@@ -6304,7 +6763,7 @@ def test_effective_control_requires_active_intent_and_current_preflight(monkeypa
     monkeypatch.setattr(
         coordinator_module,
         "build_preflight_report",
-        lambda hass, coordinator_arg: report,
+        lambda hass, coordinator_arg, **kwargs: report,
     )
     monkeypatch.setattr(
         startup_recovery_module,
@@ -6313,6 +6772,12 @@ def test_effective_control_requires_active_intent_and_current_preflight(monkeypa
     )
 
     assert coordinator.effective_control is True
+
+    coordinator._export_operator_arm = coordinator_module._ExportOperatorArm({"armed": False})
+    assert coordinator.effective_control is False
+    coordinator._export_operator_arm = coordinator_module._ExportOperatorArm({"armed": True})
+    assert coordinator.effective_control is True
+    coordinator._export_operator_arm = None
 
     report["active_control_ready"] = False
     assert coordinator.effective_control is False
@@ -8290,6 +8755,25 @@ def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:
     assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 3
 
 
+@pytest.mark.parametrize(("mode", "export_pending"), [
+    (PlannerMode.ACTIVE_HEALTHY, False), (PlannerMode.DRY_RUN, True),
+])
+@pytest.mark.parametrize("health", [InputHealth.HEALTHY, InputHealth.UNSAFE])
+def test_production_evidence_skips_discovery_when_a_plan_cannot_earn_credit(monkeypatch, mode, export_pending, health):
+    coordinator = _coordinator_for_runtime_services(store_data={"production": {"dry_run_ready_cycles": 2}})
+    coordinator._export_reconcile_pending = export_pending
+    plan = _plan("no-review-credit")
+    plan.mode, plan.health = mode, health
+    discovery = Mock()
+    monkeypatch.setattr(coordinator_module, "_runtime_control_area_report", discovery)
+
+    production = coordinator._production_evidence_for_plan(plan, [], coordinator.entry_data, coordinator.options)
+
+    discovery.assert_not_called()
+    assert production["dry_run_ready_cycles"] == 2
+    assert production.get("last_blocking_reason") == ("input_health_unsafe" if health == InputHealth.UNSAFE else None)
+
+
 def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None:
     coordinator = _coordinator_for_runtime_services(
         options={CONF_DEFAULT_READY_BY: "07:00", "ev_control_enabled": True},
@@ -8321,8 +8805,8 @@ def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution(monkeyp
         cancel=lambda: calls.append("execution"),
     )
     coordinator._plan_execution_task = execution_task
-    coordinator._pending_plan_execution = (1, _plan("pending"), object(), {})
-    coordinator._deferred_plan_execution = (1, _plan("deferred"), object(), {})
+    coordinator._pending_plan_execution = _PlanExecution(1, _plan("pending"), object(), {})
+    coordinator._deferred_plan_execution = _PlanExecution(1, _plan("deferred"), object(), {})
     coordinator._unsub_listeners = [
         lambda: calls.append("listener_1"),
         lambda: calls.append("listener_2"),
@@ -8406,6 +8890,30 @@ def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: 
     assert len(coordinator.hass.created_tasks) == 2
     assert scheduled[0] == (-2, "old_debounce_cancelled")
     assert scheduled[2] == (-3, "old_boundary_cancelled")
+
+
+@pytest.mark.parametrize("early", [datetime.resolution, timedelta(hours=1)])
+def test_planning_boundary_rearms_after_clock_correction(monkeypatch, early):
+    clock = datetime(2026, 11, 21, 10, tzinfo=UTC)
+    owner = _coordinator_for_runtime_services()
+    owner.async_update_listeners = Mock()
+    owner._schedule_debounced_refresh = Mock()
+    callbacks = []
+
+    def schedule(_, delay, callback):
+        callbacks.append(callback)
+        return lambda: None
+
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock)
+    monkeypatch.setattr(coordinator_module, "async_call_later", schedule)
+    owner._schedule_next_boundary_refresh()
+    deadline = clock + timedelta(minutes=5)
+    clock = deadline - early
+    callbacks[0](clock)
+
+    expected = deadline + timedelta(minutes=5) if early == datetime.resolution else clock + timedelta(minutes=5)
+    assert owner._planning_boundary_at == expected
+    owner._schedule_debounced_refresh.assert_called_once_with("interval_boundary", debounce_seconds=0)
 
 
 def test_planning_boundary_keeps_its_deadline_during_material_events(monkeypatch):
@@ -8514,6 +9022,9 @@ def _coordinator_for_runtime_services(
     coordinator.last_update_success = True
     coordinator._debounce_cancel = None
     coordinator._boundary_cancel = None
+    coordinator._calendar_feedback_flush_needed = False
+    coordinator._calendar_feedback_flush_pending = False
+    coordinator._ev_allocation_deadline = None
     coordinator._ev_auto_start_retry_cancel = None
     coordinator._ev_auto_start_compensation_pending = False
     coordinator._ev_auto_start_compensation_generation = 0
@@ -9169,7 +9680,14 @@ def test_charge_now_persists_bounded_intent_and_clears_delayed_compensation() ->
     from unittest.mock import AsyncMock
 
     coordinator = _coordinator_for_runtime_services()
-    coordinator._last_decision_context = SimpleNamespace(plan_id="fresh")
+    refresh = coordinator.async_refresh
+
+    async def refresh_context():
+        await refresh()
+        coordinator._last_decision_context = SimpleNamespace(plan_id="fresh")
+        coordinator._last_decision_generation = coordinator._refresh_generation
+
+    coordinator.async_refresh = refresh_context
     coordinator._async_reconcile_vehicle_ownership = AsyncMock()
     coordinator.executor.async_manual_ev_charging = AsyncMock(return_value=SimpleNamespace(applied=True))
     coordinator.store.async_save_overrides = AsyncMock()
@@ -9243,7 +9761,6 @@ def test_committed_full_load_recovery_wakes_validation_but_degraded_plan_does_no
         coordinator = _coordinator_for_runtime_services()
         coordinator._load_recovery_ready = asyncio.Event()
         coordinator._load_recovery_pending = True
-        coordinator.store.async_save_plan = AsyncMock()
         context = SimpleNamespace(ev_evidence={"load_recovery_completed": True})
         plan = _plan("recovering")
         plan.health = InputHealth.DEGRADED
@@ -9261,7 +9778,7 @@ def test_committed_full_load_recovery_wakes_validation_but_degraded_plan_does_no
         # A wake-up never arms or dispatches a device; the existing full
         # validation and restore/preflight boundaries still decide authority.
         assert not coordinator.store.data.get("production", {}).get("armed")
-        assert coordinator._deferred_plan_execution[1] is plan
+        assert coordinator._deferred_plan_execution.plan is plan
         await startup_recovery_module._wait_for_load_recovery(coordinator, 0.001)
         assert not coordinator._load_recovery_ready.is_set()
     asyncio.run(run())
@@ -9596,6 +10113,106 @@ def test_calendar_observation_captures_queued_start_and_stop_without_replanning(
     asyncio.run(run())
 
 
+def test_equivalent_calendar_feedback_merges_once_and_flushes_only_changes(monkeypatch):
+    from custom_components.ha_energy_planner import calendar as calendar_module
+    from custom_components.ha_energy_planner import storage as storage_module
+
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                        lambda self, hass, **kwargs: setattr(self, "data", None))
+    started = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    clock = [started + timedelta(seconds=10)]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+    save = AsyncMock()
+    monkeypatch.setattr(storage_module, "Store", Mock(return_value=SimpleNamespace(async_save=save)))
+    merge = Mock(wraps=storage_module.update_calendar_history)
+    monkeypatch.setattr(storage_module, "update_calendar_history", merge)
+    render = Mock(wraps=calendar_module.calendar_event_records)
+    monkeypatch.setattr(calendar_module, "calendar_event_records", render)
+
+    async def run():
+        hass = FakeHass({"climate.main": "cool"})
+        get_state = hass.states.get
+        charging = SimpleNamespace(state="on", last_changed=started, attributes={})
+        read_state = Mock(side_effect=lambda entity: charging if entity == "sensor.charging" else get_state(entity))
+        hass.states.get = read_state
+        tasks = []
+
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+
+        hass.async_create_task = create_task
+        store = storage_module.PlannerStore(hass)
+        coordinator = EnergyPlannerCoordinator(hass, FakeEntry(
+            {CONF_DAIKIN_CLIMATE: "climate.main", CONF_EV_CHARGING: "sensor.charging"},
+            {CONF_CLIMATE_CONTROL_ENABLED: True, CONF_EV_CONTROL_ENABLED: True},
+        ), store)
+        coordinator.executor = FakeExecutor()
+        plan = _plan("running-climate")
+        plan.created_at = started
+        action = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+        action.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+        plan.actions = [action, _coordinated_action(plan, "charging", ActionAsset.EV, ActionKind.EV_START)]
+        coordinator.data = plan
+        store.data["ownership"] = {"hvac_control": {
+            "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
+        }}
+        coordinator.async_start_listeners()
+        read_state.reset_mock()
+
+        def feedback():
+            callbacks[0](FakeEvent(
+                "climate.main", "cool", "cool", old_attributes={"current_temperature": 24.1},
+                new_attributes={"current_temperature": 24.2},
+            ))
+
+        feedback()
+        assert ("sensor.charging",) not in [call.args for call in read_state.call_args_list]
+        assert render.call_count == 1
+        assert merge.call_count == 1
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+        assert save.await_count == 1
+        pending = store.data["calendar_history"]["pending"]
+        assert len(pending) == 1
+        assert pending[0]["location"] == "Climate"
+        assert pending[0]["confirmed_start"] == started.isoformat()
+
+        for _ in range(5):
+            clock[0] += timedelta(seconds=1)
+            feedback()
+        assert render.call_count == 6
+        assert merge.call_count == 2  # One unchanged merge establishes the no-op cache.
+        assert len(tasks) == 1
+        assert save.await_count == 1
+
+        clock[0] = started + timedelta(seconds=10)
+        feedback()
+        assert merge.call_count == 3  # A rollback before the cached check needs a fresh merge.
+
+        # Publication can replace the history with an equivalent snapshot.
+        store.data["calendar_history"] = deepcopy(store.data["calendar_history"])
+        feedback()
+        assert merge.call_count == 4
+        assert len(tasks) == 1
+
+        clock[0] = action.execute_not_after
+        feedback()
+        assert merge.call_count == 5
+        assert len(tasks) == 2
+        await asyncio.gather(*tasks)
+        assert save.await_count == 2
+        assert not store.data["calendar_history"]["pending"]
+        assert store.data["calendar_history"]["history"][0]["confirmed_start"] == started.isoformat()
+
+    asyncio.run(run())
+
+
 def test_calendar_confirmation_is_saved_after_adapter_execution(monkeypatch):
     now = datetime.now(UTC)
     coordinator = _coordinator_for_commit(None, current_generation=1)
@@ -9607,7 +10224,7 @@ def test_calendar_confirmation_is_saved_after_adapter_execution(monkeypatch):
     plan.actions = [_coordinated_action(plan, "window", ActionAsset.EV, ActionKind.EV_START)]
     coordinator._async_reconcile_vehicle_ownership = AsyncMock()
 
-    async def evaluate(plan, context):
+    async def evaluate(plan, context, *, plan_is_current=None):
         state.state = "on"
         return None
 
@@ -9638,6 +10255,124 @@ def test_noop_actions_do_not_rebuild_calendar_history():
     owner.store.record_calendar_events.assert_not_called()
 
 
+@pytest.mark.parametrize("retry_on_shutdown", [False, True])
+def test_calendar_confirmation_retries_failed_background_save(monkeypatch, retry_on_shutdown):
+    from custom_components.ha_energy_planner import storage as storage_module
+
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                        lambda self, hass, **kwargs: setattr(self, "data", None))
+    started = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: started + timedelta(seconds=10))
+
+    async def run():
+        hass = FakeHass({"climate.main": "cool"})
+        first_write_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+        persisted = {}
+
+        async def save(payload):
+            if not first_write_started.is_set():
+                first_write_started.set()
+                await allow_failure.wait()
+                raise OSError("transient Store write failure")
+            persisted.update(deepcopy(payload))
+
+        save_calls = AsyncMock(side_effect=save)
+        monkeypatch.setattr(storage_module, "Store", Mock(return_value=SimpleNamespace(async_save=save_calls)))
+        tasks = []
+
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+
+        hass.async_create_task = create_task
+        store = storage_module.PlannerStore(hass)
+        coordinator = EnergyPlannerCoordinator(hass, FakeEntry(
+            {CONF_DAIKIN_CLIMATE: "climate.main"}, {CONF_CLIMATE_CONTROL_ENABLED: True},
+        ), store)
+        coordinator.executor = FakeExecutor()
+        plan = _plan("retry-calendar-confirmation")
+        plan.created_at = started
+        action = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+        action.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+        plan.actions = [action]
+        coordinator.data = plan
+        store.data["ownership"] = {"hvac_control": {
+            "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
+        }}
+        coordinator.async_start_listeners()
+
+        def feedback():
+            callbacks[0](FakeEvent("climate.main", "cool", "cool", old_attributes={"current_temperature": 24.1},
+                                   new_attributes={"current_temperature": 24.2}))
+
+        feedback()
+        await asyncio.wait_for(first_write_started.wait(), 2)
+        for _ in range(5):
+            feedback()
+        assert len(tasks) == 1
+        allow_failure.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert not persisted
+        assert store.data["calendar_history"]["pending"][0]["confirmed_start"] == started.isoformat()
+
+        if retry_on_shutdown:
+            coordinator._begin_shutdown()
+            await coordinator.async_wait_for_plan_execution()
+            await coordinator.async_wait_for_refresh_shutdown()
+        else:
+            for _ in range(5):
+                feedback()
+            await asyncio.gather(*tasks[1:])
+            feedback()
+            assert len(tasks) == 2
+
+        assert save_calls.await_count == 2
+        assert persisted["calendar_history"] == store.data["calendar_history"]
+
+    asyncio.run(run())
+
+
+def test_audited_noop_actions_do_not_rebuild_a_confirmed_calendar_window(monkeypatch):
+    from custom_components.ha_energy_planner import storage as storage_module
+    from custom_components.ha_energy_planner.models import ActionOutcome, OutcomeResult
+
+    now = datetime.now(UTC)
+    owner = _coordinator_for_commit(None, current_generation=1)
+    owner.entry = FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {CONF_EV_CONTROL_ENABLED: True})
+    state = SimpleNamespace(state="on", last_changed=now, attributes={})
+    owner.hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity_id: state))
+    owner._async_reconcile_vehicle_ownership = AsyncMock()
+    monkeypatch.setattr(storage_module, "Store", Mock(return_value=SimpleNamespace(async_save=AsyncMock())))
+    owner.store = storage_module.PlannerStore(owner.hass)
+    count_calendar_updates = Mock(wraps=owner.store.record_calendar_events)
+    owner.store.record_calendar_events = count_calendar_updates
+    plan = _plan("audited-no-op")
+    plan.created_at = now - timedelta(seconds=1)
+    plan.actions = [
+        _coordinated_action(plan, "running", ActionAsset.EV, ActionKind.EV_START),
+        *[_coordinated_action(plan, str(i), ActionAsset.EV, ActionKind.EV_STOP) for i in range(3)],
+    ]
+
+    async def skip(action_plan, context, *, plan_is_current=None):
+        action = action_plan.next_action
+        await owner.store.async_add_outcome(ActionOutcome(
+            action.action_id, now, OutcomeResult.SKIPPED, "test_skip", {}, {}, plan.plan_id, action.asset, action.kind,
+        ))
+
+    owner.executor.async_evaluate = AsyncMock(side_effect=skip)
+    asyncio.run(owner._async_execute_plan_if_current(1, plan, object(), {}))
+    assert owner.executor.async_evaluate.await_count == 4
+    assert owner.store.data["execution_audit"][-1]["result"] == "skipped"
+    assert owner.store.data["calendar_history"]["pending"][0]["confirmed_start"] == now.isoformat()
+    count_calendar_updates.assert_called_once()
+
+
 def test_commit_drops_result_invalidated_during_calendar_vehicle_resolution():
     from test_vehicles import make_coordinator, setup
 
@@ -9648,7 +10383,7 @@ def test_commit_drops_result_invalidated_during_calendar_vehicle_resolution():
     previous = _plan("previous-vehicle")
     coordinator.data = previous
     old_context = coordinator._last_decision_context = object()
-    coordinator.store.async_save_plan = AsyncMock()
+    coordinator.store = FakeStore()
     coordinator._async_create_listener_task = lambda coroutine: coroutine.close()
     started_generation = coordinator._refresh_generation
     hass.states.values.update({"sensor.a_port": "DISCONNECTED", "sensor.b_port": "CONNECTED"})
@@ -9660,7 +10395,7 @@ def test_commit_drops_result_invalidated_during_calendar_vehicle_resolution():
     assert result is previous
     assert coordinator._refresh_generation > started_generation
     assert coordinator._last_decision_context is old_context
-    coordinator.store.async_save_plan.assert_not_awaited()
+    assert not coordinator.store.saved_plans
 
 
 @pytest.mark.parametrize("raise_after_confirmation", [False, True])
@@ -9677,7 +10412,7 @@ def test_committed_activity_survives_generation_change_and_execution_exception(r
     plan.actions = [action]
     coordinator._async_reconcile_vehicle_ownership = AsyncMock()
 
-    async def evaluate(plan, context):
+    async def evaluate(plan, context, *, plan_is_current=None):
         # New acquisition feedback cannot confirm while ownership is provisional.
         coordinator.store.data["ownership"] = {"hvac_control": {
             "main_state_committed": True, "phase": "preconditioning", "phase_started_at": now.isoformat(),
@@ -9724,7 +10459,7 @@ def test_old_plan_completion_preserves_newer_confirmed_activity_absent_from_old_
         "end": (now + timedelta(minutes=10)).isoformat(), "description": "Charging in progress.",
     }
 
-    async def evaluate(plan, context):
+    async def evaluate(plan, context, *, plan_is_current=None):
         # A newer EV plan committed while the older Enphase service was awaiting.
         coordinator.store.data["calendar_history"] = {"history": [], "pending": [newer]}
         coordinator._refresh_generation += 1
@@ -9736,11 +10471,14 @@ def test_old_plan_completion_preserves_newer_confirmed_activity_absent_from_old_
 
 
 @pytest.mark.parametrize("already_charging", [False, True])
-@pytest.mark.parametrize("first_plan", [False, True])
-def test_calendar_feedback_uses_newest_plan_while_commit_flush_is_pending(monkeypatch, already_charging, first_plan):
-    from custom_components.ha_energy_planner.calendar import calendar_event_records
+@pytest.mark.parametrize("accepted_plan", ["none", "unrelated", "overlap"])
+def test_calendar_feedback_during_plan_proposal_keeps_confirmed_history(monkeypatch, already_charging, accepted_plan):
+    from custom_components.ha_energy_planner import calendar as calendar_module
+    from custom_components.ha_energy_planner import storage as storage_module
 
     callbacks = []
+    export_status = Mock(return_value={"blocks": []})
+    monkeypatch.setattr(calendar_module, "export_limit_status", export_status)
     monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
                         lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
     monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
@@ -9752,46 +10490,185 @@ def test_calendar_feedback_uses_newest_plan_while_commit_flush_is_pending(monkey
     async def run():
         hass = FakeHass({"sensor.charging": "off"})
         tasks = []
+        entered, release = asyncio.Event(), asyncio.Event()
+        saved = {}
+
+        async def save(payload):
+            saved.clear()
+            saved.update(deepcopy(payload))
+            if "_pending_plan_publication" in payload:
+                entered.set()
+                await release.wait()
+
         def create_task(coroutine):
             task = asyncio.create_task(coroutine)
             tasks.append(task)
             return task
         hass.async_create_task = create_task
+        monkeypatch.setattr(storage_module, "Store", lambda *args, **kwargs: SimpleNamespace(async_save=save))
         coordinator = EnergyPlannerCoordinator(hass, FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {
             CONF_EV_CONTROL_ENABLED: True,
-        }), FakeStore())
+            CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True,
+        }), storage_module.PlannerStore(hass, "calendar-feedback"))
         coordinator.executor = FakeExecutor()
-        previous = _plan("previous-without-ev-window")
-        previous.actions = []
-        coordinator.data = None if first_plan else previous
+        coordinator.async_refresh = AsyncMock()
+        previous = _plan("previous")
+        coordinator.data = None if accepted_plan == "none" else previous
+        if accepted_plan == "overlap":
+            previous.created_at = clock[0] - timedelta(minutes=1)
+            old_action = _coordinated_action(previous, "previous-window", ActionAsset.EV, ActionKind.EV_SCHEDULE)
+            old_action.desired_state = {"allocated_slots": [
+                {"valid_at": (clock[0] + timedelta(minutes=offset)).isoformat(), "charge_kw": 7}
+                for offset in (0, 5)
+            ]}
+            previous.actions = [old_action]
+        if coordinator.data is not None:
+            await coordinator.store.async_save_plan(previous, calendar_events=[])
         coordinator.async_start_listeners()
+        start = FakeEvent("sensor.charging", "on" if already_charging else "off", "on")
+        start.data["new_state"] = SimpleNamespace(
+            state="on",
+            last_changed=clock[0] - timedelta(seconds=5) if already_charging else clock[0],
+            attributes={},
+        )
+        if already_charging:
+            start.data["old_state"] = start.data["new_state"]
+            if accepted_plan == "unrelated":
+                # Cache the no-op when this same feedback had no matching window.
+                callbacks[0](start)
+                assert not coordinator.store.data["calendar_history"]["pending"]
         newer = _plan("newer-ev-window")
         newer.created_at = clock[0] - timedelta(minutes=1)
         action = _coordinated_action(newer, "newer-window", ActionAsset.EV, ActionKind.EV_SCHEDULE)
         action.desired_state = {"allocated_slots": [{"valid_at": clock[0].isoformat(), "charge_kw": 7}]}
         newer.actions = [action]
-        # Simulate the atomic in-memory publication before the Store's disk flush returns.
-        overrides = {"sensor.charging": SimpleNamespace(
-            state="on", last_changed=clock[0] - timedelta(seconds=5), attributes={},
-        )} if already_charging else None
-        records = calendar_event_records(coordinator, newer, state_overrides=overrides)
-        await coordinator.store.async_save_plan(newer, calendar_events=records)
-        assert coordinator.store.calendar_plan is newer
-        start = FakeEvent("sensor.charging", "on" if already_charging else "off", "on")
-        start.data["new_state"] = SimpleNamespace(
-            state="on", last_changed=clock[0] - timedelta(seconds=5) if already_charging else clock[0], attributes={},
-        )
-        callbacks[0](start)
-        pending = coordinator.store.data["calendar_history"]["pending"]
-        assert any("confirmed_start" in event for event in pending)
-        clock[0] += timedelta(seconds=10)
-        stop = FakeEvent("sensor.charging", "on", "off")
-        callbacks[0](stop)
-        await asyncio.gather(*tasks)
+        accepted = coordinator.data
+        publication = asyncio.create_task(coordinator._async_commit_plan_if_current(
+            coordinator._refresh_generation, newer, object(), {}, execute=False,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert coordinator.store.calendar_plan is accepted
+            callbacks[0](start)
+            pending = coordinator.store.data["calendar_history"].get("pending", [])
+            confirmed = [event for event in pending if "confirmed_start" in event]
+            assert len(confirmed) == 1
+            expected_end = clock[0] + timedelta(minutes=10 if accepted_plan == "overlap" else 5)
+            assert confirmed[0]["end"] == expected_end.isoformat()
+            clock[0] += timedelta(seconds=10)
+            stop = FakeEvent("sensor.charging", "on", "off")
+            callbacks[0](stop)
+        finally:
+            release.set()
+            result = await publication
+            await asyncio.gather(*tasks)
         history = coordinator.store.data["calendar_history"]["history"]
         assert len(history) == 1
         assert history[0]["end"] == clock[0].isoformat()
-        assert coordinator.data is (None if first_plan else previous)
+        assert coordinator.data is result is coordinator.store.calendar_plan is accepted
+        assert coordinator.store.pending_calendar_plan is None
+        assert coordinator._deferred_plan_execution is None
+        assert (saved.get("active_plan") or {}).get("plan_id") == (accepted.plan_id if accepted else None)
+        assert saved["calendar_history"] == coordinator.store.data["calendar_history"]
+        export_status.assert_called_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fail_first_refresh", [False, True])
+def test_setup_observes_calendar_feedback_during_first_plan_save(monkeypatch, fail_first_refresh):
+    from custom_components.ha_energy_planner import async_setup_entry
+    from custom_components.ha_energy_planner import storage as storage_module
+
+    class SetupEntry(FakeEntry):
+        add_update_listener = Mock()
+        async_on_unload = Mock()
+
+    async def run():
+        now = datetime.now(UTC)
+        clock = [now]
+        entered, release = asyncio.Event(), asyncio.Event()
+        subscriptions = {}
+        saved = {}
+        timers = []
+        plan = _plan("initial-calendar-window")
+        plan.created_at = now - timedelta(minutes=1)
+        action = _coordinated_action(plan, "initial-window", ActionAsset.EV, ActionKind.EV_SCHEDULE)
+        action.desired_state = {"allocated_slots": [{"valid_at": now.isoformat(), "charge_kw": 7}]}
+        plan.actions = [action]
+
+        def listen(hass, entity_ids, callback):
+            subscriptions[callback] = set(entity_ids)
+            return lambda: subscriptions.pop(callback)
+
+        def emit(event):
+            for callback, entity_ids in list(subscriptions.items()):
+                if event.data["entity_id"] in entity_ids:
+                    callback(event)
+
+        async def save(payload):
+            if "_pending_plan_publication" in payload:
+                entered.set()
+                await release.wait()
+            saved.clear()
+            saved.update(deepcopy(payload))
+
+        async def first_refresh(coordinator):
+            await coordinator._async_commit_plan_if_current(
+                coordinator._refresh_generation, plan, object(), {}, execute=False,
+            )
+            if fail_first_refresh:
+                raise RuntimeError("first refresh failed")
+
+        entry = SetupEntry({CONF_EV_CHARGING: "sensor.charging", CONF_EV_SOC: "sensor.soc"}, {
+            CONF_EV_CONTROL_ENABLED: True,
+        })
+        hass = FakeHass({"sensor.charging": "off"})
+        hass.async_create_task = asyncio.create_task
+        hass.config_entries = SimpleNamespace(async_entries=lambda _: [entry], async_forward_entry_setups=AsyncMock())
+        monkeypatch.setattr(coordinator_module, "async_track_state_change_event", listen)
+        monkeypatch.setattr(coordinator_module, "async_call_later",
+                            lambda *args: timers.append(args) or (lambda: None))
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+        monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                            lambda self, hass, **kwargs: setattr(self, "data", None))
+        monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_shutdown", AsyncMock())
+        monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_config_entry_first_refresh", first_refresh)
+        monkeypatch.setattr(EnergyPlannerCoordinator, "async_reconcile_production_evidence_contract", AsyncMock())
+        monkeypatch.setattr(EnergyPlannerCoordinator, "async_start_startup_auto_recovery", Mock())
+        monkeypatch.setattr(EnergyPlannerCoordinator, "async_cancel_startup_auto_recovery", AsyncMock())
+        monkeypatch.setattr(EnergyPlannerCoordinator, "async_disarm_production_control", AsyncMock())
+        monkeypatch.setattr(EnergyPlannerCoordinator, "async_restore_safe_state", AsyncMock())
+        monkeypatch.setattr(storage_module, "Store",
+                            lambda *args, **kwargs: SimpleNamespace(
+                                async_save=save, async_load=AsyncMock(return_value=None)))
+        monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", Mock())
+        monkeypatch.setattr("custom_components.ha_energy_planner.async_clear_migration_issue", Mock())
+
+        setup = asyncio.create_task(async_setup_entry(hass, entry))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            coordinator = entry.runtime_data
+            start = FakeEvent("sensor.charging", "off", "on")
+            start.data["new_state"] = SimpleNamespace(state="on", attributes={}, last_changed=now)
+            emit(start)
+            clock[0] = now + timedelta(seconds=10)
+            stop = FakeEvent("sensor.charging", "on", "off")
+            stop.data["old_state"] = start.data["new_state"]
+            emit(stop)
+            assert list(subscriptions.values()) == [{"sensor.charging"}]
+            assert timers == []
+        finally:
+            release.set()
+            if fail_first_refresh:
+                with pytest.raises(RuntimeError, match="first refresh failed"):
+                    await setup
+            else:
+                assert await setup is True
+                await coordinator.async_wait_for_plan_execution()
+        assert list(subscriptions.values()) == ([] if fail_first_refresh else [{"sensor.charging", "sensor.soc"}])
+        assert len(saved["calendar_history"]["history"]) == 1
+        assert saved["calendar_history"]["history"][0]["end"] == clock[0].isoformat()
 
     asyncio.run(run())
 
@@ -9822,7 +10699,7 @@ def test_confirmed_phase_survives_capture_after_execution_deadline(
     if later_action_delays_capture:
         plan.actions.append(_coordinated_action(plan, "profile", ActionAsset.ENPHASE, ActionKind.SET_PROFILE))
 
-    async def evaluate(target, context):
+    async def evaluate(target, context, *, plan_is_current=None):
         if target.next_action.kind == ActionKind.SET_HVAC:
             coordinator.store.data["ownership"] = {"hvac_control": {
                 "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
@@ -9909,7 +10786,7 @@ def test_committed_phase_is_recorded_before_a_later_device_action_stops_it(monke
     phase.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
     plan.actions = [phase, _coordinated_action(plan, "profile", ActionAsset.ENPHASE, ActionKind.SET_PROFILE)]
 
-    async def evaluate(target, context):
+    async def evaluate(target, context, *, plan_is_current=None):
         if target.next_action.kind == ActionKind.SET_HVAC:
             coordinator.store.data["ownership"] = {"hvac_control": {
                 "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
@@ -10065,7 +10942,7 @@ def test_manual_hvac_override_refresh_and_export_resume_complete_without_command
         async def refresh():
             assert not coordinator._command_lock.locked()
             await coordinator._async_update_data()
-        async def update_locked(*, defer_execution=False):
+        async def update_locked(**kwargs):
             return plan
         coordinator._async_update_data_locked = update_locked
         coordinator.async_request_refresh = refresh
@@ -10166,7 +11043,7 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
         assert coordinator._export_reconcile_task is None
         if stable:
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciled", debounce_seconds=0, force=True, immediate=False,
+                "export_reconciled", debounce_seconds=0, force=True, mode=coordinator_module._RefreshMode.DEBOUNCED,
             )
             if change == "after_completion":
                 coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
@@ -10179,7 +11056,8 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
                 await coordinator._export_reconcile_task
         elif change == "reconfigure":
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciliation_changed", debounce_seconds=0, force=True, immediate=False,
+                "export_reconciliation_changed", debounce_seconds=0, force=True,
+                mode=coordinator_module._RefreshMode.DEBOUNCED,
             )
         else:
             coordinator._schedule_debounced_refresh.assert_not_called()
@@ -10197,7 +11075,7 @@ def test_failed_export_preflight_keeps_other_device_actions_eligible(release_due
     release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
     ev = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
     plan.actions = [export, ev, release] if release_due else [export, ev]
-    coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
+    coordinator._pending_plan_execution = _PlanExecution(coordinator._refresh_generation, plan, object(), {})
     asyncio.run(coordinator._async_drain_plan_execution())
     execute = coordinator._async_execute_plan_if_current
     execute.assert_awaited_once()
@@ -10214,6 +11092,7 @@ def test_pending_export_does_not_suppress_owned_ev_safety_stop():
     async def run():
         now = datetime.now(UTC)
         hass = ExecutorHass({"binary_sensor.ev_connected": "on", "input_boolean.ev_charger": "off"})
+        hass.data = {"entity_registry": SimpleNamespace(async_get=lambda _: None)}
         entry_data = {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
             CONF_EV_CHARGER: "input_boolean.ev_charger",
@@ -10231,7 +11110,7 @@ def test_pending_export_does_not_suppress_owned_ev_safety_stop():
         plan = _plan("owned-stop")
         plan.created_at = now
         owner._export_reconcile_pending = True
-        owner._pending_plan_execution = (owner._refresh_generation, plan, context, owner.planner_options)
+        owner._pending_plan_execution = _PlanExecution(owner._refresh_generation, plan, context, owner.planner_options)
         await owner._async_drain_plan_execution()
         assert hass.states.values["input_boolean.ev_charger"] == "off"
 
@@ -10268,7 +11147,7 @@ def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypat
         disabled = ordering.startswith("control_disabled")
         ev_start = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
         plan.actions = [export, ev_start if disabled else release]
-        coordinator._pending_plan_execution = (
+        coordinator._pending_plan_execution = _PlanExecution(
             coordinator._refresh_generation, plan, object(), coordinator.planner_options,
         )
         drain = asyncio.create_task(coordinator._async_drain_plan_execution())
@@ -10965,7 +11844,9 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
         event.data["new_state"] = state
         assert not _is_material_state_change(event, coordinator.options)
         await coordinator._command_lock.acquire()
+        generation = coordinator._refresh_generation
         callbacks[0](event)
+        assert coordinator._refresh_generation == generation + int(scenario not in {"stale", "lower"})
         await asyncio.sleep(0)
         assert saved == []
         if scenario == "stopped_while_queued":
@@ -10974,6 +11855,7 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
             coordinator._tearing_down = True
         coordinator._command_lock.release()
         await asyncio.gather(*coordinator._listener_tasks)
+        assert coordinator._refresh_generation == generation + int(scenario not in {"stale", "lower"})
         coordinator._schedule_debounced_refresh.assert_not_called()
         if scenario in {"stale", "lower", "shutdown_while_queued"}:
             assert saved == []
@@ -11810,5 +12692,274 @@ def test_cancelled_tariff_retry_can_be_replaced_without_consuming_an_attempt(mon
         callbacks[1](now)
         await asyncio.gather(*owner._listener_tasks)
         assert owner.refresh_requested == 1
+
+    asyncio.run(run())
+
+
+def test_dry_zone_registry_changes_refresh_fingerprint_with_identical_states(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": 22}),
+        main: FakeState("dry", {"zone_id": 0}),
+        bedroom: FakeState("dry", {"zone_id": 1}),
+    })
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    other = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="other")
+    registry = dict.fromkeys((head, main, bedroom), daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [main, bedroom]}
+    options = {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+
+    def fingerprint() -> str:
+        capabilities = coordinator_module.CapabilityDiscovery(hass, entry_data, options)
+        dry_hvac = capabilities.hvac_evidence_in_dry()
+        assert capabilities.inspect(hvac=dry_hvac).hvac is dry_hvac
+        return _decision_input_fingerprint(hass, entry_data, options, [], now=now, dry_hvac=dry_hvac)
+
+    both_zones = fingerprint()
+    assert fingerprint() == both_zones
+    registry[bedroom] = other
+    main_only = fingerprint()
+    registry[main] = other
+    no_zones = fingerprint()
+    assert len({both_zones, main_only, no_zones}) == 3
+    registry[bedroom] = daikin
+    assert fingerprint() not in {both_zones, main_only, no_zones}
+    registry[main] = daikin
+    assert fingerprint() == both_zones
+
+
+def test_dry_registry_verification_refreshes_rollback_faults_without_state_changes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
+    switches = ["switch.main", "switch.bedroom"]
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": 22}),
+        main: FakeState("dry", {"zone_id": 0, "temperature": 10**5000}),
+        bedroom: FakeState("dry", {"zone_id": 1, "temperature": "malformed"}),
+        **dict.fromkeys(switches, "on"),
+    })
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys([head, main, bedroom, switches[0]], daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={
+            CONF_DAIKIN_CLIMATE: head,
+            CONF_CLIMATE_ZONES: [main, bedroom, *switches],
+            "hvac_zone_control": {
+                "pairs": {switches[0]: main, switches[1]: bedroom},
+                "safe_open_sets": [switches],
+            },
+        },
+        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False},
+    )
+
+    async def run() -> None:
+        coordinator.data = await coordinator._async_update_data_locked()
+        assert "climate_zone_target_unavailable" not in coordinator.data.input_issues
+        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_absent_in_dry_mode"] == []
+
+        registry[switches[1]] = daikin
+        plan = await coordinator._async_update_data_locked()
+        assert "climate_zone_target_unavailable" in plan.input_issues
+        assert HVAC_DRY_ZONE_TARGETS_ABSENT not in plan.input_issues
+        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_unavailable"] == [main, bedroom]
+        assert coordinator.executor.fallback[0] is plan
+
+    asyncio.run(run())
+    assert f"issue=climate_zone_target_unavailable entities={main}" in caplog.text
+    assert f"issue=climate_zone_target_unavailable entities={bedroom}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stored_loss", "completion_during_refresh"),
+    [(None, False), (None, True), ("hvac_acquisition_rollback_failed", False)],
+)
+def test_refresh_queues_recheck_of_provisional_dry_only_release(
+    monkeypatch: pytest.MonkeyPatch, stored_loss: str | None, completion_during_refresh: bool,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({head: FakeState("dry", {"temperature": 22}), zone: FakeState("dry", {"zone_id": 0})})
+    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), native)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    monkeypatch.setattr(
+        coordinator_module.InputManager, "_health_from_issues", staticmethod(lambda _: InputHealth.HEALTHY),
+    )
+    main = {"hvac_mode": "off", "target_temperature": 22}
+    control = {"main_state": main, "attempt_snapshot": {"main_state": main, "zone_states": {}}}
+    if stored_loss:
+        control["required_evidence_lost"] = stored_loss
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
+        options={CONF_PLANNER_ENABLED: True, CONF_CLIMATE_CONTROL_ENABLED: True,
+                 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+        store_data={"ownership": {"hvac_control": control}},
+    )
+
+    def confirm_off_start() -> None:
+        hass.states.values[head] = FakeState("cool", {"temperature": 21})
+        hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
+        coordinator.store.data["ownership"]["hvac_control"] = {"main_state": main, "main_state_committed": True}
+
+    save_discovery = coordinator.store.async_save_discovery
+
+    async def save_discovery_then_confirm(discovery: dict[str, Any]) -> None:
+        await save_discovery(discovery)
+        confirm_off_start()
+
+    if completion_during_refresh:
+        monkeypatch.setattr(coordinator.store, "async_save_discovery", save_discovery_then_confirm)
+
+    async def run() -> None:
+        plan = await coordinator._async_update_data_locked(defer_execution=True)
+        release = next(action for action in plan.actions if action.kind == ActionKind.RELEASE_HVAC)
+        assert HVAC_DRY_ZONE_TARGETS_ABSENT in plan.input_issues
+        assert release.desired_state.get(HVAC_DRY_RELEASE_DURING_OFF_START, False) is (stored_loss is None)
+        assert control.get("required_evidence_lost") == stored_loss
+
+        # The earlier transaction can finish under the command lock before
+        # this release reaches the executor. Keep unrelated release reasons.
+        if not completion_during_refresh:
+            confirm_off_start()
+        executor = coordinator_module.Executor(
+            coordinator.store, hass=hass, entry_data=coordinator.entry_data, options=coordinator.options,
+        )
+        executor.async_release_hvac_control = AsyncMock()
+        coordinator.store.async_add_outcome = AsyncMock()
+        assert await executor.async_evaluate(plan) is release
+        if stored_loss is None:
+            executor.async_release_hvac_control.assert_not_awaited()
+            outcome = coordinator.store.async_add_outcome.await_args.args[0]
+            assert outcome.reason == "hvac_off_start_confirmed"
+        else:
+            executor.async_release_hvac_control.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("execution_observes_exit", [False, True])
+def test_transient_dry_refusal_invalidates_an_unchanged_plan(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, execution_observes_exit: bool,
+) -> None:
+    from custom_components.ha_energy_planner.preconditioning import current_status
+
+    head, zone = "climate.daikin", "climate.zone"
+    cool_states = {
+        head: FakeState("cool", {"temperature": 22}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
+    }
+    hass = FakeHass(dict(cool_states))
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys(cool_states, daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+
+    def observe_execution() -> None:
+        discovery = coordinator_module.CapabilityDiscovery(hass, coordinator.entry_data, coordinator.options)
+        coordinator._log_dry_takeover_transition(bool(discovery.dry_takeover_issues()))
+
+    async def run() -> None:
+        original = await coordinator._async_update_data_locked()
+        coordinator.data = original
+        original.device_plans.setdefault("climate", {})["preconditioning"] = {
+            "status": "scheduled", "reason": "preconditioning_planned",
+        }
+        hass.states.values[head] = FakeState("dry", {"temperature": 22})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        observe_execution()
+        refusal = {
+            "plan_id": original.plan_id, "asset": "daikin", "kind": "set_hvac", "result": "rejected",
+            "reason": HVAC_DRY_ZONE_TARGETS_ABSENT, "capability_issues": [HVAC_DRY_ZONE_TARGETS_ABSENT],
+        }
+        coordinator.store.data["execution_audit"] = [refusal]
+        assert current_status(coordinator.store.data, original)["reason"] == HVAC_DRY_ZONE_TARGETS_ABSENT
+
+        hass.states.values.update(cool_states)
+        if execution_observes_exit:
+            observe_execution()
+        recovered = await coordinator._async_update_data_locked()
+        assert recovered.plan_id != original.plan_id
+        assert current_status(coordinator.store.data, recovered)["reason"] != HVAC_DRY_ZONE_TARGETS_ABSENT
+        assert refusal in coordinator.store.data["execution_audit"]
+        coordinator.data = recovered
+        assert await coordinator._async_update_data_locked() is recovered
+
+    asyncio.run(run())
+    assert caplog.messages.count("Daikin Dry mode no longer blocks HVAC takeover") == 1
+
+
+@pytest.mark.parametrize("already_charging", [False, True])
+@pytest.mark.parametrize("first_plan", [False, True])
+def test_calendar_feedback_uses_newest_plan_while_commit_flush_is_pending(monkeypatch, already_charging, first_plan):
+    from custom_components.ha_energy_planner.calendar import calendar_event_records
+
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    clock = [datetime(2026, 9, 30, 12, tzinfo=UTC)]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                        lambda self, hass, **kwargs: setattr(self, "data", None))
+
+    async def run():
+        hass = FakeHass({"sensor.charging": "off"})
+        tasks = []
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+        hass.async_create_task = create_task
+        coordinator = EnergyPlannerCoordinator(hass, FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {
+            CONF_EV_CONTROL_ENABLED: True,
+        }), FakeStore())
+        coordinator.executor = FakeExecutor()
+        previous = _plan("previous-without-ev-window")
+        previous.actions = []
+        coordinator.data = None if first_plan else previous
+        coordinator.async_start_listeners()
+        newer = _plan("newer-ev-window")
+        newer.created_at = clock[0] - timedelta(minutes=1)
+        action = _coordinated_action(newer, "newer-window", ActionAsset.EV, ActionKind.EV_SCHEDULE)
+        action.desired_state = {"allocated_slots": [{"valid_at": clock[0].isoformat(), "charge_kw": 7}]}
+        newer.actions = [action]
+        # Simulate the atomic in-memory publication before the Store's disk flush returns.
+        overrides = {"sensor.charging": SimpleNamespace(
+            state="on", last_changed=clock[0] - timedelta(seconds=5), attributes={},
+        )} if already_charging else None
+        records = calendar_event_records(coordinator, newer, state_overrides=overrides)
+        await coordinator.store.async_save_plan(newer, calendar_events=records)
+        assert coordinator.store.calendar_plan is newer
+        start = FakeEvent("sensor.charging", "on" if already_charging else "off", "on")
+        start.data["new_state"] = SimpleNamespace(
+            state="on", last_changed=clock[0] - timedelta(seconds=5) if already_charging else clock[0], attributes={},
+        )
+        callbacks[0](start)
+        pending = coordinator.store.data["calendar_history"]["pending"]
+        assert any("confirmed_start" in event for event in pending)
+        clock[0] += timedelta(seconds=10)
+        stop = FakeEvent("sensor.charging", "on", "off")
+        callbacks[0](stop)
+        await asyncio.gather(*tasks)
+        history = coordinator.store.data["calendar_history"]["history"]
+        assert len(history) == 1
+        assert history[0]["end"] == clock[0].isoformat()
+        assert coordinator.data is (None if first_plan else previous)
 
     asyncio.run(run())

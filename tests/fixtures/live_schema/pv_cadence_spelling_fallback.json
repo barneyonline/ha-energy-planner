@@ -1,0 +1,18 @@
+{
+  "kind": "forecast_state",
+  "name": "synthetic_pv_cadence_spelling_fallback",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "power",
+  "value_keys": ["value"],
+  "state": "0",
+  "attributes": {
+    "forecast_interval_minutes": 1e15,
+    "forecastIntervalMinutes": 30,
+    "forecast": [
+      {"valid_at": "2026-06-27T00:00:00+00:00", "value": 1.0}
+    ]
+  },
+  "expected": [1.0, 1.0, null, null]
+}

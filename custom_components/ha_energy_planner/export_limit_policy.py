@@ -2,45 +2,42 @@
 
 from __future__ import annotations
 
-import re
 from bisect import bisect_right
-from collections.abc import Iterator
-from copy import deepcopy
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from math import isfinite
 from operator import itemgetter
 from sys import float_info
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .const import CONF_MIN_TARIFF_CONFIDENCE, CONF_PRICE_FRESHNESS_MINUTES
 from .forecasts import (
-    _FORECAST_CADENCE_KEYS,
+    TARIFF_END_KEYS,
     _amber_half_hour_start,
-    _canonical_key,
+    _declared_interval_minutes,
     _flatten_item,
     _forecast_item_unit,
-    _forecast_items,
+    _forecast_items_from_canonical,
     _parse_datetime_or_none,
+    _tariff_row_durations,
     _utc_forecast_time,
     _with_canonical_keys,
+    cacheable_tariff_snapshot,
     normalize_scalar_value,
+    tariff_snapshot_matches,
+    tariff_source_attributes,
 )
 from .models import ActionAsset, ActionKind, DecisionContext, DecisionSlot, PlanAction
 
-if TYPE_CHECKING:
-    from homeassistant.core import State
-
 EXPORT_ASSET = "enphase_export_limit"
+GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
 PRICE_KEYS = ("export_price", "feed_in_price", "per_kwh", "price", "value")
 START_KEYS = ("start_time", "period_start", "valid_at", "datetime", "from", "time", "date", "nem_time")
-END_KEYS = ("end_time", "period_end", "valid_until", "to")
 BLOCK_DURATION = timedelta(minutes=30)
 _LAST_INFERRED_BLOCK_START = datetime.max.replace(tzinfo=UTC) - BLOCK_DURATION
-_SCIENTIFIC_NUMBER = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))[eE][+-]?\d+")
 
 
-GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
 READBACK_MAX_AGE = timedelta(minutes=10)
 
 
@@ -52,15 +49,14 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
     readback: Any = attributes.get("last_successful_readback")
     if readback is None:
         return {}, "export_limit_entity_unavailable"
-    if type(readback) not in (int, float) or not isfinite(readback):
+    if type(readback) not in (int, float) or not -float_info.max <= readback <= float_info.max:
         return {}, "export_limit_readback_invalid"
     age = now.timestamp() - readback
     watts = attributes.get("confirmed_watts")
     slew: Any = attributes.get("slew_rate")
     if (
         type(slew) not in (int, float)
-        or not isfinite(slew)
-        or slew <= 0
+        or not 0 < slew <= float_info.max
         or round(slew, 2) != slew
         or type(attributes.get("pending")) is not bool
         or (watts is not None and (type(watts) is not int or not 0 <= watts <= 100000))
@@ -83,9 +79,11 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
         "request_status": attributes.get("request_status"),
         "last_readback": readback,
     }
-    gateway = attributes.get("gateway_identity")
-    if isinstance(gateway, str) and len(gateway) == 64 and all(char in "0123456789abcdef" for char in gateway):
-        if attributes.get("gateway_identity_verified") is not True:
+    if "gateway_identity" in attributes or "gateway_identity_verified" in attributes:
+        gateway = attributes.get("gateway_identity")
+        if (attributes.get("gateway_identity_verified") is not True
+                or not isinstance(gateway, str) or len(gateway) != 64
+                or any(char not in "0123456789abcdef" for char in gateway)):
             return result, GATEWAY_UNVERIFIED
         result["gateway_identity"] = gateway
     if not 0 <= age <= READBACK_MAX_AGE.total_seconds():
@@ -96,7 +94,9 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
 def aware_time(value: Any) -> datetime | None:
     """Reject ambiguous local timestamps, retaining absolute UTC instants."""
     result = value if isinstance(value, datetime) else _parse_datetime_or_none(value)
-    return _utc_forecast_time(result) if result is not None and result.tzinfo is not None else None
+    if result is None or result.tzinfo is None:
+        return None
+    return _utc_forecast_time(result)
 
 
 def block_time(value: Any) -> datetime:
@@ -129,102 +129,145 @@ def _half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]
     return _amber_half_hour_start(start, end, item)
 
 
+@dataclass(frozen=True, slots=True)
+class ExportTariffSource:
+    """Validated rows and the metadata needed to check them at sampling time."""
+
+    updated_at: datetime | None
+    confidence: float | None
+    rows: list[tuple[datetime, datetime, float]]
+    issue: str | None
+
+
+@dataclass(slots=True)
+class ExportTariffCache:
+    """Retain one detached tariff payload for repeated preflight reports."""
+
+    _snapshot: dict[str, Any] | None = None
+    _updated_at: datetime | None = None
+    _source: ExportTariffSource | None = None
+
+    def _clear(self) -> None:
+        self._snapshot = None
+        self._updated_at = None
+        self._source = None
+
+    def blocks(self, state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        """Reuse validation while checking current freshness and payload mutations."""
+        if state is None or state.state in {"unknown", "unavailable"}:
+            self._clear()
+            return [], "export_tariff_unavailable"
+        raw_attributes = tariff_source_attributes(state.attributes or {})
+        updated_at = aware_time(state.last_updated)
+        if (self._source is not None and self._snapshot is not None and self._updated_at == updated_at
+                and tariff_snapshot_matches(raw_attributes, self._snapshot, acyclic_snapshot=True)):
+            return tariff_blocks_from_source(self._source, now, options)
+        # Drop the previous payload when a new one cannot be cached.
+        self._clear()
+        attributes = _with_canonical_keys(raw_attributes)
+        issued_at, confidence = _tariff_metadata(attributes, state.last_updated)
+        if issue := _tariff_metadata_issue(issued_at, confidence, now, options):
+            return [], issue
+        source = _validated_tariff_source(raw_attributes, attributes, issued_at, confidence)
+        snapshot = cacheable_tariff_snapshot(raw_attributes)
+        if snapshot is not None:
+            self._source = source
+            self._snapshot = snapshot
+            self._updated_at = updated_at
+        return _select_tariff_blocks(source, now)
+
+
+def parse_export_tariff(raw_attributes: dict[str, Any], last_updated: datetime) -> ExportTariffSource:
+    """Normalize and validate a detached export tariff payload."""
+    attributes = _with_canonical_keys(raw_attributes)
+    issued_at, confidence = _tariff_metadata(attributes, last_updated)
+    return _validated_tariff_source(raw_attributes, attributes, issued_at, confidence)
+
+
+def _tariff_metadata(attributes: dict[str, Any], last_updated: datetime) -> tuple[datetime | None, float | None]:
+    return _tariff_issued_at(attributes, last_updated), _tariff_confidence(attributes)
+
+
+def export_tariff_issued_at(attributes: Mapping[str, Any], last_updated: datetime) -> datetime | None:
+    """Resolve the provider's issue time, falling back to the HA update instant."""
+    return _tariff_issued_at(_with_canonical_keys(dict(attributes)), last_updated)
+
+
+def _tariff_issued_at(attributes: dict[str, Any], last_updated: datetime) -> datetime | None:
+    return aware_time(attributes.get("issued_at") or attributes.get("last_updated") or last_updated)
+
+
+def _validated_tariff_source(
+    raw_attributes: dict[str, Any], attributes: dict[str, Any], issued_at: datetime | None, confidence: float | None,
+) -> ExportTariffSource:
+    rows, issue = _parse_blocks(attributes, raw_attributes)
+    return ExportTariffSource(issued_at, confidence, rows, issue)
+
+
 def tariff_blocks(
-    state: Any, now: datetime, options: dict[str, Any], *,
-    cache: ExportTariffCache | None = None,
+    state: Any, now: datetime, options: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Preserve real half-hour source intervals without extrapolating scalar prices."""
     if state is None or state.state in {"unknown", "unavailable"}:
         return [], "export_tariff_unavailable"
-    attributes = _with_canonical_keys(state.attributes or {})
-    updated = aware_time(attributes.get("issued_at") or attributes.get("last_updated") or state.last_updated)
-    freshness = timedelta(minutes=float(options.get(CONF_PRICE_FRESHNESS_MINUTES, 30)))
-    if updated is None or not timedelta(0) <= now - updated <= freshness:
-        return [], "export_tariff_stale"
-    confidence = _tariff_confidence(attributes)
+    raw_attributes = state.attributes or {}
+    attributes = _with_canonical_keys(raw_attributes)
+    issued_at, confidence = _tariff_metadata(attributes, state.last_updated)
+    if issue := _tariff_metadata_issue(issued_at, confidence, now, options):
+        return [], issue
+    return _select_tariff_blocks(_validated_tariff_source(raw_attributes, attributes, issued_at, confidence), now)
+
+
+def tariff_blocks_from_source(
+    source: ExportTariffSource | None, now: datetime, options: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Select the current block from validated rows if source evidence is still fresh."""
+    if source is None:
+        return [], "export_tariff_unavailable"
+    if issue := _tariff_metadata_issue(source.updated_at, source.confidence, now, options):
+        return [], issue
+    return _select_tariff_blocks(source, now)
+
+
+def _tariff_metadata_issue(
+    updated: datetime | None, confidence: float | None, now: datetime, options: dict[str, Any],
+) -> str | None:
+    if not export_tariff_is_fresh(updated, now, options):
+        return "export_tariff_stale"
     if (
         confidence is None
         or confidence < float(options.get(CONF_MIN_TARIFF_CONFIDENCE, 50)) / 100
     ):
-        return [], "export_tariff_confidence_low"
-    if cache is not None:
-        parsed, issue = cache.parse(state, attributes)
-    else:
-        parsed, issue = _parse_blocks(attributes, state.attributes or {})
-    if issue is not None:
-        return [], issue
-    index = bisect_right(parsed, now, key=itemgetter(0)) - 1
-    if index < 0 or now >= parsed[index][1]:
+        return "export_tariff_confidence_low"
+    return None
+
+
+def export_tariff_is_fresh(
+    issued_at: datetime | None, now: datetime, options: Mapping[str, Any],
+) -> bool:
+    """Apply Export Limit's inclusive age boundary to the issued forecast."""
+    freshness = timedelta(minutes=float(options.get(CONF_PRICE_FRESHNESS_MINUTES, 30)))
+    return issued_at is not None and timedelta(0) <= now - issued_at <= freshness
+
+
+def _select_tariff_blocks(source: ExportTariffSource, now: datetime) -> tuple[list[dict[str, Any]], str | None]:
+    if source.issue is not None:
+        return [], source.issue
+    index = bisect_right(source.rows, now, key=itemgetter(0)) - 1
+    if index < 0 or now >= source.rows[index][1]:
         return [], "export_tariff_block_missing"
     return [
         {"start": start.isoformat(), "end": end.isoformat(), "price": price,
-         "watts": 0 if price < 0 else None, "confidence": confidence}
-        for start, end, price in parsed[index:index + 2]
+         "watts": 0 if price < 0 else None, "confidence": source.confidence}
+        for start, end, price in source.rows[index:index + 2]
     ], None
-
-
-def _same_tariff_payload(snapshot: Any, live: Any) -> bool:
-    """Compare nested tariff data without conflating equal values of different types."""
-    if snapshot is live:
-        return True
-    if type(snapshot) is not type(live):
-        return False
-    if isinstance(snapshot, dict):
-        # Alias precedence can depend on the order in which keys are read.
-        return len(snapshot) == len(live) and all(
-            _same_tariff_payload(saved_key, live_key) and _same_tariff_payload(saved_value, live_value)
-            for (saved_key, saved_value), (live_key, live_value) in zip(snapshot.items(), live.items(), strict=True)
-        )
-    if isinstance(snapshot, (list, tuple)):
-        return len(snapshot) == len(live) and all(
-            _same_tariff_payload(saved, current) for saved, current in zip(snapshot, live, strict=True)
-        )
-    return bool(snapshot == live)
-
-
-class ExportTariffCache:
-    """Retain at most one completely validated HA tariff source."""
-
-    def __init__(self) -> None:
-        self._state: State | None = None
-        self._attributes: dict[str, Any] | None = None
-        self._result: tuple[list[tuple[datetime, datetime, float]], str | None] = ([], None)
-
-    def parse(
-        self, state: State, attributes: dict[str, Any],
-    ) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
-        if self._state is not state or not _same_tariff_payload(self._attributes, attributes):
-            self._result = _parse_blocks(attributes, state.attributes or {})
-            # HA wraps the outer mapping. A provider can still edit nested
-            # rows on the same State before the next planning or write check.
-            self._attributes = deepcopy(attributes)
-            self._state = state
-        return self._result
-
-
-def _declared_cadences(attributes: dict[str, Any]) -> Iterator[int | float | Decimal | None]:
-    """Yield positive cadence declarations without rounding aliases together."""
-    for key, raw in attributes.items():
-        if _canonical_key(key) not in _FORECAST_CADENCE_KEYS:
-            continue
-        try:
-            value = Decimal(raw) if isinstance(raw, str) else raw
-        except InvalidOperation:
-            # An out-of-range exponent can still represent a positive number.
-            match = _SCIENTIFIC_NUMBER.fullmatch(raw.strip().replace("_", ""))
-            if match is not None and Decimal(match[1]) > 0:
-                yield None
-            continue
-        if isinstance(value, (int, float, Decimal)) and not (isinstance(value, Decimal) and value.is_nan()):
-            if value > 0:
-                yield value
 
 
 def _parse_blocks(
     attributes: dict[str, Any], raw_attributes: dict[str, Any],
 ) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
     """Validate the complete source before selecting its current block."""
-    items = _forecast_items(attributes, PRICE_KEYS)
+    items = _forecast_items_from_canonical(attributes, PRICE_KEYS)
     parsed = []
     for raw in items:
         if not isinstance(raw, dict):
@@ -237,23 +280,20 @@ def _parse_blocks(
             return [], "export_tariff_invalid"
         unit = _forecast_item_unit(item, key, str(attributes.get("unit_of_measurement", attributes.get("unit", ""))))
         price = normalize_scalar_value(value, value_kind="price", unit=unit)
-        end_key = next((key for key in END_KEYS if key in item), None)
+        end_key = next((key for key in TARIFF_END_KEYS if key in item), None)
         end = aware_time(item[end_key]) if end_key else None
         if end_key and end is None:
             return [], "export_tariff_invalid"
-        row_mappings = (raw, *(nested for name, nested in raw.items()
-                               if _canonical_key(name) in {"value", "values", "forecast", "data", "prediction"}))
         if any(
             type(duration) not in (int, float) or duration != 30
-            for fields in row_mappings if isinstance(fields, dict)
-            for name, duration in fields.items() if _canonical_key(name) == "duration"
+            for duration in _tariff_row_durations(raw)
         ):
             return [], "export_tariff_overlap_or_duration"
         start = _half_hour_start(start, end, item)
         parsed.append((start, end, price))
     parsed.sort(key=lambda value: value[0])
     blocks: list[tuple[datetime, datetime, float]] = []
-    cadences = tuple(_declared_cadences(raw_attributes))
+    cadences = tuple(_declared_interval_minutes(raw_attributes))
     if any(minutes != 30 for minutes in cadences):
         return [], "export_tariff_ambiguous_duration"
     for index, (start, end, price) in enumerate(parsed):

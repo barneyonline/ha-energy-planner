@@ -17,6 +17,11 @@
 - Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision.
 - Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean.
 - Pause synchronized HVAC takeover when native Daikin zones omit setpoints in Dry mode, and preserve safe restoration and reporting of genuine target faults.
+- Pause installer retries without spending an attempt when gateway settings or tariffs become unusable, and keep gateway identity problems visible while Export Limit is deferred.
+- Preserve the Export Limit cooldown across clock corrections and control remaps, and continue reconciliation when inactive controls have invalid timing metadata.
+- Discard plans when tariff data changes during publication. Recheck tariffs during arming and resume prior startup recovery after a rejected replacement arm.
+- Preserve manual EV limits during Charge Now rollback and cancel unsent Export Limit changes when Automatic Control is turned off.
+- Recheck live control authority before the first HVAC takeover command.
 
 ### 🔧 Improvements
 

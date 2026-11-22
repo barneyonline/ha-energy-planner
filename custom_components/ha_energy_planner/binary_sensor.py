@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -16,19 +17,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import (
-    CONF_BYPASS_SAFETY_GATES,
-    CONF_PLANNER_ENABLED,
-)
+from .const import CONF_PLANNER_ENABLED
 from .coordinator import STARTUP_AUTO_RECOVERY_REQUIRED_RUNS, EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, recorder_safe_attributes
 from .hvac_control import has_hvac_ownership
 from .models import InputHealth
-from .preflight import (
-    _current_plan_report,
-    _runtime_control_area_report,
-    production_evidence_fingerprint,
-)
+from .preflight import _current_plan_report, evaluate_preflight
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
@@ -98,15 +92,8 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     pause = coordinator.store.data.get("control_pause")
     now = dt_util.utcnow()
     plan = getattr(coordinator, "data", None)
-    control_areas, _discovery = _runtime_control_area_report(
-        coordinator.hass,
-        dict(coordinator.entry_data),
-        coordinator.options,
-        plan=plan,
-        pause=pause,
-        now=now,
-        export_ownership=coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {}),
-    )
+    evidence = evaluate_preflight(coordinator.hass, coordinator, require_export_write_gate=True, now=now)
+    control_areas = evidence.control_areas
     required_control_areas = list(control_areas["required"])
     ready_control_areas = list(control_areas.get("ready", []))
     blocked_control_areas = [area for area in required_control_areas if area not in ready_control_areas]
@@ -118,26 +105,15 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         if raw_pause_reason is not None and (not required_control_areas or not available_control_areas)
         else None
     )
-    evidence_matches = production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
-        dict(coordinator.entry_data), coordinator.options
-    )
-    evidence_complete = (
-        production.dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
-        and bool(control_areas["required"])
-        and evidence_matches
-    )
-    safety_bypassed = strict_bool(
-        coordinator.options.get(CONF_BYPASS_SAFETY_GATES),
-        default=False,
-    )
+    evidence_matches = evidence.production["dry_run_evidence_fingerprint_matches"]
+    evidence_complete = evidence.production["dry_run_evidence_complete"]
+    safety_bypassed = evidence.safety_gates_bypassed
     planner_enabled = strict_bool(
-        coordinator.options.get(CONF_PLANNER_ENABLED),
+        evidence.options.get(CONF_PLANNER_ENABLED),
         default=False,
     )
-    current_plan_reason = _current_plan_block_reason(
-        plan,
-        now=now,
-        last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
+    current_plan_reason = (
+        None if evidence.current_plan["safe"] else _current_plan_block_reason(plan, report=evidence.current_plan)
     )
     confidence_eligible_areas = list(control_areas.get("confidence_eligible", []))
     if pause_reason:
@@ -160,7 +136,7 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         reason = "no_confidence_eligible_control_area"
     else:
         reason = "armed"
-    effective_armed = bool(getattr(coordinator, "effective_control", reason == "armed"))
+    effective_armed = coordinator.active_control and evidence.active_control_ready
     if effective_armed:
         reason = "armed"
     elif reason == "armed":
@@ -183,7 +159,7 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "available_control_areas": available_control_areas,
         "paused_control_areas": paused_control_areas,
         "confidence_eligible_control_areas": confidence_eligible_areas,
-        "current_plan_safe": current_plan_reason is None and bool(confidence_eligible_areas),
+        "current_plan_safe": evidence.current_plan["safe"] and bool(confidence_eligible_areas),
         "dry_run_ready_cycles": production.dry_run_ready_cycles,
         "dry_run_cycles_required": DRY_RUN_READY_CYCLES_REQUIRED,
         "dry_run_evidence_complete": evidence_complete,
@@ -205,6 +181,7 @@ def _current_plan_block_reason(
     *,
     now: datetime | None = None,
     last_refresh_metadata: dict[str, Any] | None = None,
+    report: dict[str, Any] | None = None,
 ) -> str | None:
     """Return a stable reason when the current plan cannot issue normal commands."""
     if plan is None:
@@ -215,13 +192,10 @@ def _current_plan_block_reason(
         return "current_plan_not_current"
     if float(getattr(plan, "confidence", 0.0) or 0.0) <= 0:
         return "current_plan_confidence_zero"
-    if now is None:
-        return None
-    report = _current_plan_report(
-        plan,
-        now=now,
-        last_refresh_metadata=last_refresh_metadata,
-    )
+    if report is None:
+        if now is None:
+            return None
+        report = _current_plan_report(plan, now=now, last_refresh_metadata=last_refresh_metadata)
     if not report.get("fresh"):
         return "current_plan_stale"
     if not report.get("last_refresh_succeeded"):
@@ -244,6 +218,7 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
         """Initialize sensor."""
         super().__init__(coordinator, description.key)
         self.entity_description = description
+        self._armed_attrs_for_write: Callable[[], dict[str, Any]] | None = None
 
     async def async_added_to_hass(self) -> None:
         """Publish HVAC ownership without waiting for a long planner refresh to finish."""
@@ -260,12 +235,34 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
     def _ownership_changed(self) -> None:
         self.async_write_ha_state()
 
+    @callback
+    def _async_write_ha_state(self) -> None:
+        """Use one current Armed evaluation for the state and its attributes."""
+        if self.entity_description.key != "armed":
+            super()._async_write_ha_state()
+            return
+
+        @cache
+        def armed_attrs() -> dict[str, Any]:
+            return self.entity_description.attrs_fn(self.coordinator)
+
+        previous = self._armed_attrs_for_write
+        self._armed_attrs_for_write = armed_attrs
+        try:
+            super()._async_write_ha_state()
+        finally:
+            self._armed_attrs_for_write = previous
+
     @property
     def is_on(self) -> bool:
         """Return binary sensor state."""
+        if self._armed_attrs_for_write is not None:
+            return bool(self._armed_attrs_for_write()["armed"])
         return self.entity_description.value_fn(self.coordinator)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return binary sensor attributes."""
-        return recorder_safe_attributes(self.entity_description.attrs_fn(self.coordinator))
+        attrs = (self._armed_attrs_for_write() if self._armed_attrs_for_write is not None
+                 else self.entity_description.attrs_fn(self.coordinator))
+        return recorder_safe_attributes(attrs)

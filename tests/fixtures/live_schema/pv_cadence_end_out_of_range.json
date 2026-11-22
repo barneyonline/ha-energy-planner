@@ -1,0 +1,28 @@
+{
+  "kind": "forecast_state",
+  "name": "synthetic_pv_cadence_end_out_of_range",
+  "issued_at": "2026-11-20T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "power",
+  "value_keys": [
+    "value"
+  ],
+  "state": "0",
+  "attributes": {
+    "forecast_interval_minutes": 5000000000,
+    "interval_minutes": 30,
+    "forecast": [
+      {
+        "valid_at": "2026-11-20T00:00:00+00:00",
+        "value": 1.0
+      }
+    ]
+  },
+  "expected": [
+    1.0,
+    1.0,
+    null,
+    null
+  ]
+}

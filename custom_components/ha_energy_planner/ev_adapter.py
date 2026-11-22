@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import Context, HomeAssistant, State
 from homeassistant.util import dt as dt_util
 
 from .adapter_helpers import async_call_device_service, available_state, service_entity_available
@@ -23,7 +23,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
 )
 from .ev import ev_charging_state, ev_charging_state_proves_active, ev_vehicle_suspended
-from .ev_policy import finite, power_capability
+from .ev_policy import PowerCapability, finite, power_capability
 from .ev_runtime import timestamp
 from .ev_telemetry import measured, reported_at
 from .models import ActionKind, PlanAction
@@ -62,6 +62,9 @@ class EVChargerAdapter:
         confirmation_poll_seconds: float = 1.0,
         connected_override: bool | None = None,
         command_guard: Callable[[], bool] | None = None,
+        start_guard: Callable[[], bool] | None = None,
+        power_limit_context: Context | None = None,
+        stopped_power_limit_baseline: dict[str, Any] | None = None,
         power_options: dict[str, Any] | None = None,
     ) -> None:
         """Initialize adapter."""
@@ -72,6 +75,9 @@ class EVChargerAdapter:
         self.confirmation_poll_seconds = max(float(confirmation_poll_seconds), 0.01)
         self.connected_override = connected_override
         self.command_guard = command_guard or (lambda: True)
+        self.start_guard = start_guard
+        self.power_limit_context = power_limit_context
+        self.stopped_power_limit_baseline = stopped_power_limit_baseline
         self.power_options = dict(power_options or {})
 
     async def async_execute(self, action: PlanAction) -> EVCommandResult:
@@ -88,16 +94,30 @@ class EVChargerAdapter:
         if lease_deadline is not None and command_started_at >= lease_deadline:
             return EVCommandResult(False, "ev_allocation_expired", pre_state, self._snapshot())
         limit = action.desired_state.get("power_limit")
-        limit_changed = bool(limit and finite(pre_state.get("ev_power_limit_entity")) != finite(limit.get("value")))
+        limit_applied = False
+        limit_sent = False
         if limit and bool(action.desired_state.get("charging_required_now", True)):
-            limit_applied = await self._async_set_power_limit(limit, valid_until=lease_deadline)
+            if self.start_guard is not None:
+                connection_rejection = self._start_connection_rejection()
+                if connection_rejection or not self.start_guard():
+                    return EVCommandResult(
+                        False, connection_rejection or "ev_grid_projection_stale", pre_state, self._snapshot(),
+                    )
+            limit_applied, limit_sent = await self._async_set_power_limit(limit, valid_until=lease_deadline)
             if lease_deadline is not None and dt_util.utcnow() >= lease_deadline:
-                return await self._async_confirmation_failure(
+                result = await self._async_confirmation_failure(
                     reason="ev_allocation_expired", initial_pre_state=pre_state,
-                    command_sent=limit_changed, requested_enabled=True,
-                    command_entity_id=self._start_entity() or "", force_safe_stop=True,
+                    command_sent=limit_sent, requested_enabled=True,
+                    command_entity_id=self._start_entity() or "", force_safe_stop=limit_sent,
                 )
+                if self.start_guard is not None and result.safe_state_confirmed is True:
+                    return await self._async_reconcile_stopped_power_limit(
+                        result, pre_state, limit, limit_confirmed=limit_applied,
+                    )
+                return result
             if not limit_applied:
+                if not limit_sent and self.start_guard is not None:
+                    return EVCommandResult(False, "ev_grid_projection_stale", pre_state, self._snapshot())
                 refusal = self._vehicle_refusal_snapshot()
                 stopped = await self._async_stop()
                 return EVCommandResult(False, "ev_power_limit_unconfirmed", pre_state, {**self._snapshot(), **refusal},
@@ -111,11 +131,62 @@ class EVChargerAdapter:
         else:
             return EVCommandResult(False, "unsupported_ev_action", pre_state, self._snapshot())
 
-        if result.reason == "ev_vehicle_suspended" and limit_changed and not result.command_sent:
+        if (
+            result.applied and self.start_guard is not None and limit
+            and action.kind in {ActionKind.EV_START, ActionKind.EV_SCHEDULE}
+            and action.desired_state.get("charging_required_now", True)
+            and not self._power_limit_is_confirmed(limit)
+        ):
+            # The cap can change during dispatch or while charging confirms.
+            result = await self._async_confirmation_failure(
+                reason="ev_grid_projection_stale", initial_pre_state=pre_state,
+                command_sent=result.command_sent, requested_enabled=True, command_entity_id=self._start_entity() or "",
+                force_safe_stop=result.command_sent,
+                stop_feedback_required=bool(self.entry_data.get(CONF_EV_CHARGING)),
+            )
+        expired_after_cap_write = (
+            self.start_guard is not None
+            and result.reason == "ev_allocation_expired"
+            and result.safe_state_confirmed is None
+        )
+        if (
+            limit_sent and not result.command_sent
+            and (result.reason == "ev_vehicle_suspended" or expired_after_cap_write)
+        ):
             result = await self._async_confirmation_failure(
                 reason=result.reason, initial_pre_state=pre_state, command_sent=True,
                 requested_enabled=True, command_entity_id=self._start_entity() or "", force_safe_stop=True,
             )
+        if limit_sent and result.safe_state_confirmed is not True and (
+            result.reason == "ev_grid_projection_stale" or (
+                self.start_guard is not None and not result.command_sent
+                and result.reason in {"ev_not_connected", "ev_connected_state_unavailable"}
+            )
+        ):
+            assert limit is not None
+            previous_limit = finite(pre_state.get("ev_power_limit_entity"))
+            limit_state = self._state(self.entry_data.get("ev_power_limit_entity"))
+            current_limit = finite(getattr(limit_state, "state", None))
+            can_restore_without_stop = (
+                not result.command_sent and previous_limit is not None
+                and (
+                    self._existing_state_proves_safe() or self._power_limit_was_superseded(limit_state, limit)
+                    or (current_limit is not None and previous_limit <= current_limit
+                        and self._power_limit_is_confirmed(limit))
+                )
+            )
+            if can_restore_without_stop:
+                rollback = await self._async_restore_power_limit(
+                    pre_state, safe_state_confirmed=result.safe_state_confirmed, expected_limit=limit,
+                )
+                result = replace(result, rollback_succeeded=rollback.applied)
+            if result.rollback_succeeded is not True:
+                stopped = await self._async_stop()
+                result = replace(result, rollback_succeeded=False, safe_state_confirmed=_safe_state_confirmed(stopped))
+        if (limit_applied and self.start_guard is not None
+                and not result.applied and result.safe_state_confirmed is True):
+            assert limit is not None
+            result = await self._async_reconcile_stopped_power_limit(result, pre_state, limit, limit_confirmed=True)
 
         restore_limit = action.desired_state.get("restore_power_limit")
         if restore_limit is not None and not action.desired_state.get("charging_required_now", True):
@@ -151,10 +222,10 @@ class EVChargerAdapter:
                     post_state["confirmed_power_at"] = reported.isoformat()
         return EVCommandResult(
             result.applied,
-            "ev_power_limit_confirmed" if result.applied and limit_changed else result.reason,
+            "ev_power_limit_confirmed" if result.applied and limit_sent else result.reason,
             pre_state,
             post_state,
-            command_sent=result.command_sent or limit_changed,
+            command_sent=result.command_sent or limit_sent,
             rollback_succeeded=result.rollback_succeeded,
             safe_state_confirmed=result.safe_state_confirmed,
         )
@@ -171,17 +242,9 @@ class EVChargerAdapter:
             stopped = await self._async_stop()
             if not _safe_state_confirmed(stopped):
                 return stopped
-            entity_id = self.entry_data.get("ev_power_limit_entity")
-            value = finite(saved_state["ev_power_limit_entity"])
-            state = self._state(entity_id)
-            if (saved_state.get("ev_power_limit_unit") is not None and state is not None
-                    and saved_state["ev_power_limit_unit"] != state.attributes.get("unit_of_measurement")):
-                return EVCommandResult(False, "ev_power_limit_unit_changed", pre_state, self._snapshot(),
-                                       safe_state_confirmed=True)
-
-            restored = bool(entity_id and value is not None and await self._async_write_number(entity_id, value))
-            return EVCommandResult(restored, "ev_power_limit_restored" if restored else "ev_power_limit_restore_failed",
-                                   pre_state, self._snapshot(), command_sent=True, safe_state_confirmed=True)
+            return await self._async_restore_power_limit(
+                saved_state, safe_state_confirmed=True, pre_state=pre_state,
+            )
         if saved_state:
             restore_entity_id = command_entity_id or self._start_entity()
             if restore_entity_id and self._start_command_requires_safe_stop(restore_entity_id):
@@ -259,23 +322,12 @@ class EVChargerAdapter:
 
     async def _async_start(self, action: PlanAction | None) -> EVCommandResult:
         deadline = timestamp(action.desired_state.get("charge_lease_until")) if action is not None else None
+        power_limit = action.desired_state.get("power_limit") if action is not None else None
         if deadline is not None:
             if dt_util.utcnow() >= deadline:
                 return EVCommandResult(False, "ev_allocation_expired", self._snapshot(), self._snapshot())
-        connected_entity = self.entry_data.get(CONF_EV_CONNECTED)
-        if connected_entity:
-            connected = self._state(connected_entity)
-            if connected is None:
-                return EVCommandResult(
-                    False,
-                    "ev_connected_state_unavailable",
-                    self._snapshot(),
-                    self._snapshot(),
-                )
-            if not _truthy_state(connected):
-                return EVCommandResult(False, "ev_not_connected", self._snapshot(), self._snapshot())
-        elif self.connected_override is False:
-            return EVCommandResult(False, "ev_not_connected", self._snapshot(), self._snapshot())
+        if connection_rejection := self._start_connection_rejection():
+            return EVCommandResult(False, connection_rejection, self._snapshot(), self._snapshot())
         keep_charger_on = bool(action and action.desired_state.get("keep_charger_on"))
         if keep_charger_on:
             keep_on_entity = self._keep_on_entity()
@@ -295,13 +347,26 @@ class EVChargerAdapter:
                 confirmation_entity=keep_on_entity,
                 confirmation_reason="ev_charger_enabled_for_preconditioning",
                 valid_until=deadline,
+                power_limit=power_limit,
             )
         start_entity = self._start_entity()
         if self._vehicle_suspended():
             return EVCommandResult(False, "ev_vehicle_suspended", self._snapshot(), self._snapshot())
         if not start_entity:
             return EVCommandResult(False, "ev_start_control_not_configured", self._snapshot(), self._snapshot())
-        return await self._async_control_with_confirmation(start_entity, enabled=True, valid_until=deadline)
+        return await self._async_control_with_confirmation(
+            start_entity, enabled=True, valid_until=deadline, power_limit=power_limit,
+        )
+
+    def _start_connection_rejection(self) -> str | None:
+        """Check the native helper before energizing the charger."""
+        connected_entity = self.entry_data.get(CONF_EV_CONNECTED)
+        if connected_entity:
+            connected = self._state(connected_entity)
+            if connected is None:
+                return "ev_connected_state_unavailable"
+            return None if _truthy_state(connected) else "ev_not_connected"
+        return "ev_not_connected" if self.connected_override is False else None
 
     async def _async_stop(self) -> EVCommandResult:
         stop_entity = self._stop_entity()
@@ -317,14 +382,26 @@ class EVChargerAdapter:
         confirmation_entity: str | None = None,
         confirmation_reason: str | None = None,
         valid_until: datetime | None = None,
+        power_limit: dict[str, Any] | None = None,
     ) -> EVCommandResult:
         """Issue a command and confirm the mapped charging feedback state."""
         charging_entity = confirmation_entity or self.entry_data.get(CONF_EV_CHARGING)
         initial_pre_state = self._snapshot()
         command_sent = False
         control_adopted = False
-        stop_feedback_required = False
+        stop_feedback_required = not enabled and self.start_guard is not None and bool(charging_entity)
         for _attempt in range(self.confirmation_retries + 1):
+            if enabled and self.start_guard is not None and (
+                self._start_connection_rejection() or not self.start_guard()
+                or (power_limit and not self._power_limit_is_confirmed(power_limit))
+            ):
+                # Charging can first appear during the compensating stop.
+                return await self._async_confirmation_failure(
+                    reason="ev_grid_projection_stale", initial_pre_state=initial_pre_state,
+                    command_sent=command_sent, requested_enabled=True, command_entity_id=entity_id,
+                    force_safe_stop=command_sent,
+                    stop_feedback_required=bool(self.entry_data.get(CONF_EV_CHARGING)),
+                )
             if enabled and confirmation_entity is None and self._vehicle_suspended():
                 return await self._async_confirmation_failure(
                     reason="ev_vehicle_suspended", initial_pre_state=initial_pre_state,
@@ -586,19 +663,24 @@ class EVChargerAdapter:
             return EVCommandResult(False, reason, initial_pre_state, self._snapshot())
         refusal = self._vehicle_refusal_snapshot()
         force_safe_stop = force_safe_stop or bool(refusal)
+        guarded_start = requested_enabled and self.start_guard is not None
         attempted = False
         restored = False
         command_requires_safe_stop = self._start_command_requires_safe_stop(command_entity_id)
-        if (requested_enabled and not force_safe_stop and reason != "ev_allocation_expired"
+        if (requested_enabled and not guarded_start and not force_safe_stop and reason != "ev_allocation_expired"
                 and not command_requires_safe_stop):
             attempted, restored = await self._async_restore_control_snapshot(
                 initial_pre_state,
                 entity_ids={command_entity_id},
             )
         if not attempted:
+            # A bounded start can have reached the charger while charging readback
+            # was unavailable. Turning the switch off alone cannot clear its load.
             attempted, restored = await self._async_issue_safe_stop(
                 check_active_feedback=not requested_enabled,
-                require_stopped_feedback=stop_feedback_required,
+                require_stopped_feedback=stop_feedback_required or (
+                    guarded_start and bool(self.entry_data.get(CONF_EV_CHARGING))
+                ),
             )
         post_state = {**self._snapshot(), **refusal}
         return EVCommandResult(
@@ -672,19 +754,23 @@ class EVChargerAdapter:
 
     async def _async_write_number(
         self, entity_id: str, value: float, *, valid_until: datetime | None = None,
-    ) -> bool:
+        context: Context | None = None,
+    ) -> bool | None:
+        """Return None before dispatch, or whether a sent write was confirmed."""
         if not self.command_guard():
-            return False
+            return None
         if valid_until is not None and dt_util.utcnow() >= valid_until:
-            return False
+            return None
         state = self._state(entity_id)
         if state is None or not entity_id.startswith("number."):
-            return False
+            return None
         minimum, maximum = finite(state.attributes.get("min")), finite(state.attributes.get("max"))
         if minimum is None or maximum is None or not minimum <= value <= maximum:
-            return False
+            return None
         try:
-            await async_call_device_service(self.hass, "number", "set_value", {"entity_id": entity_id, "value": value})
+            await async_call_device_service(
+                self.hass, "number", "set_value", {"entity_id": entity_id, "value": value}, context=context,
+            )
             deadline = asyncio.get_running_loop().time() + self.confirmation_timeout_seconds
             while True:
                 if not self.command_guard():
@@ -704,22 +790,107 @@ class EVChargerAdapter:
         except Exception:  # Device errors leave ownership and load reserved.
             return False
 
-    async def _async_set_power_limit(
-        self, requested: dict[str, Any], *, valid_until: datetime | None = None,
-    ) -> bool:
+    async def _async_restore_power_limit(
+        self, saved_state: dict[str, Any], *, safe_state_confirmed: bool | None,
+        pre_state: dict[str, Any] | None = None,
+        expected_limit: dict[str, Any] | None = None,
+    ) -> EVCommandResult:
+        if pre_state is None:
+            pre_state = self._snapshot()
+        entity_id = self.entry_data.get("ev_power_limit_entity")
+        state = self._state(entity_id)
+        if expected_limit is not None and not self._power_limit_is_confirmed(expected_limit):
+            superseded = self._power_limit_was_superseded(state, expected_limit)
+            reason = "ev_power_limit_superseded" if superseded else "ev_power_limit_restore_failed"
+            return EVCommandResult(superseded, reason, pre_state, self._snapshot(),
+                                   safe_state_confirmed=safe_state_confirmed)
+        value = finite(saved_state["ev_power_limit_entity"])
+        unit = saved_state.get("ev_power_limit_unit")
+        if unit is not None and state is not None and unit != state.attributes.get("unit_of_measurement"):
+            return EVCommandResult(False, "ev_power_limit_unit_changed", pre_state, self._snapshot(),
+                                   safe_state_confirmed=safe_state_confirmed)
+        restored = False
+        if entity_id and value is not None and (
+            expected_limit is None or self._native_limit_accepts(state, value, unit)
+        ):
+            restored = await self._async_write_number(entity_id, value) is True
+            if restored and expected_limit is not None:
+                # The service can echo the requested number after its unit or
+                # native range changed. That does not prove a safe rollback.
+                restored = self._native_limit_accepts(self._state(entity_id), value, unit)
+        return EVCommandResult(restored, "ev_power_limit_restored" if restored else "ev_power_limit_restore_failed",
+                               pre_state, self._snapshot(), command_sent=True,
+                               safe_state_confirmed=safe_state_confirmed)
+
+    async def _async_reconcile_stopped_power_limit(
+        self, result: EVCommandResult, pre_state: dict[str, Any], limit: dict[str, Any], *, limit_confirmed: bool,
+    ) -> EVCommandResult:
+        """Release native-cap ownership only after a verified restore or supersession."""
+        if not (limit_confirmed or self._power_limit_is_confirmed(limit)):
+            # The stop proves grid capacity is free. A delayed cap write may still arrive.
+            return replace(result, rollback_succeeded=False)
+        baseline = self.stopped_power_limit_baseline or pre_state
+        rollback = await self._async_restore_power_limit(baseline, safe_state_confirmed=True, expected_limit=limit)
+        return replace(
+            result, rollback_succeeded=rollback.applied and self.stopped_power_limit_baseline != {},
+            post_state={**result.post_state, **rollback.post_state},
+        )
+
+    @staticmethod
+    def _native_limit_accepts(state: State | None, value: float, unit: str | None) -> bool:
+        """Check the physical control's unit, bounds and increment for a setpoint."""
+        if state is None or state.attributes.get("unit_of_measurement") != unit:
+            return False
+        minimum, maximum, step = (finite(state.attributes.get(key)) for key in ("min", "max", "step"))
+        if minimum is None or maximum is None or step is None or step <= 0 or not minimum <= value <= maximum:
+            return False
+        remainder = (value - minimum) % step
+        return min(remainder, step - remainder) < 1e-6
+
+    def _power_limit_was_superseded(self, state: State | None, expected_limit: dict[str, Any]) -> bool:
+        """Recognize a different valid setting in the same units as Planner's write."""
+        if state is None or state.entity_id != expected_limit.get("entity_id"):
+            return False
+        current_value, expected_value = finite(state.state), finite(expected_limit.get("value"))
+        return (
+            current_value is not None and expected_value is not None and abs(current_value - expected_value) >= 1e-6
+            and self._native_limit_accepts(state, current_value, expected_limit.get("unit"))
+        )
+
+    def _validated_power_limit(self, requested: dict[str, Any]) -> tuple[PowerCapability, float] | None:
         entity_id = self.entry_data.get("ev_power_limit_entity")
         if not isinstance(entity_id, str) or entity_id != requested.get("entity_id"):
-            return False
+            return None
         capability = power_capability(self._state(entity_id), self.power_options)
         power, value = finite(requested.get("physical_power_kw")), finite(requested.get("value"))
         if capability is None or power is None or value is None or requested.get("unit") != capability.unit:
-            return False
+            return None
         valid = capability.setpoint(power)
         if valid is None or abs(valid-value) > 1e-6 or abs(value*capability.kw_per_unit-power) > 1e-6:
+            return None
+        return capability, value
+
+    def _power_limit_is_confirmed(self, requested: dict[str, Any]) -> bool:
+        validated = self._validated_power_limit(requested)
+        if validated is None:
             return False
+        capability, value = validated
+        return abs(capability.current - value) < 1e-6
+
+    async def _async_set_power_limit(
+        self, requested: dict[str, Any], *, valid_until: datetime | None = None,
+    ) -> tuple[bool, bool]:
+        """Return whether the cap was confirmed and whether a write was sent."""
+        validated = self._validated_power_limit(requested)
+        if validated is None:
+            return False, False
+        capability, value = validated
         if abs(capability.current-value) < 1e-6:
-            return True
-        return await self._async_write_number(entity_id, value, valid_until=valid_until)
+            return True, False
+        confirmed = await self._async_write_number(
+            capability.entity_id, value, valid_until=valid_until, context=self.power_limit_context,
+        )
+        return confirmed is True, confirmed is not None
 
     async def _async_schedule(self, action: PlanAction) -> EVCommandResult:
         if "charging_required_now" not in action.desired_state:

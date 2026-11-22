@@ -31,6 +31,8 @@ from .const import (
     DEFAULT_OPTIONS,
     DOMAIN,
     EV_RESERVATION_EXTERNAL_BASELINE,
+    EV_RESERVATION_EXTERNAL_POWER_OPTIONS,
+    EV_RESERVATION_EXTERNAL_TOPOLOGY,
     EV_RESERVATION_RETAIN_WHEN_UNLOADED,
     INTEGRATION_NAME,
     LEGACY_INTEGRATION_NAME,
@@ -48,6 +50,7 @@ from .const import (
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .entry_data import combined_entry_data, remove_retired_config_keys
+from .ev_policy import power_limit_options
 from .migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
@@ -248,12 +251,12 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
     async def handle_run_preflight(call: ServiceCall) -> dict[str, Any]:
         coordinator = await _require_coordinator(call)
-        return build_preflight_report(hass, coordinator)
+        return build_preflight_report(hass, coordinator, require_export_write_gate=True)
 
     async def handle_export_support_bundle(call: ServiceCall) -> dict[str, Any]:
         coordinator = await _require_coordinator(call)
         return {
-            "preflight": build_preflight_report(hass, coordinator),
+            "preflight": build_preflight_report(hass, coordinator, require_export_write_gate=True),
             "diagnostics": await async_get_config_entry_diagnostics(hass, coordinator.entry),
         }
 
@@ -413,7 +416,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Set up Energy Planner from a config entry."""
-    from .coordinator import EnergyPlannerCoordinator
+    from .coordinator import EnergyPlannerCoordinator, InitialPlanSuperseded
     from .storage import PlannerStore
     from .subentry_migration import async_migrate_subentries_to_entry_data
 
@@ -442,6 +445,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     entry.runtime_data = coordinator
     forwarding_started = False
     try:
+        # Other entries can reserve shared headroom while the first refresh waits.
+        external_ev = store.data.get("ev_grid_reservation", {})
+        if (external_ev.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+                and isinstance(external_ev.get(EV_RESERVATION_EXTERNAL_TOPOLOGY), dict)
+                and coordinator.executor.sync_ev_grid_reservation()):
+            await coordinator.executor.async_persist_ev_grid_reservation()
         await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
@@ -451,12 +460,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         _async_sync_planner_device(hass, entry)
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
         entry.async_on_unload(coordinator.async_shutdown)
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError) as error:
         # Keep cleanup alive if Home Assistant cancels setup while platforms or
         # recovery are starting. Do not cancel a transaction with external effects.
         coordinator._tearing_down = True
         cleanup = asyncio.create_task(
-            _async_cleanup_failed_setup(hass, entry, coordinator, forwarding_started)
+            _async_cleanup_failed_setup(
+                hass, entry, coordinator, forwarding_started,
+                preserve_control=not forwarding_started and isinstance(error.__cause__, InitialPlanSuperseded),
+            )
         )
         while not cleanup.done():
             try:
@@ -474,18 +486,27 @@ async def _async_cleanup_failed_setup(
     entry: EnergyPlannerConfigEntry,
     coordinator: EnergyPlannerCoordinator,
     forwarding_started: bool,
+    *,
+    preserve_control: bool,
 ) -> None:
     """Attempt every cleanup step without masking the original setup failure."""
     from .notifications import cancel_deferred_notifications_for_entry
 
-    steps: list[Callable[[], Awaitable[object]]] = [
-        lambda: coordinator.async_cancel_startup_auto_recovery("setup_entry_failed"),
+    steps: list[Callable[[], Awaitable[object]]] = []
+    if not preserve_control:
+        steps.append(lambda: coordinator.async_cancel_startup_auto_recovery("setup_entry_failed"))
+    steps.extend([
         coordinator.async_shutdown,
         coordinator.async_wait_for_plan_execution,
         coordinator.async_wait_for_refresh_shutdown,
-        lambda: coordinator.async_disarm_production_control("setup_entry_failed"),
-        lambda: coordinator.async_restore_safe_state("setup_entry_failed", refresh=False),
-    ]
+    ])
+    # A superseded first plan grants no command authority and setup has not
+    # started recovery. Preserve the existing handoff for Core's next attempt.
+    if not preserve_control:
+        steps.extend([
+            lambda: coordinator.async_disarm_production_control("setup_entry_failed"),
+            lambda: coordinator.async_restore_safe_state("setup_entry_failed", refresh=False),
+        ])
     if forwarding_started:
         steps.append(lambda: hass.config_entries.async_unload_platforms(entry, PLATFORMS))
     try:
@@ -617,7 +638,7 @@ def _rehydrate_ev_grid_reservation(
     entry: EnergyPlannerConfigEntry,
     store_data: dict[str, Any],
 ) -> None:
-    """Reserve conservative headroom for persisted planner-owned EV state."""
+    """Reserve headroom for persisted planner-owned or external EV load."""
     ownership = store_data.get("ownership")
     persisted_reservation = store_data.get("ev_grid_reservation")
     if (
@@ -662,6 +683,19 @@ def _rehydrate_ev_grid_reservation(
         and persisted_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
     ):
         reservation[EV_RESERVATION_EXTERNAL_BASELINE] = True
+        topology = persisted_reservation.get(EV_RESERVATION_EXTERNAL_TOPOLOGY)
+        if isinstance(topology, dict):
+            reservation[EV_RESERVATION_EXTERNAL_TOPOLOGY] = dict(topology)
+            power_options = persisted_reservation.get(EV_RESERVATION_EXTERNAL_POWER_OPTIONS)
+            if isinstance(power_options, dict):
+                reservation[EV_RESERVATION_EXTERNAL_POWER_OPTIONS] = power_limit_options(power_options)
+            observed_load_kw = _non_negative_finite_float(persisted_reservation.get("observed_load_kw"))
+            observed_limit_kw = _non_negative_finite_float(persisted_reservation.get("observed_limit_kw"))
+            reservation.update(observed_load_kw=observed_load_kw, observed_limit_kw=observed_limit_kw)
+            # A replacement charger's configured rate is not evidence about
+            # the external charger that produced this reservation.
+            external_load_kw = max(persisted_load_kw, observed_load_kw, observed_limit_kw)
+            reservation["load_kw"] = external_load_kw or reservation["load_kw"]
     reservations.setdefault(entry.entry_id, reservation)
 
 

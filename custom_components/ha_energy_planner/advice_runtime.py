@@ -179,7 +179,7 @@ async def async_request_ai_advice(self: EnergyPlannerCoordinator) -> None:
 
 @callback
 def _sync_ai_request_to_plan(self: EnergyPlannerCoordinator, plan: EnergyPlan) -> None:
-    """Cancel an in-flight explanation if its deterministic plan is obsolete."""
+    """Cancel obsolete advice before Core publishes the replacement plan."""
     safe = plan.health != InputHealth.UNSAFE and plan.status != "unsafe" and plan.confidence > 0
     fingerprint = _material_plan_fingerprint(plan) if safe else None
     self._ai_current_plan_safe = safe
@@ -190,7 +190,6 @@ def _sync_ai_request_to_plan(self: EnergyPlannerCoordinator, plan: EnergyPlan) -
     if not safe or getattr(self, "_ai_advice_fingerprint", None) != fingerprint:
         current.cancel()
         self._clear_ai_advice_pending()
-        self.async_update_listeners()
 
 
 async def _async_run_ai_advice(
