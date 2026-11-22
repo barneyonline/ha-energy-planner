@@ -207,9 +207,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 coordinator._debounce_cancel = None
             await coordinator.async_refresh()
             await coordinator.async_wait_for_plan_execution()
-            ai_task = getattr(coordinator, "_ai_advice_task", None)
-            if ai_task is not None:
-                await ai_task
+
+    async def wait_for_ai_explanation(call: ServiceCall) -> None:
+        """Wait for Explain's background Store write before requesting another plan."""
+        entry = next(iter(hass.config_entries.async_entries("ha_energy_planner")))
+        task = entry.runtime_data._ai_advice_task
+        if task is None:
+            return
+        done, _ = await asyncio.wait({task}, timeout=30)
+        if not done:
+            raise TimeoutError("AI explanation did not complete within 30 seconds")
+        if task.cancelled():
+            raise RuntimeError("AI explanation was cancelled before completion")
+        task.result()
 
     async def assert_startup_climate_restored(call: ServiceCall) -> None:
         """Check the restored baseline and include actual state on failure."""
@@ -460,6 +470,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
     hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
     hass.services.async_register(DOMAIN, "wait_for_planner_idle", wait_for_planner_idle)
+    hass.services.async_register(DOMAIN, "wait_for_ai_explanation", wait_for_ai_explanation)
     hass.services.async_register(DOMAIN, "assert_startup_climate_restored", assert_startup_climate_restored)
     hass.services.async_register(DOMAIN, "wait_for_manual_override_clear", wait_for_manual_override_clear)
     hass.services.async_register(DOMAIN, "wait_for_hvac_away_off", wait_for_hvac_away_off)
@@ -1137,7 +1148,8 @@ automation:
       - action: button.press
         data:
           entity_id: button.energy_planner_explain
-      - action: fake_planner_test.wait_for_planner_idle
+      # A materially changed plan cancels an in-flight explanation.
+      - action: fake_planner_test.wait_for_ai_explanation
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
       - action: input_text.set_value

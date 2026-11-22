@@ -1,8 +1,8 @@
-"""HA-independent startup ordering and failure diagnostics.
+"""HA-independent smoke scenario ordering and failure diagnostics.
 
 Run directly with ``python3 -I tests/scripts/test_smoke_startup_contract.py -v``
 to avoid the Home Assistant import in tests/conftest.py. Only YAML parsing and
-the extracted assertion helper run; the smoke shell script is never executed.
+the extracted helpers run; the smoke shell script is never executed.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import yaml
 
@@ -28,7 +29,7 @@ def heredoc(target, delimiter):
     )[0]
 
 
-def startup_actions():
+def smoke_actions():
     config = yaml.safe_load(heredoc("configuration.yaml", "YAML"))
     return next(
         item["actions"] for item in config["automation"]
@@ -40,9 +41,71 @@ def seeded_ownership():
     return json.loads(heredoc(".storage/ha_energy_planner_state", "JSON"))["data"]["ownership"]
 
 
+def smoke_helper(name, hass):
+    # Compile only the requested helper. No helper-module imports or setup run.
+    tree = ast.parse(heredoc("custom_components/fake_planner_test/__init__.py", "PY"))
+    setup = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef))
+    helper = next(node for node in setup.body if (
+        isinstance(node, ast.AsyncFunctionDef) and node.name == name
+    ))
+    namespace = {"hass": hass, "asyncio": asyncio, "json": json}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "smoke helper", "exec"), namespace)
+    return namespace[name]
+
+
+class AIExplanationContractTests(unittest.TestCase):
+    def explanation_wait(self, writer):
+        hass = SimpleNamespace(config_entries=SimpleNamespace(async_entries=lambda domain: [
+            SimpleNamespace(runtime_data=SimpleNamespace(_ai_advice_task=writer)),
+        ]))
+        return smoke_helper("wait_for_ai_explanation", hass)(None)
+
+    def test_explain_waits_before_any_further_refresh(self):
+        actions = smoke_actions()
+        explain = actions.index({
+            "action": "button.press", "data": {"entity_id": "button.energy_planner_explain"},
+        })
+        self.assertEqual([step["action"] for step in actions[explain + 1:explain + 3]], [
+            "fake_planner_test.wait_for_ai_explanation",
+            "ha_energy_planner.replan",
+        ])
+
+    def test_explanation_waits_for_background_write(self):
+        async def scenario():
+            writer = asyncio.get_running_loop().create_future()
+            async with asyncio.TaskGroup() as tasks:
+                waiter = tasks.create_task(self.explanation_wait(writer))
+                await asyncio.sleep(0)
+                self.assertFalse(waiter.done())
+                writer.set_result(None)
+                await asyncio.wait_for(waiter, timeout=1)
+
+        asyncio.run(scenario())
+
+    def test_explanation_wait_times_out_with_write_still_pending(self):
+        async def scenario():
+            writer = asyncio.get_running_loop().create_future()
+            with patch.object(asyncio, "wait", return_value=(set(), {writer})) as wait:
+                with self.assertRaisesRegex(TimeoutError, "did not complete within 30 seconds"):
+                    await self.explanation_wait(writer)
+            wait.assert_awaited_once_with({writer}, timeout=30)
+            self.assertFalse(writer.done())
+
+        asyncio.run(scenario())
+
+    def test_cancelled_explanation_fails_the_wait(self):
+        async def scenario():
+            writer = asyncio.get_running_loop().create_future()
+            writer.cancel()
+            with self.assertRaisesRegex(RuntimeError, "cancelled before completion"):
+                await self.explanation_wait(writer)
+
+        asyncio.run(scenario())
+
+
 class StartupContractTests(unittest.TestCase):
     def test_first_off_assertion_follows_input_readiness_restore_and_drain(self):
-        actions = startup_actions()
+        actions = smoke_actions()
         assertion = next(
             i for i, step in enumerate(actions)
             if step.get("action") == "fake_planner_test.assert_startup_climate_restored"
@@ -79,15 +142,7 @@ class StartupContractTests(unittest.TestCase):
             )),
             config_entries=SimpleNamespace(async_entries=lambda domain: entries),
         )
-        # Compile only this assertion's AST. No helper-module imports or setup run.
-        tree = ast.parse(heredoc("custom_components/fake_planner_test/__init__.py", "PY"))
-        setup = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef))
-        helper = next(node for node in setup.body if (
-            isinstance(node, ast.AsyncFunctionDef) and node.name == "assert_startup_climate_restored"
-        ))
-        namespace = {"hass": hass, "json": json}
-        exec(compile(ast.Module(body=[helper], type_ignores=[]), "smoke assertion", "exec"), namespace)
-        return namespace[helper.name](None)
+        return smoke_helper("assert_startup_climate_restored", hass)(None)
 
     def test_seeded_legacy_ownership_is_reported_when_sensor_stays_on(self):
         ownership = seeded_ownership()
