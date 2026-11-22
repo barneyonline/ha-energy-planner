@@ -54,6 +54,11 @@ INSTALLER_SESSION_EXPIRED = "export_limit_service_rejected:installer_session_exp
 INSTALLER_WRITE_REJECTED = "export_limit_service_rejected"
 GATEWAY_CHANGED = "export_limit_gateway_changed"
 TARGET_CHANGED = "export_limit_target_changed"
+_UNSENT_GATEWAY_REJECTIONS = {
+    "export_limit_changed": "export_limit_target_changed",
+    "export_limit_pending": "export_limit_pending",
+    "export_limit_mismatch": INSTALLER_FORM_MISMATCH,
+}
 GATEWAY_ISSUES = frozenset({GATEWAY_CHANGED, GATEWAY_UNVERIFIED})
 EXPORT_IDENTITY_ISSUES = GATEWAY_ISSUES | {TARGET_CHANGED}
 COMPANION_UPGRADE_REQUIRED = "export_limit_companion_upgrade_required"
@@ -110,7 +115,7 @@ def owned_feedback_issue(
     if saved and live and not same_control(saved, live):
         return TARGET_CHANGED
     gateway = ownership.get("gateway_identity")
-    if issue is None and (gateway or ownership.get("pending") or ownership.get("baseline")):
+    if issue is None and (gateway or any(ownership.get(key) for key in ("pending", "baseline", "retry"))):
         return gateway_identity_issue(gateway, observed.get("gateway_identity"))
     return issue
 
@@ -624,7 +629,7 @@ class ExportLimitControl:
 
     async def audit(
         self, pending: dict[str, Any], result: OutcomeResult, reason: str, now: datetime, observed: dict[str, Any],
-        *, desired_state: dict[str, Any] | None = None,
+        *, desired_state: dict[str, Any] | None = None, command_sent: bool | None = None,
     ) -> None:
         await self.store.async_add_outcome(
             ActionOutcome(
@@ -644,6 +649,7 @@ class ExportLimitControl:
                 kind=pending["kind"],
                 service_target=pending["identity"]["entity_id"],
                 desired_state=desired_state if desired_state is not None else {"watts": pending["watts"]},
+                command_sent=command_sent,
             )
         )
 
@@ -826,26 +832,44 @@ class ExportLimitControl:
     ) -> None:
         """Pause once even if readback itself has become unavailable or stale."""
         if state.get("pause") != "export_limit_unconfirmed":
-            state["pause"] = "export_limit_unconfirmed"
-            await self.save(state)
-            await self.audit(pending, OutcomeResult.FAILED, "export_limit_unconfirmed", now, observed)
+            async with self.store.async_delay_save():
+                await self.audit(pending, OutcomeResult.FAILED, "export_limit_unconfirmed", now, observed)
+                state["pause"] = "export_limit_unconfirmed"
+                await self.save(state)
 
     async def resume(self) -> None:
         """Clear a pause or retire ownership of a verified replaced gateway."""
         state = self.state
         now = datetime.now(UTC)
-        observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
-        gateway = state.get("gateway_identity")
-        owned_identity = state.get("identity")
+        entity = self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        observed, issue = feedback(self.hass, entity, now)
         if owned_feedback_issue(state, observed, issue) == TARGET_CHANGED:
             return
+        gateway = state.get("gateway_identity")
+        owned_identity = state.get("identity")
+        replacement = observed.get("gateway_identity")
         can_retire = (
-            not issue and not observed["pending"] and observed.get("gateway_identity")
-            and observed["gateway_identity"] != gateway
-            and owned_identity
+            not issue and replacement and replacement != gateway
+            and owned_identity and same_control(observed["identity"], owned_identity)
         )
         if pending := state.get("pending"):
-            if can_retire and (gateway or state.get("pause") == "export_limit_unconfirmed"):
+            if owned_identity and can_retire and (gateway or state.get("pause") == "export_limit_unconfirmed"):
+                if observed["pending"]:
+                    upstream = installer_runtime(self.hass, owned_identity)
+                    retire = getattr(upstream, "async_retire_replaced_intent", None)
+                    if not callable(retire):
+                        return
+                    try:
+                        async with asyncio.timeout(DEVICE_SERVICE_TIMEOUT_SECONDS):
+                            if not await retire(replacement, original_gateway=gateway):
+                                return
+                    except (ServiceValidationError, TimeoutError):
+                        return
+                    now = datetime.now(UTC)
+                    observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+                    if (issue or observed["pending"] or observed.get("gateway_identity") != replacement
+                            or not same_control(observed["identity"], owned_identity) or self.state != state):
+                        return
                 # Keep the original reservation and account for an uncertain
                 # dispatch without treating the replacement as confirmation.
                 async with self.store.async_delay_save():
@@ -854,7 +878,7 @@ class ExportLimitControl:
                     await self.save({})
                 await self.store.async_flush()
             return
-        if can_retire:
+        if can_retire and not observed["pending"]:
             await self.save({})
             return
         state.pop("pause", None)
@@ -1018,6 +1042,16 @@ class ExportLimitControl:
                 await rollback_reservation("export_limit_retry_not_sent")
             raise
         except ServiceValidationError as err:
+            if (retry_apply is None and "expected_gateway" in data and err.translation_domain == "enphase_ev"
+                    and (reason := _UNSENT_GATEWAY_REJECTIONS.get(err.translation_key or "")) is not None):
+                # The companion raises these during locked preparation, before saving or sending the request.
+                if reason == INSTALLER_FORM_MISMATCH:
+                    previous.setdefault("identity", state["identity"])
+                    previous["pause"] = reason
+                await rollback_reservation(reason)
+                if restore:
+                    await self.audit(pending, OutcomeResult.REJECTED, reason, dispatch_now, latest, command_sent=False)
+                return OutcomeResult.REJECTED, reason, False
             if not dispatch_reached:
                 if isinstance(err, RetryWriteDeferred):
                     reason = err.reason

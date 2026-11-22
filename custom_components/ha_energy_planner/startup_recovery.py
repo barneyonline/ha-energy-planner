@@ -15,6 +15,7 @@ from .const import (
     CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
     STARTUP_WARMUP_SECONDS,
 )
 from .export_limit_policy import area_safe
@@ -621,10 +622,24 @@ def _startup_auto_recovery_validation_ready(
     """Return whether a committed recovery plan passes all non-production gates."""
     ready, reason = _startup_auto_recovery_prerequisites(report, entry_data)
     if not ready:
+        if reason == "no_ready_control_area" and _startup_waiting_for_dry_mode(report, entry_data):
+            return False, HVAC_DRY_ZONE_TARGETS_ABSENT
         return ready, reason
     if not bool(dict(report.get("current_plan", {})).get("safe")):
         return False, "current_plan_unsafe"
     return True, "validation_succeeded"
+
+
+def _startup_waiting_for_dry_mode(report: dict[str, Any], entry_data: dict[str, Any]) -> bool:
+    """Distinguish a temporary HVAC-only startup block from faulty prerequisites."""
+    entities = report.get("entities", {})
+    return (
+        report.get("control_areas", {}).get("required") == ["hvac"]
+        and report.get("discovery", {}).get("hvac", {}).get("issues") == [HVAC_DRY_ZONE_TARGETS_ABSENT]
+        and bool(report.get("current_plan", {}).get("safe"))
+        and not (entities.get("missing") or entities.get("unavailable"))
+        and (not entry_data.get(CONF_HOUSEHOLD_LOAD) or bool(report.get("recorder", {}).get("available")))
+    )
 
 
 def _action_outcome_failed(outcome: Any) -> bool:

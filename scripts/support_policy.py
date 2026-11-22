@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single source for release validation versions; HACS owns the minimum."""
+"""Resolve release validation versions from hacs.json and pyproject.toml."""
 
 from __future__ import annotations
 

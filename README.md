@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/barneyonline/ha-energy-planner/releases"><img src="https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&amp;sort=semver" alt="Latest release"></a>
   <a href="https://codecov.io/gh/barneyonline/ha-energy-planner"><img src="https://codecov.io/gh/barneyonline/ha-energy-planner/branch/main/graph/badge.svg" alt="Codecov coverage"></a>
-  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&amp;repository=ha-energy-planner&amp;category=integration"><img src="https://img.shields.io/badge/HACS-Open_repository-41BDF5.svg" alt="Open Energy Planner in HACS"></a>
+  <a href="https://my.home-assistant.io/redirect/marketplace_repository/?owner=barneyonline&amp;repository=ha-energy-planner&amp;category=integration"><img src="https://img.shields.io/badge/Marketplace-Open_repository-41BDF5.svg" alt="Open Energy Planner in Home Assistant Marketplace"></a>
 </p>
 
 <p align="center">Coordinate EV charging, climate comfort and Enphase controls with your home's energy plan.</p>
@@ -80,21 +80,15 @@ The calendar distinguishes upcoming plan windows from retained confirmed activit
 
 ## Get started
 
-1. [Open Energy Planner in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration), add the repository if prompted, and download it.
-2. Restart Home Assistant, then add **Energy Planner** under **Settings → Devices & services → Add integration**.
+Requires **Home Assistant 2026.11.0 or newer** (Python **3.14+**).
+
+1. [Open Energy Planner in Marketplace](https://my.home-assistant.io/redirect/marketplace_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration). If it is missing from the catalog, go to **Settings → Marketplace → Add from link**, connect GitHub when prompted, and enter `barneyonline/ha-energy-planner`.
+2. Select **Install**. Complete the setup that opens, or add **Energy Planner** under **Settings → Devices & services → Add integration**. Restart Home Assistant first if prompted.
 3. Map your inputs in **Configure → Planner settings**. Keep **Automatic control** off while reviewing plans and the safety check.
-
-Enter your Home Assistant URL if prompted by the HACS link. [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
-
-Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
-
-**Automatic control** records your request to operate; **Armed** reports actual command authority.
 
 ## Documentation
 
 [Setup](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup) · [Safety and production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production) · [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) · [Known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
-
-The [planning and control guide](docs/planning-and-control.md) preserves the detailed operating notes, compatibility requirements and safety limits.
 
 <details>
 <summary>Planning and control details</summary>
@@ -114,10 +108,6 @@ The [planning and control guide](docs/planning-and-control.md) preserves the det
 Configured through the Home Assistant UI. No separate vendor credentials or third-party Python dependencies are required. AI explanations are advisory; selected planner context goes to your configured provider only when requested.
 
 </details>
-
-Development validation covers the minimum and current stable Home Assistant runtimes; see the [CI hang diagnostics](docs/validation-warnings.md#ci-hang-diagnostics).
-
-[Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
 
 ---
 

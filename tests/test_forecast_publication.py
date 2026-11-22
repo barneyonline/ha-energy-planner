@@ -132,7 +132,8 @@ def test_forecast_stays_aligned_during_refresh_persistence_and_listeners(
         )
         monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
         monkeypatch.setattr(coordinator_module, "CapabilityDiscovery", lambda *args: SimpleNamespace(
-            inspect=lambda: SimpleNamespace(as_dict=lambda: {"fixture": True}),
+            inspect=lambda **kwargs: SimpleNamespace(as_dict=lambda: {"fixture": True}),
+            hvac_evidence_in_dry=lambda: None,
         ))
         rows = [{"start_time": now.isoformat(), "end_time": (now + timedelta(minutes=30)).isoformat(),
                  "per_kwh": 1 if outcome == "tariff_type_changed" else 0.2}]

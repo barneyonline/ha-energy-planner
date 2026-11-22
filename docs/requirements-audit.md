@@ -9,6 +9,22 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Current state publishes Home Assistant's reported temperature unit alongside
+  live climate readings and targets, including low/high targets. The unit is
+  omitted when the source lacks a valid unit or supplies no temperature details.
+  The summary uses the live reading when the head reports a non-Celsius unit.
+  `tests/test_sensor.py` checks Celsius, Fahrenheit, and omission cases through
+  the Recorder-bounded sensor attributes and replays the data shape in
+  `tests/fixtures/live_schema/climate_zone_temperatures.json`.
+  See [planning and control](planning-and-control.md#feature-reference).
+- The Climate control active entity opts into Home Assistant 2026.11's in-place
+  entity ID changes. Its store and coordinator subscriptions continue publishing
+  under the new entity ID and are cleaned up on unload. `tests/test_ha_runtime.py`
+  exercises rename and unload through the actual entity registry and platform.
+- Operator guides explain how [Home Assistant Action history](stable-release.md#example-setup)
+  complements verified Planner activity, when to use [ABRP SoC](ev-scheduling.md#charging-observations),
+  and how to interpret optional [Enphase radio diagnostics](export-limit-timing.md).
+
 - Local integration branding ships all eight Home Assistant PNG variants under
   `custom_components/ha_energy_planner/brand/`: transparent light/dark icons at
   256×256 and 512×512, and light/dark wordmark logos at 548×256 and 1096×512.
@@ -90,7 +106,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   This changes documentation presentation only. Full validation remains
   `scripts/docker-validate.sh`.
 
-- The README presents concise features before a compact light/dark screenshot gallery, links directly to this repository in HACS, and keeps project badges visible outside expandable sections. `docs/planning-and-control.md` preserves the previous README's detailed behavior, compatibility requirements and safety limits, with corrected relative links. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. This is a documentation change; runtime behavior, configuration and quality-scale claims are unchanged. Full validation remains `scripts/docker-validate.sh`.
+- The README presents concise features before a compact light/dark screenshot gallery and keeps project badges visible outside expandable sections. Its installation guide links to the Marketplace listing, documents the Home Assistant 2026.11.0 minimum and explains how to add the repository from a link. The bug report form accepts both Marketplace and HACS as installation methods. `docs/planning-and-control.md` describes behavior, compatibility requirements and safety limits. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. Full validation remains `scripts/docker-validate.sh`.
 
 - UI-only configuration is declared by `CONFIG_SCHEMA` delegating to `cv.config_entry_only_config_schema(DOMAIN)` in `__init__.py`, as required by hassfest for integrations with `async_setup`. The helper is imported when validation runs so standalone planner tools remain usable without Home Assistant installed. `tests/test_ha_runtime.py` covers normal configuration and unsupported domain YAML. Integration services remain registered in `async_setup`; service tests and the Docker smoke gate cover service registration.
 
@@ -159,6 +175,7 @@ use throughout; the Docker and pull-request gates enforce that result.
 - Export setting mutations share a dedicated 300-second minimum across normal policy, restoration and resumed retries. `export_limit_cooldown.py` keys durable reservations by upstream config entry, control unique ID and device ID, excluding entity aliases; `enphase_export_limit.py` persists reservations before dispatch and starts a separate full 300-second wait at the first fresh matching confirmation observed by Planner. Upstream `last_successful_readback` is a settings-read completion timestamp, not physical-change time. Repeated reads do not extend that observation deadline. Pending/uncertain commands retain ownership and block retries, while rejection retains its reservation across resume/restart. Exact restoration baselines survive cooldown deferral, and clearing restored ownership does not erase timing. Known unsent requests and no-ops do not consume budget or create successful control/savings evidence. An external intervention that retires an uncertain request starts a separate safety wait without recording Planner confirmation or applied control; repeated settlement observations retain the first deadline. Old timing schemas, present null legacy timestamps and invalid/future/backward clocks receive a persisted bounded conservative wait. Clock repair freezes the original restoration audit identity separately from reconciliation time, preserving idempotent confirmed calendar history across repeated rollback/restart replay. The existing stricter general interval also applies to restoration and cannot be shortened by editing options after a reservation. `coordinator.py` schedules one refresh at the earlier tariff boundary or eligible-change time (or immediately if input collection crosses eligibility), using current valid tariff/device evidence without queueing obsolete intent; diagnostics, next actions and calendar previews expose the cooldown reason and deadline. `tests/test_export_limit_cooldown.py` and updated `tests/test_export_limit.py` exercise latency, rapid sign changes, no-op cancellation, failures, persistence, aliases, recovery, exact 299/300-second boundaries, clock recovery, evidence blockers and presentation. See [export timing](export-limit-timing.md). Fresh, settled feedback readiness is retained independently of mutation readiness. `export_limit_policy.py` projects the confirmed zero/finite/disabled limit during deferral and valid eligible future intent only when no other blocker or restoration has authority. `planner.py` uses the same export cap for estimated costs while preserving raw production and on-site solar use. Regressions in `tests/test_export_limit_cooldown.py` cover tariff signs, above/below-cap surplus, exact eligibility, service blockers, pending/uncertain/stale readback, restoration priority and import costs, with no new commands or successful-control outcomes. These tests establish simulated requests and observed confirmations, not live physical timing.
 
 - Export Limit accepts Amber's declared 30-minute first-second timestamp convention (e.g. 02:00:01Z–02:30:00Z) as the half-open control window [02:00:00Z, 02:30:00Z). `export_limit_policy.py` normalizes only an explicit numeric duration of 30 with exactly 29m59s between aware UTC timestamps and an exact half-hour end; it does not change prices, infer missing ends or relax other duration/gap/overlap checks. The detailed forecast retains precedence over convenience forecasts. `tests/test_export_limit.py` covers exact boundary sign transitions, both key styles, mixed timestamp conventions, DST, missing/invalid duration evidence, subsecond/other offsets, true gaps/overlaps and confirmed command deduplication; `tests/fixtures/live_schema/export_tariff_amber_first_second.json` preserves the sanitized observed payload shape in the full schema gate. The convention matches [Amber's API schema](https://github.com/amberelectric/public-api/blob/main/swagger.json). No live-device execution is claimed by these regressions.
+- Export Limit rejects conflicting cadence aliases, inconsistent row durations, and UTC timestamps or inferred ends outside the supported range. Generic tariff sampling preserves a gap when a timestamp cannot be represented. The cache reuses unchanged source rows and revalidates a nested change on the same Home Assistant State before either ordinary or guarded retry dispatch. `tests/test_export_limit_cooldown.py` verifies cache reuse, structure changes, and price type changes that compare equal in Python. `tests/test_forecasts.py`, `tests/test_export_limit.py` and the export tariff live-schema fixtures cover parsing and dispatch offline.
 
 - Export Limit lifecycle review regressions cover upstream Unconfirmed with retained pending intent, external slew changes during confirmation, rollback of unsent requests on persistence failure/cancellation, conflicting declared tariff cadence, startup recovery without unrelated Recorder evidence, independent toggles during startup grace, off-selector restoration presentation/timer cancellation, deferred unload while restoration is pending, preservation of other areas' failed restoration results, target races before restore dispatch, target-specific rejected-restore audit evidence, and immediate confirmed-restoration outcomes (`tests/test_export_limit.py`, `tests/test_lifecycle.py`).
 
@@ -216,18 +233,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   These supplement the existing constraint-only supplied-plan replay fixtures.
 - Custom integration scaffold, config flow, options flow, entities, services,
   diagnostics, and versioned Home Assistant `Store` persistence are present.
-  EV maximum import price and low-price charging threshold use conditional
-  `data_entry_flow.Required` markers when the HA 2026.11 API is available.
-  The fallback retains unconditional required fields and existing defaults;
-  omitted hidden thresholds retain stored values through the options merge.
-  `tests/test_config_flow.py` covers both marker paths, independent toggle
-  conditions, omitted values, repeated disable/enable edits, and new-API
-  serialization/validation (the latter requires a supporting HA runtime).
+  EV price settings use native `data_entry_flow.Required` visibility markers.
+  The import and low-price toggles control their own fields. Emergency price
+  and budget also require Departure priority. Hidden values are retained
+  through the options merge.
+  `tests/test_config_flow.py` covers section-local conditions, omitted values,
+  repeated disable/enable edits, and native serialization and validation.
   `tests/test_conditional_ev_options_runtime.py` exercises complete forms through
   HA's options manager, including default injection, stale hidden submissions,
-  persisted values on reopen, independent thresholds and the fallback schema.
-  These runtime checks await a permitted environment; source-contract checks
-  alone do not verify the options manager or browser behavior.
+  persisted values on reopen, independent thresholds, and changes to the
+  departure price policy. CI runs this contract on the pinned minimum and stable.
   The manifest classifies Energy Planner as a service integration so configured
   entries remain visible on the main Devices & services integration page rather
   than being routed to the Helpers-only experience.
@@ -907,8 +922,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   full failure timeout. Pull-request CI classifies changed paths with
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
   fails safe to the full CI set for an unclassified trigger path.
-  Behavioral changes also run real runtime contracts and smoke tests on the HACS
-  minimum/pinned HA 2026.10.0 and current stable. Documentation-only
+  Behavioral changes also run real runtime contracts and smoke tests on the Marketplace
+  minimum/pinned HA 2026.11.0 and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
   complete local gate including minimum/pinned runtime contracts and package smoke.
   CI pins Ubuntu 26.04 and Node 24 artifact uploads. Smoke runs export synthetic
@@ -1182,12 +1197,139 @@ use throughout; the Docker and pull-request gates enforce that result.
   target, and failed acquisition restores the captured main mode and target before reporting
   rollback success. Options-aware discovery always validates the finite main
   rollback target and additionally validates configured-zone targets when
-  synchronisation is enabled. Off zones with entirely absent target attributes are
+  synchronisation is enabled. Discovery validates the target fields chosen by
+  rollback and rejects boolean setpoints, values outside the supported numeric
+  range, and malformed selected ranges, including reversed finite bounds.
+  Oversized setpoints remain reportable faults through discovery, state listeners,
+  and context construction. `tests/test_control_runtime.py` verifies that such
+  feedback still allows automation restoration and successful on-disk recovery.
+  A late Dry transition after a head or damper write also withholds further takeover
+  commands and retains the capability reason through restoration, manual overrides,
+  failures while saving or retiring an unsent intent, and transient Dry during
+  command readback. This includes generic zone switch and helper feedback. If
+  Dry interrupts an accepted write, Planner checks its feedback before
+  compensating. Dispatched zone and automation failures retain that check when
+  Dry or a manual override arrives during recovery preparation. A malformed zone
+  bound retains that zone's restoration baseline while other settings recover.
+  Verified Off starts can continue through a matching Dry recall only when dispatch
+  observed the head Off, subsequent feedback matches that recall, and concurrent
+  capability checks pass.
+  A same-interval refresh reports zone rollback faults when registry verification
+  enables independent synchronization without a change in entity state.
+  Off zones with entirely absent target attributes are
   deferred for that takeover, including provisional ownership persistence, retries,
   confirmation, and rollback; the planner never invents a rollback temperature.
   Main control, switch/helper takeover, and other zones remain eligible.
   `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
-  recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
+  recovered zones. Unavailable or malformed-target zones retain safety checks.
+  When a registered native Daikin head and zone on the same controller both
+  report Dry and the zone exposes no targets, `climate_zone_targets_absent_in_dry_mode`
+  blocks synchronized takeover, including verified independent-zone control with
+  the general synchronization option off. It is reported at INFO, including brief blocks discovered
+  by queued commands between refreshes. Concurrent faults still follow the
+  normal warning and notification paths. An otherwise healthy HVAC-only startup
+  waits and retries when Dry is the sole blocker without a persistent startup
+  fault notification. The sanitized Dry-mode replay covers
+  restoration of owned settings, Off recovery, and escalation when a target
+  stays missing in Cool. Planner excludes blocked takeover load from grid
+  projections and preserves independent EV confidence during load fallback
+  when the concurrent faults are limited to HVAC. The executor
+  and adapter recheck Dry after storing provisional ownership, during
+  automation suppression, and at the first head or zone write. Tests cover real
+  scheduler guard calls, a guard that fails as Dry starts, compensation after
+  the last automation is confirmed off, and supported Off starts that recall
+  Dry after activation. The audit distinguishes refusals after automation
+  suppression from refusals before dispatch. Successful actions count material
+  suppression only when the suppression call was dispatched. Planned and
+  queued refusals use the same explanation and surface concurrent rollback-target
+  faults first, including faults first observed during a late capability check.
+  A queued coast refusal reaches preconditioning status through the execution
+  audit without adding an outcome to preparation history.
+  The Dry explanation remains visible after a compensated automation failure,
+  which remains in the action audit.
+  The live queue checks for Dry before cycle and action validation and records
+  Dry refusals when an already-blocked continuation releases earlier ownership.
+  The execution audit retains concurrent faults and dispatch evidence if
+  automation suppression or restoration fails, including faults first observed
+  after automation restoration.
+  The adapter rechecks Dry after scheduler setup, at failed confirmation
+  persistence, and during readback before the first actuator write. Planner
+  saves only pending automation recovery before compensating a Dry-blocked
+  takeover, including when that compensation is interrupted.
+  For an unsent head command, confirmation and minimum-cycle intent are
+  retired in the same write as the narrowed recovery ownership.
+  An interrupted provisional ownership write in verified Dry retires the
+  unmodified climate snapshots. Unused Off-start metadata from the aborted
+  attempt cannot block automation recovery if AirBase becomes unavailable.
+  Queued Dry refusals stay visible while prior preconditioning is still
+  owned, and concurrent availability warnings name only faulted zones.
+  A local dispatch refusal creates no automation restoration ownership, and
+  a failed synchronized suppression retains only automation recovery before
+  compensation. A Dry transition during that compensation reaches the audit.
+  Cancelling acquisition in verified Dry before actuator dispatch retains only
+  prior ownership and attempted automation suppression. If an accepted suppression
+  is still awaiting feedback, Planner waits for Off after saving recovery so the
+  release retry can restore On. If readback times out or recovery is interrupted,
+  the saved suppression evidence makes release explicitly re-enable the automation
+  despite cached On, including while zone target restoration remains deferred.
+  A queued takeover after Dry ends resolves pending suppression before writing
+  to the HVAC, including when no thermostat baseline remains in ownership.
+  Post-dispatch compensation also rechecks Dry and concurrent
+  faults after restoring the automations. A manual override before any HVAC
+  dispatch uses the same automation-only recovery, including when Off feedback
+  times out or Dry begins during compensation. Emergency shutdown
+  remains available for an Off baseline when dispatch is uncertain or Dry is
+  unverified. Queued refusals also retain Dry and other capability evidence
+  when a concurrent manual override supersedes saved climate settings. Planner
+  rechecks Dry after saving and reconciling the supersession, including a failed
+  save before the first actuator write. It rechecks after the failed guard's
+  supersession save and after final readback while the HVAC is still untouched.
+  Rollback settles accepted automation and generic zone writes before compensating
+  for a head or sibling override. If Dry first appears while a supersession is
+  saved, a dispatched thermostat write settles under its original confirmation
+  deadline before compensation.
+  A scheduler guard failure before the first synchronized actuator dispatch
+  retires untouched snapshots and retains only outstanding automation recovery.
+  Synchronized takeover, including actions that explicitly request zone
+  synchronization, revalidates availability and live rollback targets
+  after the provisional ownership save and through the first actuator's
+  dispatch checks, including active zones with a previously saved baseline and
+  zones excluded while Off that report Heat or Cool before dispatch.
+  The audit records both Dry transitions observed by live checks. An episode
+  observed only by execution invalidates plan reuse after Dry ends. If recovery
+  observes the exit, INFO records it immediately and the audit retains the
+  earlier Dry refusal alongside any genuine target fault observed after the
+  exit. Current state keeps both zone classifications visible
+  even when a malformed target exceeds Recorder's numeric range.
+  A planning refresh during verified Off-start recall cannot produce a false
+  Dry exit while the head is still in Dry. A release queued solely from that
+  provisional Dry evidence is rechecked after the start confirms Heat or Cool,
+  including when confirmation finishes during the refresh. A recovery fault
+  saved before or after planning still triggers release.
+  Dry that starts while retiring an unsent confirmation blocks climate rollback
+  even if retirement fails. A superseded or already confirmed command is
+  excluded when preserving earlier readback uncertainty, including a head target
+  confirmed before the first zone write was prepared.
+  Recovery and ownership completion clear superseded climate baselines and
+  confirmations for overrides that arrive during either save, including when
+  cancellation interrupts ownership or accounting persistence after the adapter
+  returns. An interrupted provisional save also honors user changes with healthy
+  live capability. Errors retiring an unsent intent, releasing prior ownership,
+  or saving recovery preserve the original cancellation and attach the recovery
+  failure as its cause. A failed replacement before actuator dispatch restores suspended
+  automations and retains an earlier pending confirmation with its original
+  context, subject to manual supersession.
+  Audit marks a command as issued only after local service preflight, preserving
+  feedback evidence from earlier dispatches when a new target is rejected.
+  A locally rejected first actuator in a
+  synchronized takeover retires its untouched snapshots, even if the Dry
+  feedback arrives after the local rejection. Per-zone outage identity warns
+  on a new missing Cool target even when another zone was already faulted.
+  The notification checks live rollback-target faults before notifying, and both
+  state and action sensors list unavailable zones separately from Dry zones.
+  Discovery retains legacy head target validation when synchronization is disabled.
+  Changes to the verified zone set invalidate the plan fingerprint in Dry even
+  when the climate states and attributes are unchanged.
   Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
   frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution and compatible restored targets. Main-unit turn-on may restore the remembered mode before the requested mode is applied; zone-switch feedback must match the command-time head mode, or the requested mode when the head is off. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only compatible recovered targets within the bounded command settling period. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction, including a cooling request that first restores remembered heating; attributed changes, unrelated zones, inactive modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping
@@ -1531,7 +1673,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
-- The minimum and pinned baseline are HA 2026.10.0. Migration recovery uses the
+- Vehicle target migration repairs use Home Assistant's issue registry ownership
+  and refresh APIs. At startup `migration_recovery.py` reconciles only existing
+  `legacy_vehicle_target_` issue IDs, including saved ownerless records. It
+  adopts pending repairs in place and preserves their creation time and ignored
+  status, including repairs with a saved target and a failed migration retry.
+  Native refresh removes notices for removed or migrated entries and cancels
+  that cleanup if an update raises. Removal also clears any ownerless record for
+  the entry. `tests/test_repairs.py` covers startup, restart, disabled-entry
+  visibility, removal isolation, and interrupted refresh with the real registry.
+- The 1.4.0 minimum and pinned baseline were HA 2026.10.0. Migration recovery uses the
   public retry API directly; obsolete restart branches, strings and tests are
   removed. Schemas import Probatio directly; binary-sensor device classes use
   the current constant module. Tests still initialize HA before collection to

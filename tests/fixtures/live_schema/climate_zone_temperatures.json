@@ -24,7 +24,12 @@
   "states": {
     "climate.living": {
       "state": "cool",
-      "attributes": {},
+      "attributes": {
+        "current_temperature": 70,
+        "temperature": 71,
+        "temperature_unit": "\u00b0F",
+        "hvac_action": "cooling"
+      },
       "last_updated": "2026-10-18T00:00:00+00:00"
     },
     "sensor.living_temperature": {
@@ -35,8 +40,12 @@
       "last_updated": "2026-10-18T00:00:00+00:00"
     },
     "climate.family": {
-      "state": "cool",
-      "attributes": {},
+      "state": "heat_cool",
+      "attributes": {
+        "target_temp_low": 68,
+        "target_temp_high": 75,
+        "temperature_unit": "\u00b0F"
+      },
       "last_updated": "2026-10-18T00:00:00+00:00"
     },
     "sensor.family_temperature": {

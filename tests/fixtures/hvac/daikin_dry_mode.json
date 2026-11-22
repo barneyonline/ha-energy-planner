@@ -1,0 +1,28 @@
+{
+  "description": "Sanitized native Daikin Off through Dry to Off replay with two configured zones",
+  "entity_ids": {
+    "head": "climate.daikin",
+    "main": "climate.daikin_main_temperature",
+    "bedrooms": "climate.daikin_bedrooms_temperature"
+  },
+  "samples": [
+    {
+      "mode": "off",
+      "head_attributes": {"temperature": 17},
+      "main_attributes": {"zone_id": 0},
+      "bedrooms_attributes": {"zone_id": 1}
+    },
+    {
+      "mode": "dry",
+      "head_attributes": {"temperature": 17},
+      "main_attributes": {"zone_id": 0, "temperature": null},
+      "bedrooms_attributes": {"zone_id": 1}
+    },
+    {
+      "mode": "off",
+      "head_attributes": {"temperature": 17},
+      "main_attributes": {"zone_id": 0},
+      "bedrooms_attributes": {"zone_id": 1}
+    }
+  ]
+}

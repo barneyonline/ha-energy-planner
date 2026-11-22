@@ -62,6 +62,7 @@ from .advice_runtime import (
 from .availability import AvailabilityIdentity, availability_details
 from .calendar_history import calendar_feedback_recheck_delay
 from .climate_inputs import finite
+from .climate_inputs import temperature_targets_match as _matching_hvac_target
 from .climate_learning import observe
 from .climate_runtime import update_readiness
 from .const import (
@@ -113,13 +114,15 @@ from .const import (
     DEFAULT_OPTIONS,
     DOMAIN,
     EV_RESERVATION_EXTERNAL_BASELINE,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
     HVAC_ZONE_SETTLE_MAX_SECONDS,
     HVAC_ZONE_SETTLE_SECONDS,
     MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS,
     STATE_UNKNOWN_VALUES,
 )
 from .constraints import ConstraintValidator
-from .discovery import CapabilityDiscovery
+from .discovery import CapabilityDiscovery, CapabilityEvidence
 from .enphase_export_limit import (
     COMPANION_UPGRADE_REQUIRED,
     EXPORT_IDENTITY_ISSUES,
@@ -517,6 +520,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.ev_restore_guard = self._ev_restore_allowed
         self.executor.export_write_blocked = self._export_dispatch_blocked
         self.executor.export_cooldown_options = lambda: self.options
+        self.executor.log_dry_takeover_transition = self._log_dry_takeover_transition
         self.executor.operator_arm_confirmed = self._operator_arm_confirmed
         self.executor.ev_allocation_deadline_callback = self._schedule_ev_allocation_deadline
         self.executor.current_ev_allocation_deadline = lambda: self._ev_allocation_deadline
@@ -2631,6 +2635,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._force_next_refresh |= force_refresh
             self._discard_superseded_refresh()
             return self.data
+        capabilities = CapabilityDiscovery(self.hass, entry_data, options)
+        dry_hvac = capabilities.hvac_evidence_in_dry()
+        # Sample ownership with the Dry evidence. A command can confirm the
+        # Off start and clear its provisional snapshot during a later await.
+        dry_control = _hvac_control_from_ownership(self.store.data.get("ownership", {})) if dry_hvac is not None else {}
+        dry_during_provisional_off_start = bool(
+            dry_hvac is not None and dry_hvac.issues == [HVAC_DRY_ZONE_TARGETS_ABSENT]
+            and dry_control.get("attempt_snapshot") and not dry_control.get("main_state_committed")
+            and not dry_control.get("required_evidence_lost")
+        )
+        self._log_dry_takeover_transition(dry_hvac is not None and HVAC_DRY_ZONE_TARGETS_ABSENT in dry_hvac.issues)
         tariff_fingerprints: dict[str, str] = {}
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
@@ -2640,6 +2655,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             now=dt_util.utcnow(),
             weather_forecast=weather_forecast,
             tariff_fingerprints=tariff_fingerprints,
+            dry_hvac=dry_hvac,
+            dry_takeover_revision=getattr(self, "_dry_takeover_revision", 0),
+            dry_during_provisional_off_start=dry_during_provisional_off_start,
         )
         if (
             not force_refresh
@@ -2654,11 +2672,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if (refresh_timing := current_timing()) is not None:
                 refresh_timing.aliases["fingerprint_ms"] = round((perf_counter() - preparation_started) * 1000, 3)
             assert self.data is not None
-            self._log_availability_transition(self.data.input_issues)
+            hvac_details = self.store.data.get("discovery", {}).get("hvac", {}).get("details")
+            self._log_availability_transition(self.data.input_issues, hvac_details=hvac_details)
             return self.data
         self.executor.entry_data = entry_data
-        discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
-        await self.store.async_save_discovery(discovery.as_dict())
+        discovery = capabilities.inspect(hvac=dry_hvac)
+        discovery_report = discovery.as_dict()
+        await self.store.async_save_discovery(discovery_report)
         request = self._training_request()
         self.history_training.request(request)
         ev_charge_calibration = request.ev_model
@@ -2788,6 +2808,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if issue not in context.input_issues:
                 context.input_issues.append(issue)
         context.hvac_control = _hvac_control_from_ownership(self.store.data.get("ownership", {}))
+        context.dry_during_provisional_off_start = dry_during_provisional_off_start
         reconcile_cycle = getattr(self.executor, "async_reconcile_hvac_cycle", None)
         if callable(reconcile_cycle):
             await reconcile_cycle()
@@ -2795,7 +2816,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if isinstance(cycle, dict) and cycle.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE):
             context.hvac_cycle = dict(cycle)
         context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
-        if context.hvac_control and climate_issues:
+        if context.hvac_control and climate_issues and not dry_during_provisional_off_start:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
         stored_thermal = dict(self.store.data.get("thermal_model", {}))
         thermal_model = update_zone_thermal_model(stored_thermal, thermal_sample(
@@ -2854,7 +2875,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 plan.status = "unsafe"
             if plan.mode == PlannerMode.ACTIVE_HEALTHY:
                 plan.mode = PlannerMode.ACTIVE_DEGRADED
-        self._log_availability_transition(plan.input_issues)
+        self._log_availability_transition(
+            plan.input_issues, hvac_details=discovery_report.get("hvac", {}).get("details"),
+        )
         self._record_startup_auto_recovery_validation_candidate(plan, violations)
         await self.executor.async_notify_plan_fallback(plan, violations)
         if not is_current():
@@ -2940,9 +2963,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.store.async_flush_deferred()
         return result
 
-    def _log_availability_transition(self, issues: list[str]) -> None:
+    def _log_dry_takeover_transition(self, dry_takeover_blocked: bool) -> None:
+        """Log changes to the Dry takeover block observed by planning or execution."""
+        if dry_takeover_blocked != getattr(self, "_dry_takeover_blocked", False):
+            if dry_takeover_blocked:
+                _LOGGER.info(HVAC_DRY_TAKEOVER_SUMMARY)
+            else:
+                _LOGGER.info("Daikin Dry mode no longer blocks HVAC takeover")
+            self._dry_takeover_blocked = dry_takeover_blocked
+            # A queued action may observe a complete Dry episode between
+            # refreshes. Do not reuse a plan whose audit still shows that pause.
+            self._dry_takeover_revision = getattr(self, "_dry_takeover_revision", 0) + 1
+
+    def _log_availability_transition(self, issues: list[str], *, hvac_details: dict[str, Any] | None = None) -> None:
         """Log each input transition with bounded details and recovery duration."""
-        active = availability_details(issues, self.entry_data)
+        active = availability_details(issues, self.entry_data, hvac_details=hvac_details)
         previous: dict[AvailabilityIdentity, tuple[float, str]] = getattr(self, "_availability_outages", {})
         now = monotonic()
         warned: set[AvailabilityIdentity] = getattr(self, "_availability_warned", set())
@@ -3051,11 +3086,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             or production.raw.get(_EXPORT_OPERATOR_ARM_REVALIDATE) is True
             or (recovery_status == "restoring" and production.raw.get("armed_reason") == "startup_auto_recovered")
         )
-        if production.armed and operator_disarmed:
-            # Older saves can contain a completed operator cancellation with
-            # the old arm still present.
-            await self.async_disarm_production_control("operator_disarmed")
-            return True
+        if operator_disarmed:
+            if production.armed:
+                # Older saves can contain a completed operator cancellation with
+                # the old arm still present.
+                await self.async_disarm_production_control("operator_disarmed")
+            export = ExportLimitControl(self.hass, self.store, self.entry_data)
+            export_state = export.state
+            if export_state.get("baseline") and not export_state.get("restoring"):
+                # The stop can be durable before the original process reaches
+                # its restore call. Reconcile and restore under the command lock.
+                await export.save({**export_state, "restoring": True})
+            return production.armed
         if provisional_arm:
             if self.automatic_control_requested:
                 # Commit the disarm and resumable disposition together, even
@@ -3291,21 +3333,23 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
             automatic_lifecycle_was_active = was_running or recovery_was_pending
             operator_disarm = getattr(self, "_operator_disarm_request", None)
-            await self.async_cancel_startup_auto_recovery(
-                "options_changed", restore_owned_state=not device_control_only_change)
-            if operator_disarm is not getattr(self, "_operator_disarm_request", None):
-                was_running = automatic_lifecycle_was_active = False
             automatic_control_still_requested = bool(
                 strict_bool(current_options.get(CONF_PLANNER_ENABLED), default=False)
                 and not strict_bool(current_options.get(CONF_DRY_RUN), default=True)
             )
-            resume_provisional_recovery = (
-                was_running and automatic_control_still_requested
-                and device_control_only_change and self._export_activation_pending()
+            resume_disarmed_recovery = (
+                automatic_control_still_requested and device_control_only_change
+                and ((was_running and self._export_write_blocked()) or (recovery_was_pending and not production.armed))
             )
-            if resume_provisional_recovery:
-                # The provisional arm still blocks dispatch if we restart before
-                # this save. Once disarmed, this status carries recovery intent.
+            await self.async_cancel_startup_auto_recovery(
+                "options_changed", preserve_control=resume_disarmed_recovery,
+                restore_owned_state=not device_control_only_change,
+            )
+            if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+                was_running = automatic_lifecycle_was_active = resume_disarmed_recovery = False
+            if resume_disarmed_recovery:
+                # Preserve the previous recovery while cancellation drains.
+                # Save its restartable replacement before restoration or replanning.
                 await self._async_update_startup_auto_recovery(
                     "waiting_for_home_assistant", successful_runs=0, reason="startup_safe_recovery_pending",
                 )
@@ -3313,7 +3357,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 was_running
                 and automatic_control_still_requested
                 and operator_disarm is getattr(self, "_operator_disarm_request", None)
-                and (not device_control_only_change or resume_provisional_recovery)
+                and (not device_control_only_change or resume_disarmed_recovery)
                 and parse_production_state(self.store.data.get("production")).armed
             ):
                 await self.async_disarm_production_control("configuration_changed")
@@ -3387,7 +3431,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         return
                 self._startup_auto_recovery_authorized = True
                 self._export_retry_startup_blocked = True
-                if not resume_provisional_recovery:
+                if not resume_disarmed_recovery:
                     await self._async_update_startup_auto_recovery(
                         "waiting_for_home_assistant",
                         successful_runs=0,
@@ -5010,6 +5054,9 @@ def _decision_input_fingerprint(
     now: datetime,
     weather_forecast: dict[str, Any] | None = None,
     tariff_fingerprints: dict[str, str] | None = None,
+    dry_hvac: CapabilityEvidence | None = None,
+    dry_takeover_revision: int = 0,
+    dry_during_provisional_off_start: bool = False,
 ) -> str | None:
     """Fingerprint decision state and optionally retain its tariff evidence."""
     interval_seconds = max(int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), 1) * 60
@@ -5040,7 +5087,11 @@ def _decision_input_fingerprint(
         "options": options,
         "overrides": to_jsonable(overrides),
         "weather_forecast": weather_forecast or {},
+        "dry_takeover_revision": dry_takeover_revision,
+        "dry_during_provisional_off_start": dry_during_provisional_off_start,
     }
+    if dry_hvac is not None:
+        payload["hvac_in_dry"] = dry_hvac
     return _digest_decision_inputs(payload)
 
 
@@ -6172,16 +6223,6 @@ def _pending_zone_hvac_manual_change_entity_id(
     return None if str(new_state.state).lower() == expected_power else entity_id
 
 
-def _matching_hvac_target(observed: Any, expected: Any) -> bool:
-    """Return whether Home Assistant published the expected climate target."""
-    if expected is None:
-        return False
-    try:
-        return abs(float(observed) - float(expected)) < 0.05
-    except (TypeError, ValueError):
-        return False
-
-
 def _matches_hvac_command_feedback(
     desired: dict[str, Any],
     event: Any,
@@ -6219,7 +6260,7 @@ def _matches_hvac_command_feedback(
         try:
             if float(observed_temperature) != float(desired_temperature):
                 return False
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
         matched_command_change = True
     return matched_command_change
@@ -6348,6 +6389,9 @@ def _bounded_material_value(value: Any, *, depth: int = 0, budget: TariffSnapsho
             str(key): _bounded_material_value(item, depth=depth + 1)
             for key, item in islice(value.items(), MAX_FORECAST_SOURCE_ROWS)
         }
+    if not ordered and type(value) is int and value.bit_length() > 1024:
+        # Oversized numeric attributes cannot provide usable climate evidence.
+        return None
     if ordered and value is not None:
         if type(value) is datetime:
             return ["datetime", value.isoformat()]

@@ -7,6 +7,7 @@ import json
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from homeassistant.core import State
@@ -14,8 +15,10 @@ from test_export_limit import DATA, ENTITY, NOW, OPTIONS, action, context, limit
 from test_export_limit import setup as export_setup
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
+from custom_components.ha_energy_planner import export_limit_policy
 from custom_components.ha_energy_planner.action_limits import action_budget, budget_history
 from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_EXPORT_PRICE,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DRY_RUN,
     CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
@@ -267,7 +270,7 @@ def test_reads_noops_and_unavailable_identity_do_not_reserve_attempts(setup):
 
 
 def test_settled_refreshes_do_not_reconcile_or_save_unchanged_settings(setup, monkeypatch):
-    from unittest.mock import AsyncMock, Mock
+    from unittest.mock import AsyncMock
 
     from test_coordinator import _coordinator_for_runtime_services, _plan
 
@@ -313,7 +316,7 @@ def test_settled_refreshes_do_not_reconcile_or_save_unchanged_settings(setup, mo
 
 @pytest.mark.parametrize("change", ["backward_poll", "invalid_timing", "unmapped_during_completion"])
 def test_completion_reuse_requires_published_readback_and_valid_timing(setup, change):
-    from unittest.mock import AsyncMock, Mock
+    from unittest.mock import AsyncMock
 
     from test_coordinator import _coordinator_for_runtime_services, _plan
 
@@ -357,7 +360,7 @@ def test_completion_reuse_requires_published_readback_and_valid_timing(setup, ch
 
 
 def test_reconciliation_rejects_feedback_that_returns_to_its_original_value_during_save(setup):
-    from unittest.mock import AsyncMock, Mock
+    from unittest.mock import AsyncMock
 
     from test_coordinator import _coordinator_for_runtime_services, _plan
 
@@ -400,7 +403,7 @@ def test_reconciliation_rejects_feedback_that_returns_to_its_original_value_duri
 
 @pytest.mark.parametrize("skew_seconds", [480, 8 * 3600])
 def test_clock_repair_reopens_daily_allowance_after_remap_and_settled_refresh(setup, monkeypatch, skew_seconds):
-    from unittest.mock import AsyncMock, Mock
+    from unittest.mock import AsyncMock
 
     from test_coordinator import _coordinator_for_runtime_services, _plan
 
@@ -460,8 +463,10 @@ def test_export_planning_rechecks_mutable_tariff_time_and_confidence(setup):
     raw.attributes["confidence"] = 0.8
     s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
 
+    cache = export_limit_policy.ExportTariffCache()
+
     def current(now, **options):
-        return runtime.current_tariff_blocks(s.hass, "sensor.export_price", options, now)
+        return runtime.current_tariff_blocks(s.hass, "sensor.export_price", options, now, preflight_cache=cache)
 
     blocks, issue = current(NOW)
     assert issue is None and blocks[0]["watts"] == 0
@@ -1178,3 +1183,65 @@ def test_remapping_pruned_control_preserves_cooldown_after_clock_correction(
         assert (await s.control.execute(latest_action(s, True), later))[2]
 
     asyncio.run(run())
+
+
+def test_export_tariff_reuses_validation_but_rechecks_time_confidence_and_replacement(setup, monkeypatch):
+    s = setup
+    parse = Mock(wraps=export_limit_policy._parse_blocks)
+    monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
+    raw = price_state((-0.1, 0.2, 0.3))
+    raw.attributes["confidence"] = 0.8
+    s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+
+    cache = export_limit_policy.ExportTariffCache()
+
+    def current(now, **options):
+        return runtime.current_tariff_blocks(s.hass, "sensor.export_price", options, now, preflight_cache=cache)
+
+    blocks, issue = current(NOW)
+    assert issue is None and blocks[0]["watts"] == 0
+    blocks[0]["watts"] = 800  # Consumers cannot modify the cached source.
+    assert current(NOW)[0][0]["watts"] == 0
+    assert current(NOW + timedelta(minutes=20))[0][0]["watts"] is None
+    assert current(NOW + timedelta(minutes=31))[1] == "export_tariff_stale"
+    assert current(NOW, minimum_tariff_confidence=90)[1] == "export_tariff_confidence_low"
+    parse.assert_called_once()
+    raw.attributes["forecasts"][0]["duration"] = 30
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 2
+    raw.attributes["forecasts"].pop()
+    assert current(NOW)[0][0]["watts"] == 0
+    assert parse.call_count == 3
+    raw = price_state((0.2, -0.1))
+    s.states["sensor.export_price"] = State("sensor.export_price", raw.state, raw.attributes, last_updated=NOW)
+    assert current(NOW)[0][0]["watts"] is None
+    assert parse.call_count == 4
+
+
+@pytest.mark.parametrize(("revised_price", "issue"), [(False, "export_tariff_invalid"), (0.0, None)])
+def test_export_tariff_cache_revalidates_a_nested_price_type_change(setup, monkeypatch, revised_price, issue):
+    entity_id = DATA[CONF_AMBER_EXPORT_PRICE]
+    raw = price_state((0, 0.2))
+    row = raw.attributes["forecasts"][0]
+    row["prediction"] = {"per_kwh": row.pop("per_kwh")}
+    state = State(entity_id, raw.state, raw.attributes, last_updated=NOW)
+    setup.states[entity_id] = state
+    parse = Mock(wraps=export_limit_policy._parse_blocks)
+    monkeypatch.setattr(export_limit_policy, "_parse_blocks", parse)
+
+    cache = export_limit_policy.ExportTariffCache()
+
+    def current():
+        return runtime.current_tariff_blocks(setup.hass, entity_id, OPTIONS, NOW, preflight_cache=cache)
+
+    original = current()
+    assert original[1] is None and original[0][0]["price"] == 0
+    assert current() == original
+    parse.assert_called_once()
+
+    row["prediction"]["per_kwh"] = revised_price
+    assert setup.states[entity_id] is state
+    blocks, reason = current()
+    assert reason == issue
+    assert blocks == (original[0] if issue is None else [])
+    assert parse.call_count == 2

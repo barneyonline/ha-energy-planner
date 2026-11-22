@@ -4,6 +4,40 @@
 
 ### 🚧 Breaking changes
 
+- Require Home Assistant 2026.11.0 or newer. Update Home Assistant before installing this Energy Planner release.
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes.
+- Keep forecast refreshes running when a provider reports an out-of-range forecast interval.
+- Reject conflicting half-hour Export Limit declarations and tariff timestamps outside the supported UTC range. Revalidate edited tariff rows before using a cached Export Limit decision.
+- Revalidate cached Export Limit tariffs when a nested field changes type, including a numeric price replaced by a boolean.
+- Pause synchronized HVAC takeover when native Daikin zones omit setpoints in Dry mode, and preserve safe restoration and reporting of genuine target faults.
+- Pause installer retries without spending an attempt when gateway settings or tariffs become unusable, and keep gateway identity problems visible while Export Limit is deferred.
+- Preserve the Export Limit cooldown across clock corrections and control remaps, and continue reconciliation when inactive controls have invalid timing metadata.
+- Discard plans when tariff data changes during publication. Recheck tariffs during arming and resume prior startup recovery after a rejected replacement arm.
+- Preserve manual EV limits during Charge Now rollback and cancel unsent Export Limit changes when Automatic Control is turned off.
+- Recheck live control authority before the first HVAC takeover command.
+
+### 🔧 Improvements
+
+- Show the EV price policy when the import price limit is enabled. Show the emergency price and budget only with Departure priority. Saved values are retained when the controls are hidden.
+- Show Home Assistant's reported unit alongside live climate temperatures in Current state.
+- Rename the Climate control active entity in place so its ownership updates continue under the new entity ID.
+- Link vehicle target migration repairs to their config entry. Startup adopts older notices, preserves ignored repairs that still need migration, and removes stale notices.
+
+### 🔄 Other changes
+
+- None
+
+## 1.5.0 - 2026-11-14
+
+### 🚧 Breaking changes
+
 - None
 
 ### ✨ New features
@@ -12,18 +46,13 @@
 
 ### 🐛 Bug fixes
 
-- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard. Missing verified gateway settings during installer preparation or guarded apply pauses recovery without spending the check.
-- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change. Gateway problems stay visible when tariff data is missing, a cooldown is active, or a replacement gateway already has a pending request. Export Limit blocks partial verification metadata and identifies remapped controls separately from gateway replacements even when the new control is unavailable.
-- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes. Preserve the command cooldown when a pruned control is remapped before or after correcting the clock. Keep remap reconciliation running when an inactive control has invalid timing metadata. Lowering the command interval preserves any longer wait recorded during clock repair.
-- Keep forecast refreshes running when a provider reports a cadence too small or too large to represent. Use the next valid cadence field and require timestamped cadence to fit its source rows. Block Export Limit writes when cadence fields conflict with its 30-minute requirement or a tariff timestamp falls outside the supported UTC range. Recheck current tariff rows before dispatch and require usable timestamps for secondary PV coverage.
-- Keep scheduled planning boundaries on time during sustained Home Assistant state changes.
-- Preserve newer manual EV limits during Charge Now rollback. Cancel unsent Export Limit writes when Automatic Control is switched off, and preserve installer retry attempts when tariff data becomes unusable.
-- Recheck live Export Limit tariff data during arming. Resume prior startup recovery after a rejected replacement arm and pause ready installer retries until Export Limit can write again.
-- Discard plans when tariff data changes during publication. Preserve unsent Export Limit retry attempts when verified gateway replacement coincides with a probe error or tariff deferral.
+- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard. ([#184](https://github.com/barneyonline/ha-energy-planner/pull/184))
+- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change. ([#185](https://github.com/barneyonline/ha-energy-planner/pull/185))
+- Let Resume retire an expired Export Limit request after a verified gateway replacement. Keep the original attempt on record, and refund identity-bound requests refused before sending. ([#185](https://github.com/barneyonline/ha-energy-planner/pull/185))
 
 ### 🔧 Improvements
 
-- None
+- Keep scheduled refreshes on time during frequent input changes and reduce repeated tariff, EV forecast, and calendar processing. ([#186](https://github.com/barneyonline/ha-energy-planner/pull/186))
 
 ### 🔄 Other changes
 

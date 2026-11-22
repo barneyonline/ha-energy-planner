@@ -423,6 +423,7 @@ def test_remaining_setup_services_without_entries() -> None:
     hass = SimpleNamespace(
         services=services,
         config_entries=SimpleNamespace(async_entries=lambda domain: []),
+        data={},
     )
 
     assert asyncio.run(async_setup(hass, {})) is True
@@ -529,6 +530,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(diagnostics_module, "async_get_config_entry_diagnostics", fake_diagnostics)
     hass = SimpleNamespace(
         config_entries=SimpleNamespace(async_entries=lambda domain: [SimpleNamespace(runtime_data=fake_coordinator)]),
+        data={},
         services=SimpleNamespace(
             handlers={},
             async_register=lambda domain, service, handler, **kwargs: hass.services.handlers.setdefault(

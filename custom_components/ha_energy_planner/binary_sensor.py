@@ -227,6 +227,11 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
             self.async_on_remove(self.coordinator.store.async_add_ownership_listener(self._ownership_changed))
 
     @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place renames because our subscriptions follow the entity instance."""
+        super().async_entity_id_changed(old_entity_id)
+
+    @callback
     def _ownership_changed(self) -> None:
         self.async_write_ha_state()
 

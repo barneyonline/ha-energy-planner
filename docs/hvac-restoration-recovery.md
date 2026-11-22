@@ -7,9 +7,145 @@ establish the original user setting.
 
 Synchronized zone takeover normally requires complete numeric baselines for every
 zone whose target will change, with an active original head mode matching the
-requested mode. Hidden targets produce `climate_zone_target_unavailable` and
+requested mode. Unexpectedly missing targets produce `climate_zone_target_unavailable` and
 unproven mode transitions produce `climate_zone_baseline_mode_mismatch` before
 schedule suppression, zone activation or head writes.
+
+When the native Daikin head and zones on the same controller report Dry mode,
+zone setpoints can be absent by design. Planner pauses takeover and lists those
+zones under `zone_targets_absent_in_dry_mode` when zone synchronization is
+enabled. Verified independent-zone control also synchronizes zone targets,
+so discovery and planning apply the same pause when the general option is off.
+The live check also applies when an HVAC action explicitly requests zone
+synchronization. If Dry begins after a takeover write, Planner withholds further
+HVAC writes and runs the existing restoration sequence. During a verified Off
+start, Planner checks that the head is still Off as it dispatches the activation.
+It can then finish the mode change if the activation recalls the saved Dry mode
+and target and the remaining capability checks pass. While waiting for Heat or
+Cool feedback, Planner accepts the unchanged recall until the bounded mode
+confirmation finishes. A different mode or target ends that exception before
+Planner saves the confirmation.
+The recall exception applies only to the in-flight start. It does not report a
+Dry exit to planning while the head still reports Dry. Planner samples Dry
+feedback and provisional ownership together. If that feedback alone queues a
+release, Planner rechecks the confirmed mode and synchronized rollback targets
+before applying it. A recovery failure saved while the release was queued still
+requires restoration.
+Planner checks for Dry while waiting for takeover feedback, including generic
+zone switches and helpers, and again before reporting success. If Dry interrupts
+an accepted write, Planner uses bounded readback before issuing restoration
+commands. For synchronized takeover, Planner waits for dispatched zone or
+automation feedback after a service error, even if Dry arrives only while
+recovery is being prepared. It also settles accepted helper writes before
+compensating for a head or sibling override. If Dry interrupts suppression with
+cancellation, Planner saves the automation's recovery baseline and waits for
+dispatched Off feedback before passing cancellation back. Pending suppression
+evidence survives interrupted recovery. If Off remains unconfirmed, restoration
+explicitly re-enables the automation even when the state machine still shows On.
+It can do so while a hidden zone target remains pending, without waking the head.
+If a queued HVAC action becomes eligible after Dry ends, Planner resolves any
+saved automation suppression before it attempts another takeover.
+Home Assistant can disable its triggers before publishing Off, while it waits
+for a running action to stop. For writes with a saved confirmation,
+it rechecks Dry after persisting the override and uses the original deadline
+to settle feedback before restoring. The execution record retains Dry and
+input faults observed through rollback, including a missing Cool target that
+first appears during restoration after Dry ends.
+Planner logs each transition at INFO, including when queued commands observe
+Dry starting or ending during command recovery between planning refreshes. After an observed Dry
+episode, the next refresh builds a fresh plan so a past refusal cannot keep
+preconditioning paused. Unavailable entities,
+malformed targets, and missing Heat or Cool setpoints follow the fault reporting
+path. A malformed zone temperature bound defers that zone's target restoration
+while sibling zones and automations can still recover. Discovery and synchronized
+takeover validate the same scalar or ordered
+range. Boolean setpoints and values that exceed the supported numeric range are
+malformed. Planner reports oversized targets while continuing the refresh. Audit
+and command records keep recovery data writable when Home Assistant reports a
+target outside its JSON integer range. Refresh fingerprints distinguish oversized
+targets from genuinely absent setpoints. If registry verification of an independent
+zone changes during Dry, the next refresh evaluates its rollback targets even
+when the thermostat and switch states are unchanged.
+Current state and Next actions list unavailable zones alongside the zones paused
+in Dry, including before the first plan. Current state omits target values that
+exceed the storage range and still identifies the affected zone as faulted.
+Target fault notifications recheck live evidence before alerting.
+With zone synchronization disabled, discovery still accepts a finite scalar
+or a complete finite range for the head thermostat.
+Zone warnings name the affected entities in Dry and after a return to Cool,
+including when a target is still missing on one zone after another recovers.
+Each zone has its own outage, so a new fault in Cool produces a warning even
+if a different zone was already faulted.
+The Dry-mode pause allows
+release of existing HVAC ownership and independent EV and export-limit control.
+Concurrent HVAC-only faults remain visible and preserve independent EV
+confidence when Planner uses the household-load fallback.
+On an otherwise healthy HVAC-only installation, a restart in Dry keeps takeover
+blocked and uses the normal automatic startup retry without a startup fault
+notification. Independent prerequisite or restoration failures still alert.
+Planner preserves the baseline load forecast and excludes load from the blocked
+HVAC takeover. It checks for Dry after saving provisional ownership, during
+automation suppression, and before the first head or zone write. These checks
+also validate live availability and rollback targets for synchronized equipment,
+even when Planner already holds a valid baseline. A zone excluded while Off can
+still block takeover if it reports Heat or Cool without a valid target before
+the first write. A failed
+ownership save that observes Dry retires the untouched provisional snapshots.
+The check stays active through scheduler setup, confirmation persistence, and
+readback of already-matching targets, including failed confirmation retirement.
+If Dry starts after an automation is suspended, Planner restores that automation and retains any failed restoration
+for retry, including when suspension is the entire action. The action audit
+records whether automation suppression had already been dispatched. Successful
+actions count material suppression only when a service call was dispatched.
+Decision summary and queued-action status use the same explanation as the plan, including
+queued coast actions refused while earlier ownership is still awaiting release. A compensated
+automation failure stays in the action audit while status explains the current
+Dry pause. Late refusals
+retain concurrent faults from live discovery and give genuine rollback-target
+faults precedence. Planner also checks for Dry before applying the minimum
+cycle and other queued-action checks. If an owned continuation is already
+ineligible, Planner records the Dry refusal and proceeds with its release.
+The audit retains capability codes and dispatch evidence if suppression or
+restoration fails. Planner checks again after restoring automations, so faults
+that develop during recovery also reach the audit. During Dry, failure
+before climate dispatch retains recovery only for automation writes that
+actually or possibly reached Home Assistant. Planner saves that narrower
+recovery record before restoring automations so an interrupted restore can
+be retried. It also saves automation-only recovery when suppression fails
+before the first synchronized HVAC write, then checks whether Dry began
+during compensation. When Dry interrupts an unsent climate command, Planner retires
+that command's confirmation and minimum-cycle intent in the same write as
+the narrowed recovery record. It rechecks Dry after unsent intent retirement
+and keeps the confirmation that was pending when the unsent command was prepared.
+A head target confirmed earlier in the same takeover stays settled if Dry then
+blocks the first zone write.
+A command rejected by local preflight never invalidates feedback from an
+earlier dispatch. The recovery record retains any earlier AirBase
+ownership and drops unused memory from this attempt, so automation-only
+recovery can proceed if AirBase becomes unavailable. If cancellation observes
+verified Dry before the first head or zone write, Planner drops the untouched
+HVAC snapshots and retains any attempted automation suppression for recovery.
+Emergency shutdown remains available for an Off baseline when a write may
+have reached the equipment or Dry is unverified. A concurrent manual override
+still supersedes the saved climate setting and its pending confirmation, including
+after a successful command or when cancellation interrupts a provisional,
+completed ownership, or rate-limit save. If a replacement confirmation fails
+to persist before any HVAC actuator has changed, Planner restores any suspended
+automations and keeps the earlier confirmation with its original command context
+unless the user has superseded it. If retiring an unsent confirmation, releasing
+prior ownership, or saving recovery fails during cancellation, the original
+cancellation propagates with the secondary error attached. Automation recovery uses service dispatch evidence
+to identify which writes could have reached Home Assistant.
+Planner rechecks for
+Dry after persisting the override on a failed guard and after the final
+readback of a takeover that has issued no HVAC command. If a scheduler guard
+refuses a synchronized takeover before any actuator dispatch, Planner drops the
+untouched climate snapshots and restores only automations it suspended. If Home Assistant
+rejects the first actuator locally during a synchronized takeover, Planner
+retires the unsent command and restores only any suspended automations. The
+queued refusal records the Dry block and concurrent capability faults when
+Dry feedback is available. A refresh reassesses registry ownership for each affected zone,
+including when its climate state has stayed the same.
 
 ## Opt-in AirBase starts from Off
 

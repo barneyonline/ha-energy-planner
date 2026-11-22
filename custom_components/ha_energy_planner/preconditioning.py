@@ -6,10 +6,30 @@ from collections.abc import Mapping
 from typing import Any
 
 from .climate_inputs import finite, instant
-from .models import ActionAsset, DecisionContext, OccupancyState, PlanAction, PlannerMode, to_jsonable
-from .planner_confidence import _confidence_rejection_reason, _hvac_rollback_capability_unavailable
+from .const import (
+    HVAC_CAPABILITY_ISSUES,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    HVAC_ROLLBACK_TARGET_FAULTS,
+)
+from .models import ActionAsset, DecisionContext, InputHealth, OccupancyState, PlanAction, PlannerMode, to_jsonable
+from .planner_confidence import _confidence_rejection_reason
 from .safety import strict_bool
 from .zone_temperature import control_temperature
+
+_DRY_MODE_NEXT_STEP = "Planner reassesses HVAC takeover after Dry mode ends."
+_BLOCKED_NEXT_STEP = "Resolve the reported blocker; the next planner refresh reassesses eligibility."
+_ROLLBACK_TARGET_BLOCK_REASON = "rollback_target_unavailable"
+_ROLLBACK_TARGET_BLOCK_SUMMARY = (
+    "A required thermostat or zone restoration target is unavailable; takeover is withheld."
+)
+
+
+def _setpoint_block_details(input_issues: list[str]) -> tuple[str, str]:
+    """Describe a known setpoint block, giving actual faults precedence."""
+    if HVAC_ROLLBACK_TARGET_FAULTS.intersection(input_issues):
+        return _ROLLBACK_TARGET_BLOCK_REASON, _ROLLBACK_TARGET_BLOCK_SUMMARY
+    return HVAC_DRY_ZONE_TARGETS_ABSENT, HVAC_DRY_TAKEOVER_SUMMARY
 
 
 def planning_status(
@@ -83,20 +103,28 @@ def planning_status(
         "room_demand_unproven", "conflicting_room_demand", "room_target_reached", "preconditioning_mode_not_allowed",
     }:
         status, code, reason = "no_opportunity", legacy["reason"], legacy["summary"]
-    if _hvac_rollback_capability_unavailable(context):
-        status, code, reason = (
-            "blocked",
-            "rollback_target_unavailable",
-            "A required thermostat or zone restoration target is unavailable; takeover is withheld.",
-        )
+    dry_mode_blocked = HVAC_DRY_ZONE_TARGETS_ABSENT in context.input_issues
+    if dry_mode_blocked or HVAC_ROLLBACK_TARGET_FAULTS.intersection(context.input_issues):
+        status = "blocked"
+        code, reason = _setpoint_block_details(context.input_issues)
     if not strict_bool(options.get("climate_control_enabled"), default=False):
         status, code, reason = "blocked", "climate_control_disabled", "The Climate control switch is off."
-    if mode != PlannerMode.ACTIVE_HEALTHY:
+    current_review = mode == PlannerMode.DRY_RUN and context.input_health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+    if mode != PlannerMode.ACTIVE_HEALTHY and not (dry_mode_blocked and current_review):
         status, code, reason = (
             "blocked",
             "planner_not_active",
             "Automatic execution is disabled, in review, or awaiting healthy inputs.",
         )
+    next_step = {
+        "scheduled": "Wait for the scheduled start; current safety gates are checked again before execution.",
+        "blocked": _BLOCKED_NEXT_STEP,
+        "learning": "Allow normal climate operation to collect the missing validation evidence.",
+        "observation": "Allow the observation period to finish, or review the observation-only policy setting.",
+        "no_opportunity": "No action is needed; the next refresh checks updated prices and thermal conditions.",
+    }.get(status, "Review the reported evidence before changing settings.")
+    if code == HVAC_DRY_ZONE_TARGETS_ABSENT:
+        next_step = _DRY_MODE_NEXT_STEP
     return {
         "status": status,
         "reason": code,
@@ -109,13 +137,7 @@ def planning_status(
             {"reason": key, "count": item["count"], **item["evidence"]}
             for key, item in legacy.get("rejected", {}).items()
         ],
-        "next_step": {
-            "scheduled": "Wait for the scheduled start; current safety gates are checked again before execution.",
-            "blocked": "Resolve the reported blocker; the next planner refresh reassesses eligibility.",
-            "learning": "Allow normal climate operation to collect the missing validation evidence.",
-            "observation": "Allow the observation period to finish, or review the observation-only policy setting.",
-            "no_opportunity": "No action is needed; the next refresh checks updated prices and thermal conditions.",
-        }.get(status, "Review the reported evidence before changing settings."),
+        "next_step": next_step,
     }
 
 
@@ -272,6 +294,24 @@ def record_acquisition(history: dict[str, Any], control: Any) -> dict[str, Any]:
     return history
 
 
+def outcome_capability_issues(outcome: dict[str, Any]) -> list[str]:
+    """Read only known HVAC capability codes from persisted execution evidence."""
+    issues = outcome.get("capability_issues")
+    if not isinstance(issues, list):
+        return []
+    return list(dict.fromkeys(
+        issue for issue in issues if isinstance(issue, str) and issue in HVAC_CAPABILITY_ISSUES
+    ))
+
+
+def _attempt_summary(outcome: dict[str, Any]) -> dict[str, Any]:
+    issues = outcome_capability_issues(outcome)
+    return {
+        **{field: outcome.get(field) for field in ("attempted_at", "plan_id", "action_id", "result", "reason")},
+        **({"capability_issues": issues} if issues else {}),
+    }
+
+
 def record_outcome(history: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
     """Correlate actual execution evidence before the bounded general audit truncates it."""
     desired = outcome.get("desired_state") or {}
@@ -300,9 +340,7 @@ def record_outcome(history: dict[str, Any], outcome: dict[str, Any]) -> dict[str
             history[key] = {
                 **record,
                 "fulfilled": bool(record.get("fulfilled") or _fulfilled(outcome)),
-                "last_outcome": {
-                    field: outcome.get(field) for field in ("attempted_at", "plan_id", "action_id", "result", "reason")
-                },
+                "last_outcome": _attempt_summary(outcome),
             }
             if _fulfilled(outcome):
                 for source in matched:
@@ -321,7 +359,23 @@ def current_status(store: dict[str, Any], plan: Any) -> dict[str, Any]:
     if not isinstance(control, dict):
         control = {}
     pending = history.get("pending", {})
-    outcome = pending.get("last_outcome", {})
+    outcome = pending.get("last_outcome") or {}
+    plan_id = getattr(plan, "plan_id", None)
+    audit = store.get("execution_audit")
+    if plan_id is not None and isinstance(audit, list):
+        for attempt in reversed(audit):
+            if (isinstance(attempt, dict) and attempt.get("plan_id") == plan_id and attempt.get("asset") == "daikin"
+                    and attempt.get("kind") == "set_hvac"):
+                # A coast or direct-control refusal does not belong to preparation history.
+                if HVAC_DRY_ZONE_TARGETS_ABSENT in outcome_capability_issues(attempt):
+                    outcome = _attempt_summary(attempt)
+                break
+    matched_refusal = bool(outcome and not _fulfilled(outcome) and plan_id is not None
+                           and outcome.get("plan_id") == plan_id)
+    reason = outcome.get("reason")
+    live_issues = outcome_capability_issues(outcome) or (reason.split(",") if isinstance(reason, str) else [])
+    live_dry_block = matched_refusal and HVAC_DRY_ZONE_TARGETS_ABSENT in live_issues
+    planned_dry_block = HVAC_DRY_ZONE_TARGETS_ABSENT in getattr(plan, "input_issues", ())
     if control.get("required_evidence_lost"):
         result.update(
             status="restoring",
@@ -336,20 +390,33 @@ def current_status(store: dict[str, Any], plan: Any) -> dict[str, Any]:
             summary="Saved climate ownership is awaiting command confirmation or recovery.",
             next_step="Wait for reconciliation; check device availability if recovery remains pending.",
         )
-    elif control.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"}:
+    elif control.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"} and not (
+        planned_dry_block or live_dry_block
+    ):
         result.update(
             status="running",
             reason=control["phase"],
             summary=f"The planner owns the {control['phase']} phase.",
             next_step="The planner continues to check comfort, evidence, and restoration requirements.",
         )
-    elif outcome and not _fulfilled(outcome) and plan is not None and outcome.get("plan_id") == plan.plan_id:
-        result.update(
-            status="blocked",
-            reason=outcome.get("reason"),
-            summary="The scheduled preconditioning command did not run.",
-            next_step="Resolve the execution blocker shown in reason; eligibility is checked again on refresh.",
-        )
+    elif matched_refusal and (live_dry_block or not planned_dry_block):
+        if HVAC_DRY_ZONE_TARGETS_ABSENT not in live_issues:
+            result.update(
+                status="blocked",
+                reason=reason,
+                summary="The scheduled preconditioning command did not run.",
+                next_step="Resolve the execution blocker shown in reason; eligibility is checked again on refresh.",
+            )
+        elif result.get("reason") not in {
+            "climate_control_disabled", "planner_not_active", _ROLLBACK_TARGET_BLOCK_REASON,
+        }:
+            reason, summary = _setpoint_block_details([*live_issues, *plan.input_issues])
+            result.update(
+                status="blocked",
+                reason=reason,
+                summary=summary,
+                next_step=_DRY_MODE_NEXT_STEP if reason == HVAC_DRY_ZONE_TARGETS_ABSENT else _BLOCKED_NEXT_STEP,
+            )
     elif result.get("status") == "scheduled" and getattr(plan, "mode", None) != PlannerMode.ACTIVE_HEALTHY:
         result.update(
             status="blocked",

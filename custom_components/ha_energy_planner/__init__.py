@@ -54,6 +54,7 @@ from .ev_policy import power_limit_options
 from .migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
+    async_refresh_migration_issues,
 )
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import VEHICLE, VEHICLES
@@ -148,6 +149,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     from .diagnostics import async_get_config_entry_diagnostics
     from .preflight import build_preflight_report
 
+    async_refresh_migration_issues(hass)
     await _async_rehydrate_all_ev_grid_reservations(hass)
 
     async def _require_coordinator(call: ServiceCall) -> EnergyPlannerCoordinator:

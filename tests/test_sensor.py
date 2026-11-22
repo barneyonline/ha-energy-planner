@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -13,9 +14,11 @@ import pytest
 from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import CoreState
+from homeassistant.helpers import entity_registry
 
 from custom_components.ha_energy_planner import plan_presentation as presentation_module
 from custom_components.ha_energy_planner import sensor as sensor_module
+from custom_components.ha_energy_planner.const import HVAC_DRY_ZONE_TARGETS_ABSENT
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
 from custom_components.ha_energy_planner.entity import RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
 from custom_components.ha_energy_planner.models import (
@@ -101,6 +104,110 @@ def test_mode_sensor_exposes_operational_control_mode() -> None:
     active.effective_control = False
     assert active.active_control is True
     assert description.value_fn(active) == "review"
+
+
+@pytest.mark.parametrize("key", ["current_state", "next_actions"])
+@pytest.mark.parametrize("plan_ready", [False, True])
+def test_state_sensor_exposes_dry_mode_zones(monkeypatch: pytest.MonkeyPatch, key: str, plan_ready: bool) -> None:
+    head, zone, unavailable = "climate.daikin", "climate.daikin_zone_temperature", "climate.daikin_other"
+    registered = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registered)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    states = {
+        head: SimpleNamespace(state="dry", attributes={"temperature": 17}),
+        zone: SimpleNamespace(state="dry", attributes={"zone_id": 0}),
+        unavailable: SimpleNamespace(state="unavailable", attributes={"zone_id": 1}),
+    }
+    coordinator = _coordinator(
+        _plan() if plan_ready else None,
+        options={"climate_control_enabled": True, "hvac_precondition_configured_zones_only": True},
+        entry_data={"daikin_climate_entity": head, "climate_zone_entities": [zone, unavailable]},
+        hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
+    )
+
+    description = next(item for item in SENSORS if item.key == key)
+    capability = description.attrs_fn(coordinator)["climate_capability"]
+    assert capability["available"] is False
+    assert capability["issues"] == ["climate_zone_unavailable", HVAC_DRY_ZONE_TARGETS_ABSENT]
+    assert capability["unavailable_zones"] == [unavailable]
+    assert capability["zone_targets_absent_in_dry_mode"] == [zone]
+    assert capability["zone_targets_unavailable"] == []
+
+
+@pytest.mark.parametrize("oversized_target", [2**64, 10**5000], ids=["past-recorder-range", "past-json-digit-limit"])
+def test_current_state_publishes_dry_zones_with_oversized_target(
+    monkeypatch: pytest.MonkeyPatch, oversized_target: int,
+) -> None:
+    head, zone, faulted = "climate.daikin", "climate.bedroom", "climate.main"
+    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone, faulted), native)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    states = {
+        head: SimpleNamespace(state="dry", attributes={"temperature": 17}),
+        zone: SimpleNamespace(state="dry", attributes={"zone_id": 0}),
+        faulted: SimpleNamespace(state="dry", attributes={"zone_id": 1, "temperature": oversized_target}),
+    }
+    coordinator = _coordinator(
+        _plan(),
+        options={"climate_control_enabled": True, "hvac_precondition_configured_zones_only": True},
+        entry_data={"daikin_climate_entity": head, "climate_zone_entities": [zone, faulted]},
+        hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
+    )
+    description = next(item for item in SENSORS if item.key == "current_state")
+    attrs = PlannerSensor(coordinator, description).extra_state_attributes
+
+    assert attrs["climate_capability"]["zone_targets_unavailable"] == [faulted]
+    assert attrs["climate_capability"]["zone_targets_absent_in_dry_mode"] == [zone]
+    live = {row["entity_id"]: row["details"] for row in attrs["controlled_assets"][0]["entities"]}
+    assert live[head]["temperature"] == 17
+    assert "temperature" not in live[faulted]
+
+
+def test_current_state_includes_only_reported_climate_temperature_units() -> None:
+    fixture = Path(__file__).parent / "fixtures/live_schema/climate_zone_temperatures.json"
+    recorded_states = json.loads(fixture.read_text(encoding="utf-8"))["states"]
+    head, ranged_zone = "climate.living", "climate.family"
+    zones = {
+        "climate.legacy": ("heat", {"temperature": 21}),
+        "climate.invalid_text": ("heat", {"temperature": 21, "temperature_unit": "W"}),
+        "climate.invalid_value": ("heat", {"temperature": 21, "temperature_unit": ["°C"]}),
+        "climate.dry": ("dry", {"temperature_unit": "°F", "hvac_action": "drying"}),
+        "switch.zone": ("on", {"temperature": 21, "temperature_unit": "°C"}),
+    }
+    states = {
+        head: SimpleNamespace(**recorded_states[head]),
+        ranged_zone: SimpleNamespace(**recorded_states[ranged_zone]),
+        **{entity_id: SimpleNamespace(state=state, attributes=attrs) for entity_id, (state, attrs) in zones.items()},
+    }
+    coordinator = _coordinator(
+        _plan(device_plans={"climate": {"current_state_label": "Cool (70.0 C)"}}),
+        options={"climate_control_enabled": True},
+        entry_data={"daikin_climate_entity": head, "climate_zone_entities": [ranged_zone, *zones]},
+        hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
+    )
+
+    description = next(item for item in SENSORS if item.key == "current_state")
+    sensor = PlannerSensor(coordinator, description)
+    assert sensor.native_value == "Climate: Cool (70 °F)"
+    attrs = sensor.extra_state_attributes
+    live = {row["entity_id"]: row["details"] for row in attrs["controlled_assets"][0]["entities"]}
+
+    assert live == {
+        head: {"current_temperature": 70, "temperature": 71, "temperature_unit": "°F", "hvac_action": "cooling"},
+        ranged_zone: {"target_temp_low": 68, "target_temp_high": 75, "temperature_unit": "°F"},
+        "climate.legacy": {"temperature": 21},
+        "climate.invalid_text": {"temperature": 21},
+        "climate.invalid_value": {"temperature": 21},
+        "climate.dry": {"hvac_action": "drying"},
+        "switch.zone": {"temperature": 21},
+    }
+    states[head].attributes.pop("current_temperature")
+    assert sensor.native_value == "Climate: Cool"
+    states[head].attributes.pop("temperature")
+    states[head].state = "dry"
+    states[head].attributes["hvac_action"] = "drying"
+    assert sensor.native_value == "Climate: Dry"
+    assert sensor.extra_state_attributes["controlled_assets"][0]["entities"][0]["details"] == {"hvac_action": "drying"}
 
 
 def test_mode_sensor_reports_post_startup_auto_recovery_and_retains_intent() -> None:
@@ -440,6 +547,7 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
                 "friendly_name": "Home climate",
                 "current_temperature": 19,
                 "temperature": 19,
+                "temperature_unit": "°C",
                 "hvac_action": "heating",
             },
         ),
@@ -512,7 +620,9 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert current.value_fn(coordinator) == "Climate: Heat (19 C) | EV: Not Charging"
     current_attrs = current.attrs_fn(coordinator)
     assert current_attrs["controlled_assets"][0]["planner_owns_control"] is True
-    assert current_attrs["controlled_assets"][0]["entities"][0]["details"]["current_temperature"] == 19
+    assert current_attrs["controlled_assets"][0]["entities"][0]["details"] == {
+        "current_temperature": 19, "temperature": 19, "temperature_unit": "°C", "hvac_action": "heating",
+    }
     assert current_attrs["controlled_assets"][1]["entities"][0]["state"] == "off"
     assert current_attrs["weather_forecast"]["fetch_status"] == "cached_after_error"
     assert current_attrs["load_forecast"]["live_source_status"] == "model_fallback"

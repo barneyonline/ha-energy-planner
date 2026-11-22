@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,14 @@ from test_zone_control import BED, BED_CLIMATE, MAIN, MAIN_CLIMATE, PAIRS, data,
 from test_zone_temperature import NOW
 
 from custom_components.ha_energy_planner import hvac_adapter as adapter_module
+from custom_components.ha_energy_planner.const import (
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+)
+from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
 from custom_components.ha_energy_planner.daikin_memory import MEMORY_KEY, OFF_START_OPTION, provider, read_memory
+from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
 from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
 from custom_components.ha_energy_planner.zone_control import desired_fields
@@ -99,11 +107,12 @@ def system(monkeypatch):
             hvac_modes=["off", "heat", "cool", "dry"],
         )
         hass.states.values["climate.head"] = head
-        for actuator, entity in PAIRS.items():
+        for index, (actuator, entity) in enumerate(PAIRS.items()):
             enabled = head.state != "off" and hass.states.get(actuator).state == "on"
             hass.states.values[entity] = FakeState(
                 mode if enabled else "off",
                 {
+                    "zone_id": index,
                     "temperature": modes[mode]["zones"].get(entity) if head.state != "off" else None,
                     "min_temp": modes[mode]["head"] - 2,
                     "max_temp": modes[mode]["head"] + 2,
@@ -660,6 +669,101 @@ def test_executor_flushes_mode_memory_before_writes_and_restores_owned_mapping(s
     asyncio.run(run())
 
 
+def test_dry_abort_can_restore_automation_without_unused_airbase_memory(system):
+    from test_constraints import _plan
+    from test_executor import FakeStore, _arm_store
+
+    from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+    automation = "automation.climate_schedule"
+    s.data["climate_automation_entities"] = [automation]
+    s.hass.states.values[automation] = FakeState("on", {"current": 0})
+    store = FakeStore()
+    executor = Executor(
+        store, hass=s.hass, entry_data=s.data,
+        options={**DEFAULT_OPTIONS, OFF_START_OPTION: True, "dry_run": False, "climate_control_enabled": True,
+                 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+    _arm_store(store, executor)
+    action = _action(s.desired)
+    action.execute_not_before = NOW
+    action.execute_not_after = s.c.created_at.replace(year=s.c.created_at.year + 1)
+    action.plan_id = "plan-1"
+    original = s.hass.services.async_call
+
+    async def call(domain, service, payload, **kwargs):
+        if (domain, service) == ("automation", "turn_on") and s.entry.runtime_data.last_update_success:
+            raise asyncio.CancelledError
+        await original(domain, service, payload, **kwargs)
+        if (domain, service) == ("automation", "turn_off"):
+            assert store.data["ownership"]["hvac_control"]["main_state"][MEMORY_KEY]
+            s.selected[0] = "dry"
+            s.modes["dry"] = {"head": 19, "zones": {}}
+            s.hass.states.values["climate.head"].state = "dry"
+            s.publish()
+
+    s.hass.services.async_call = call
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await executor.async_evaluate(_plan(NOW, action))
+        recovery = store.data["ownership"]
+        assert recovery.get("climate_automations") == {automation: "on"}, store.data["outcomes"]
+        control = recovery["hvac_control"]
+        assert not {"off_start_control_data", "off_start_identity", "attempt_snapshot"} & control.keys()
+        assert s.hass.states.get(automation).state == "off"
+
+        s.entry.runtime_data.last_update_success = False
+        result = await executor.async_release_hvac_control("Dry regression")
+        assert result.result.value == "restored", result
+        assert s.hass.states.get("climate.head").state == "dry"
+        assert s.hass.states.get(automation).state == "on"
+        assert [call[:2] for call in s.hass.services.calls if call[0] != "persistent_notification"] == [
+            ("automation", "turn_off"), ("automation", "turn_on"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_manual_head_change_during_paired_readback_preserves_user_target(system):
+    s = system
+    dispatch = s.hass.services.async_call
+    manual_override = False
+
+    def change_head_target():
+        nonlocal manual_override
+        manual_override = True
+        s.modes["heat"]["head"] = 20
+        s.publish()
+
+    async def service(domain, name, payload, **kwargs):
+        await dispatch(domain, name, payload, **kwargs)
+        if name == "turn_on" and payload["entity_id"] == BED:
+            # The user update is delivered when confirmation first yields.
+            asyncio.get_running_loop().call_soon(change_head_target)
+
+    s.hass.services.async_call = service
+    s.adapter.set_manual_override_check(lambda: manual_override)
+
+    async def run():
+        action = _action(s.desired)
+        await s.adapter.async_prepare_off_start(action)
+        result = await s.adapter.async_execute(action)
+
+        assert manual_override
+        assert not result.applied
+        assert result.reason == "manual_hvac_override_detected"
+        assert result.rollback_succeeded is True
+        assert s.hass.states.get("climate.head").state == "heat"
+        assert s.hass.states.get("climate.head").attributes["temperature"] == 20
+        assert s.hass.states.get(BED).state == "off"
+        assert all(domain != "climate" for domain, _, _ in s.hass.services.calls)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("response", ["delayed", "timeout"])
 def test_asynchronous_mode_activation_and_readback_do_not_resend(system, monkeypatch, response):
     s = system
@@ -810,9 +914,9 @@ def test_cancelled_acquisition_keeps_unattempted_complete_baseline_for_restart(s
         s.adapter.set_abort_main_state(main)
         original = s.adapter._async_execute
 
-        async def cancel(action):
+        async def cancel(action, saved_automation_states):
             # Simulate cancellation after accepted activation and target writes.
-            result = await original(action)
+            result = await original(action, saved_automation_states)
             assert result.applied
             raise asyncio.CancelledError
 
@@ -932,8 +1036,13 @@ def test_failed_scheduler_guard_still_shuts_down_proven_off_owner(system, replac
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("corrupt_inactive_memory", [False, True])
-def test_live_airbase_padding_and_off_dry_replay(system, corrupt_inactive_memory):
+@pytest.mark.parametrize(
+    "scenario", [
+        "verified_recall", "invalid_restoration", "external_wake", "unavailable_sibling",
+        "different_recall", "delayed_recall", "different_readback_before_save", "delayed_mode_change",
+    ],
+)
+def test_live_airbase_padding_and_off_dry_replay(system, scenario, caplog):
     """Actual read-only protocol shape: two zones, eight slots and no dt7."""
     s = system
     fixture = json.loads((Path(__file__).parent / "fixtures/hvac/airbase_off_dry_memory_2026_10_31.json").read_text())
@@ -952,7 +1061,11 @@ def test_live_airbase_padding_and_off_dry_replay(system, corrupt_inactive_memory
         s.hass.states.values[actuator] = (
             "on" if unquote(s.values.zones["zone_onoff"]).split(";")[index] == "1" else "off"
         )
+    if scenario == "different_readback_before_save":
+        s.hass.states.values[BED] = "on"
+        s.publish()
     original = deepcopy(s.modes)
+    corrupt_inactive_memory = scenario == "invalid_restoration"
 
     async def run():
         await s.adapter.async_prepare_off_start(_action(s.desired))
@@ -960,7 +1073,130 @@ def test_live_airbase_padding_and_off_dry_replay(system, corrupt_inactive_memory
         assert main[MEMORY_KEY]["selected_mode"] == "dry"
         assert main[MEMORY_KEY]["modes"]["dry"]["target_source"] == "original_off_dry_stemp"
         assert len(zones) == 4 and not s.hass.services.calls
-        assert (await s.adapter.async_execute(_action(s.desired))).applied
+        options = {OFF_START_OPTION: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}
+        s.adapter.set_zone_control_context(options, {})
+        apply_service = s.hass.services.async_call
+        saw_recalled_dry = False
+        woke_externally = False
+        commands = []
+        pending_mode_change = None
+        read_state = s.adapter._state
+        s.adapter.set_command_callback(commands.append)
+        if scenario == "delayed_mode_change":
+            log_state = SimpleNamespace()
+            caplog.set_level(logging.INFO, logger=EnergyPlannerCoordinator.__module__)
+
+            def observe_dry(blocked):
+                EnergyPlannerCoordinator._log_dry_takeover_transition(log_state, blocked)
+
+            s.adapter.set_dry_takeover_observation_callback(observe_dry)
+
+        async def deliver_mode_change(coroutine):
+            # A deferred planning refresh can observe the same verified Dry
+            # feedback while the active acquisition waits for Cool.
+            observe_dry(bool(CapabilityDiscovery(s.hass, s.data, options).dry_takeover_issues()))
+            await coroutine
+
+        def deliver_mode_feedback(entity_id):
+            nonlocal pending_mode_change
+            observed = read_state(entity_id)
+            if entity_id == "climate.head" and pending_mode_change is not None:
+                asyncio.create_task(deliver_mode_change(pending_mode_change))
+                pending_mode_change = None
+            return observed
+
+        async def persist_confirmation(record):
+            nonlocal woke_externally, saw_recalled_dry
+            if (
+                scenario == "external_wake" and record and record["entity_id"] in PAIRS
+                and record["service"] == "turn_on" and not woke_externally
+            ):
+                # The record was assembled while Off. Another controller wakes
+                # the head before this damper command reaches Home Assistant.
+                woke_externally = True
+                s.selected[0] = "heat"
+                s.hass.states.values["climate.head"].state = "heat"
+                s.publish()
+            if (scenario == "different_recall" and record and record["entity_id"] == "climate.head"
+                    and record["service"] == "set_hvac_mode" and not saw_recalled_dry):
+                # Activation already reported Heat. A Dry update during the
+                # next command's persistence cannot be that activation's recall.
+                assert s.hass.states.get("climate.head").state == "heat"
+                s.selected[0] = "dry"
+                s.hass.states.values["climate.head"].state = "dry"
+                s.publish()
+                saw_recalled_dry = bool(CapabilityDiscovery(s.hass, s.data, options).dry_takeover_issues())
+            if (scenario == "delayed_recall" and record and record["entity_id"] == "climate.head"
+                    and record["service"] == "turn_on" and not saw_recalled_dry):
+                assert s.hass.states.get("climate.head").state == "off"
+                s.hass.states.values["climate.head"].state = "dry"
+                s.publish()
+            if scenario == "different_readback_before_save" and record is None and not saw_recalled_dry:
+                # Turn-on has observed Heat, but Dry arrives while confirmation
+                # is retired, before the next write can sample state.
+                assert s.hass.states.get("climate.head").state == "heat"
+                s.selected[0] = "dry"
+                s.hass.states.values["climate.head"].state = "dry"
+                s.publish()
+                saw_recalled_dry = bool(CapabilityDiscovery(s.hass, s.data, options).dry_takeover_issues())
+            return record
+
+        async def observe_recalled_dry(domain, name, payload, **kwargs):
+            nonlocal saw_recalled_dry, pending_mode_change
+            if (scenario == "delayed_mode_change" and name == "set_hvac_mode"
+                    and payload["entity_id"] == "climate.head" and s.hass.states.get("climate.head").state == "dry"):
+                observe_dry(bool(CapabilityDiscovery(s.hass, s.data, options).dry_takeover_issues()))
+                pending_mode_change = apply_service(domain, name, payload, **kwargs)
+                return
+            if (scenario == "different_recall" and payload["entity_id"] in PAIRS and name == "turn_on"
+                    and s.hass.states.get("climate.head").state == "off"):
+                s.selected[0] = "heat"
+            if (scenario == "different_readback_before_save"
+                    and payload["entity_id"] == "climate.head" and name == "turn_on"):
+                s.selected[0] = "heat"
+            await apply_service(domain, name, payload, **kwargs)
+            if (scenario == "delayed_recall" and not saw_recalled_dry
+                    and payload["entity_id"] in PAIRS and name == "turn_on"):
+                # The switch changes before the controller publishes the recalled mode.
+                s.hass.states.values["climate.head"].state = "off"
+                s.publish()
+            if woke_externally and not saw_recalled_dry and payload["entity_id"] in PAIRS and name == "turn_on":
+                assert s.hass.states.get("climate.head").state == "heat"
+                s.selected[0] = "dry"
+                s.hass.states.values["climate.head"].state = "dry"
+                s.publish()
+            if (scenario == "unavailable_sibling" and not saw_recalled_dry
+                    and s.hass.states.get("climate.head").state == "dry"):
+                s.hass.states.values[MAIN_CLIMATE] = FakeState("unavailable")
+            saw_recalled_dry |= bool(CapabilityDiscovery(s.hass, s.data, options).dry_takeover_issues())
+
+        s.adapter.set_confirmation_persistence_callback(persist_confirmation)
+        if scenario == "delayed_mode_change":
+            s.adapter._state = deliver_mode_feedback
+        s.hass.services.async_call = observe_recalled_dry
+        result = await s.adapter.async_execute(_action(s.desired))
+        assert saw_recalled_dry
+        if scenario == "delayed_mode_change":
+            recovered = "Daikin Dry mode no longer blocks HVAC takeover"
+            assert [message for message in caplog.messages if message in {HVAC_DRY_TAKEOVER_SUMMARY, recovered}] == [
+                HVAC_DRY_TAKEOVER_SUMMARY, recovered,
+            ]
+        if scenario in {"external_wake", "unavailable_sibling", "different_recall", "different_readback_before_save"}:
+            assert woke_externally is (scenario == "external_wake")
+            assert not result.applied
+            expected = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+            if scenario == "unavailable_sibling":
+                expected.insert(0, "climate_zone_unavailable")
+            assert result.capability_issues == tuple(expected)
+            assert not any(
+                row["stage"] == "issued" and row["entity_id"] == "climate.head"
+                and not row["restoration"] and row["service"] != "turn_on"
+                for row in commands
+            )
+            if scenario == "external_wake":
+                assert not any(row.get("off_start_head_activation") for row in commands if row["stage"] == "issued")
+            return
+        assert result.applied
         service = s.hass.services.async_call
 
         async def corrupt(domain, name, payload, **kwargs):

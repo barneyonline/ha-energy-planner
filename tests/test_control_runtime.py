@@ -16,6 +16,7 @@ from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState
 from homeassistant.core import Context, CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
 
@@ -40,10 +41,12 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     DEFAULT_OPTIONS,
     DOMAIN,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
 from custom_components.ha_energy_planner.entry_data import combined_entry_data
 from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter, EVCommandResult
 from custom_components.ha_energy_planner.ev_control import ev_grid_headroom_reason
@@ -4323,6 +4326,9 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
         )
         monkeypatch.setattr(daikin_memory, "read_topology", lambda *args: zone_control.topology(config))
         monkeypatch.setattr(zone_control, "read_topology", lambda *args: zone_control.topology(config))
+        registration = SimpleNamespace(platform="daikin", config_entry_id="core-daikin", device_id="controller")
+        registered = dict.fromkeys(["climate.head", *PAIRS.values()], registration)
+        monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registered.get))
 
         def publish():
             mode = {"1": "heat", "2": "cool", "7": "dry"}[control["mode"]] if control["pow"] == "1" else "off"
@@ -4349,7 +4355,10 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
                 hass.states.async_set(
                     entity,
                     mode if power == "1" else "off",
-                    {"temperature": value, "min_temp": target - 2, "max_temp": target + 2, "target_temp_step": 1},
+                    {
+                        "zone_id": index, "temperature": value, "min_temp": target - 2,
+                        "max_temp": target + 2, "target_temp_step": 1,
+                    },
                 )
 
         publish()
@@ -4533,4 +4542,157 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
             await coordinator.async_shutdown()
             await hass.async_stop(force=True)
 
+    asyncio.run(run())
+
+
+def test_oversized_zone_feedback_preserves_automation_recovery_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        zone = "climate.zone"
+        hass.states.async_set(zone, "heat", {"zone_id": 0, "temperature": 22})
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        entry = ConfigEntry(
+            domain=DOMAIN, title="HVAC feedback",
+            data={**configured.entry_data, CONF_CLIMATE_ZONES: [zone]},
+            options={**configured.options, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+            source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        save_ownership = store.async_save_ownership
+        injected = False
+
+        async def inject_feedback(ownership: dict[str, Any]) -> None:
+            nonlocal injected
+            await save_ownership(ownership)
+            confirmation = ownership.get("hvac_control", {}).get("command_confirmation", {})
+            if not injected and confirmation.get("entity_id") == zone:
+                injected = True
+                hass.states.async_set(zone, "heat", {"zone_id": 0, "temperature": 10**400})
+                await asyncio.sleep(0)
+
+        monkeypatch.setattr(store, "async_save_ownership", inject_feedback)
+        coordinator.async_start_listeners()
+        try:
+            plan, context = _command("hvac")
+            plan.actions[0].desired_state.update(target_temperature=20, configured_zones_only=True)
+            async with coordinator._command_lock:
+                await coordinator.executor.async_evaluate(plan, context)
+            await hass.async_block_till_done()
+            assert injected
+            assert [(domain, service) for domain, service, _ in calls] == [
+                ("automation", "turn_off"), ("automation", "turn_on"),
+            ]
+            hvac = CapabilityDiscovery(hass, coordinator.entry_data, coordinator.options).inspect().hvac
+            assert hvac.issues == ["climate_zone_target_unavailable"]
+            await store.async_flush()
+            reloaded = PlannerStore(hass, "runtime")
+            await reloaded.async_load()
+            event = next(item for item in reloaded.data["climate_audit"] if item["stage"] == "unmatched_feedback")
+            assert event["expected"]["temperature"] == 22
+            assert event["observed"]["temperature"] is None
+            assert {"hvac_control", "climate_automations"}.isdisjoint(reloaded.data["ownership"])
+            assert f"required_evidence_missing issue=climate_zone_target_unavailable entities={zone}" in caplog.text
+            assert "OverflowError" not in caplog.text
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("later", ["unavailable", "0", "confirmed_reduction", "renewed_start", "confirmed_stop"])
+def test_queued_power_event_preserves_peak_but_not_superseded_evidence(tmp_path, monkeypatch, later):
+    """Real HA queues both reports before the capacity listener can run."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        power_attrs = {"unit_of_measurement": "kW"}
+        hass.states.async_set("sensor.ev_power", 7, power_attrs)
+        hass.states.async_set("number.limit", 3, {
+            "unit_of_measurement": "kW", "min": 1, "max": 7, "step": 1,
+        })
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data.update(ev_power_entity="sensor.ev_power", ev_power_limit_entity="number.limit")
+        configured.options.update(ev_limit_min=1, ev_limit_max=7)
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Queued capacity", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        executor = coordinator.executor
+        reservations = executor._ev_grid_reservations()
+        reservations[entry.entry_id] = {"load_kw": 7, "limit_kw": 10}
+        plan, context = _command("ev")
+        context.slots[0].baseline_load_forecast_kw = 2
+        issues = []
+
+        async def refresh():
+            issues.append(executor._ev_reservation_safety_issue(context))
+
+        monkeypatch.setattr(coordinator, "async_request_refresh", refresh)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+
+        @callback
+        def publish(_event):
+            # HA queues nested state_changed events until this push callback
+            # returns; both listeners then see the later value in hass.states.
+            hass.states.async_set("sensor.ev_power", 9, power_attrs)
+            if later == "confirmed_stop":
+                executor._release_ev_grid_reservation()
+            elif later in {"confirmed_reduction", "renewed_start"}:
+                hass.states.async_set("sensor.ev_power", 3, power_attrs)
+                executor._reconcile_ev_grid_reservation(plan.actions[0], EVCommandResult(
+                    True, "ev_power_limit_confirmed", {}, {
+                        "confirmed_power_kw": 3,
+                        "confirmed_power_at": hass.states.get("sensor.ev_power").last_reported.isoformat(),
+                    }, command_sent=True,
+                ), None)
+                if later == "renewed_start":
+                    plan.actions[0].desired_state["projected_load_kw_now"] = 3
+                    context.slots[0].projected_ev_load_kw = 3
+                    reason, _previous = executor._reserve_ev_grid_capacity(
+                        plan.actions[0], context, dt_util.utcnow(),
+                    )
+                    assert reason is None
+            else:
+                hass.states.async_set("sensor.ev_power", later, power_attrs)
+
+        unsubscribe = hass.bus.async_listen("ev_provider_push", publish)
+        try:
+            hass.bus.async_fire("ev_provider_push")
+            await hass.async_block_till_done()
+            if later == "confirmed_stop":
+                assert entry.entry_id not in reservations
+                assert issues == []
+            elif later == "confirmed_reduction":
+                assert reservations[entry.entry_id]["load_kw"] == 3
+                assert issues == []
+            elif later == "renewed_start":
+                # Renewal remains conservative at the configured rate until
+                # its own confirmation, but must not revive the retired 9 kW.
+                assert reservations[entry.entry_id]["load_kw"] == 7
+                assert issues == [None]
+            else:
+                assert reservations[entry.entry_id]["load_kw"] == 9
+                assert issues == ["grid_import_limit_exceeded"]
+                await store.async_flush()
+                reloaded = PlannerStore(hass, "runtime")
+                await reloaded.async_load()
+                assert reloaded.data["ev_grid_reservation"]["load_kw"] == 9
+        finally:
+            unsubscribe()
+            await coordinator.async_shutdown()
+            await hass.async_stop()
     asyncio.run(run())

@@ -1,9 +1,17 @@
 # Setup, upgrades and stable contracts
 
-Home Assistant 2026.10.0 is the minimum and pinned validation baseline.
-CI also exercises floating stable. HACS owns the minimum
-declaration and `tool.energy-planner.support` in pyproject owns tested versions.
+Home Assistant 2026.11.0 is the minimum and pinned validation baseline for the
+next Energy Planner release. CI also exercises floating stable. `hacs.json`
+declares the Marketplace minimum and `tool.energy-planner.support` in pyproject
+owns tested versions.
 Weekly runtime checks detect upstream changes even without a repository push.
+
+Update Home Assistant to 2026.11.0 or newer before updating Energy Planner.
+Home Assistant migrates existing HACS installations and their update entities
+to Marketplace. For a new installation, find Energy Planner in **Settings →
+Marketplace**. If it is missing from the catalog, connect GitHub and use
+**Add from link** with `barneyonline/ha-energy-planner`.
+[Home Assistant Marketplace documentation](https://www.home-assistant.io/integrations/marketplace/#custom-repositories).
 
 ## Operator documentation
 
@@ -38,8 +46,9 @@ or conditions. Use standard Home Assistant state triggers and conditions.
 The source-controlled [EV policy](ev-scheduling.md), [climate policy](climate-decisions.md),
 [requirements audit](requirements-audit.md), [quality evidence](../quality_scale.yaml)
 and [release checklist](release-checklist.md) remain implementation and validation
-references. Publishing a release and deploying it to Home Assistant are separate
-steps from preparing a release pull request.
+references. See the [2026.11 compatibility review](ha-2026-11-compatibility-review.md)
+for API changes and follow-up opportunities. Publishing a release and deploying
+it to Home Assistant are separate steps from preparing a release pull request.
 
 ## Example setup
 
@@ -65,6 +74,15 @@ Current state, Next actions, Plan health and the safety-check result are the
 troubleshooting entry points. Production readiness is no longer a standalone
 sensor. A learning model may need more than three calendar days if history is
 incomplete or holdout validation does not pass.
+
+When reproducing an issue, enable debug logging on the Energy Planner integration
+page and choose **Show logs** for the live, filtered view.
+[Home Assistant integration logs](https://www.home-assistant.io/blog/2026/11/04/release-202611/#live-logs-for-each-integration)
+
+Open **Settings → Tools → Action history** to see when a service was called,
+what it targeted, and its context ID. Compare the call time and target with the
+confirmed activity in the Planner calendar and check device feedback to verify
+the result. [Home Assistant Action history](https://www.home-assistant.io/blog/2026/11/04/release-202611/#every-action-on-the-record)
 
 ## Services
 
@@ -125,6 +143,11 @@ values are compact audit codes, not free-form personal information.
 4. Confirm original entity IDs, control intent, overrides and device feedback.
    Recovery may keep Armed off while retaining Automatic control.
 5. Review the first plan and run the safety check before enabling new control.
+
+Migration repairs belong to their Energy Planner config entry. Disabling the
+entry hides its repair, and removing the entry clears it. Startup adopts saved
+notices from earlier versions, preserves ignored repairs that are still pending,
+and clears notices for migrated or removed entries.
 
 The Store envelope remains version 1; audit normalization removes the duplicate
 `outcomes` list in favor of `execution_audit`. A file-only downgrade is not a

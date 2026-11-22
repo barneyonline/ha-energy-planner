@@ -8,11 +8,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Required
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import probatio as vol
 import pytest
+from homeassistant.data_entry_flow import _strip_hidden_fields, add_visible_conditions_to_serialized_schema
 
 import custom_components.ha_energy_planner.config_flow as config_flow_module
 from custom_components.ha_energy_planner.config_flow import (
@@ -1096,61 +1097,32 @@ _CONDITIONAL_EV_FIELDS = (
 )
 
 
-@pytest.fixture
-def conditional_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise marker selection even on an older HA test runtime."""
-    class VisibleRequired(vol.Required):
-        def __init__(self, *args: Any, visible: Any = None, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self.visible = visible
-
-    monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", VisibleRequired, raising=False)
-
-
-@pytest.mark.usefixtures("conditional_required")
-def test_ev_threshold_visibility_is_scoped_to_its_own_toggle() -> None:
-    """Only the two dependent thresholds receive section-local conditions."""
+def test_ev_price_visibility_is_scoped_to_its_own_controls() -> None:
+    """Price controls use the conditions of their own charging policy."""
     saved = {CONF_EV_MAX_IMPORT_PRICE: 0.37, CONF_EV_LOW_PRICE_THRESHOLD: -0.05}
     flow = OptionsFlow(SimpleNamespace(data={}, options=saved))
     groups = flow._settings_schema().schema
     ev = next(group for marker, group in groups.items() if marker.schema == INPUT_STEP_EV)
     markers = {marker.schema: marker for marker in ev.schema.schema}
     visible = {field: marker.visible for field, marker in markers.items() if hasattr(marker, "visible")}
-    assert visible == {field: {"field": toggle, "value": True} for toggle, field in _CONDITIONAL_EV_FIELDS}
+    price_limit_on = {"field": CONF_EV_PRICE_LIMIT_ENABLED, "value": True}
+    departure_priority = [price_limit_on, {"field": "ev_price_policy", "value": "departure_priority"}]
+    assert visible == {
+        **{field: {"field": toggle, "value": True} for toggle, field in _CONDITIONAL_EV_FIELDS},
+        "ev_price_policy": price_limit_on,
+        "ev_emergency_price": departure_priority,
+        "ev_emergency_budget": departure_priority,
+    }
     for toggle, field in _CONDITIONAL_EV_FIELDS:
         assert markers[toggle].default() is DEFAULT_OPTIONS[toggle]
         assert markers[field].default() == saved[field]
         assert ev.schema.schema[markers[field]].serialize() == config_flow_module._option_selector(field).serialize()
 
 
-@pytest.mark.parametrize("legacy_required", [None, Required])
-def test_ev_threshold_visibility_falls_back_on_older_ha(
-    monkeypatch: pytest.MonkeyPatch, legacy_required: Any,
-) -> None:
-    """Older HA can expose typing.Required rather than the new schema marker."""
-    monkeypatch.delattr(config_flow_module.data_entry_flow, "Required", raising=False)
-    if legacy_required is not None:
-        monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", legacy_required, raising=False)
-    fields = tuple(field for pair in _CONDITIONAL_EV_FIELDS for field in pair)
-    schema = config_flow_module._options_section_schema({}, fields)
-    for marker in schema.schema:
-        assert type(marker) is vol.Required
-        assert not hasattr(marker, "visible")
-    assert schema({}) == {field: DEFAULT_OPTIONS[field] for field in fields}
-
-
 @pytest.mark.parametrize("toggle,field", _CONDITIONAL_EV_FIELDS)
 @pytest.mark.parametrize("saved", [None, -0.05, 0.0, 0.37])
-@pytest.mark.parametrize("use_visibility", [False, True])
-def test_ev_threshold_survives_omission_and_repeated_edits(
-    monkeypatch: pytest.MonkeyPatch, toggle: str, field: str, saved: float | None, use_visibility: bool,
-    request: pytest.FixtureRequest,
-) -> None:
+def test_ev_threshold_survives_omission_and_repeated_edits(toggle: str, field: str, saved: float | None) -> None:
     """Hidden/omitted thresholds retain saved values or the established default."""
-    if use_visibility:
-        request.getfixturevalue("conditional_required")
-    else:
-        monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", Required, raising=False)
     entry = SimpleNamespace(data={}, options={toggle: True, **({field: saved} if saved is not None else {})})
     expected = DEFAULT_OPTIONS[field] if saved is None else saved
     # Reopen after each save, including disabling, unrelated edits, and enabling.
@@ -1176,27 +1148,18 @@ def test_ev_threshold_survives_omission_and_repeated_edits(
 
 
 def test_ev_threshold_visibility_with_real_ha_api() -> None:
-    """Check serialization and hidden-field handling on a supporting HA runtime."""
-    required = getattr(config_flow_module.data_entry_flow, "Required", None)
-    if not (isinstance(required, type) and issubclass(required, vol.Required)):
-        pytest.skip("Conditional form-field runtime requires HA 2026.11 or newer")
-    strip_hidden = getattr(config_flow_module.data_entry_flow, "_strip_hidden_fields", None)
-    serialize_visibility = getattr(
-        config_flow_module.data_entry_flow, "add_visible_conditions_to_serialized_schema", None,
-    )
-    assert strip_hidden is not None
-    assert serialize_visibility is not None
+    """Check serialization and hidden-field handling with Home Assistant's markers."""
     flow = OptionsFlow(SimpleNamespace(data={}, options={CONF_EV_MAX_IMPORT_PRICE: 0.37}))
     schema = flow._settings_schema()
     serialized = vol.to_field_list(schema, custom_serializer=config_flow_module.cv.custom_serializer)
-    serialize_visibility(schema, serialized)
+    add_visible_conditions_to_serialized_schema(schema, serialized)
     ev = next(group for group in serialized if group["name"] == INPUT_STEP_EV)
     for toggle, field in _CONDITIONAL_EV_FIELDS:
         assert next(item for item in ev["schema"] if item["name"] == field)["visible"] == {
             "field": toggle, "value": True,
         }
         for enabled in (False, True, False):
-            filtered_schema, filtered_input = strip_hidden(
+            filtered_schema, filtered_input = _strip_hidden_fields(
                 schema, {INPUT_STEP_EV: {toggle: enabled, field: 0.42}},
             )
             group = next(group for marker, group in filtered_schema.schema.items() if marker.schema == INPUT_STEP_EV)
@@ -1205,7 +1168,7 @@ def test_ev_threshold_visibility_with_real_ha_api() -> None:
             if enabled:
                 assert submitted[field] == 0.42
             # Omitted fields use their saved/default value only while visible.
-            filtered_schema, filtered_input = strip_hidden(schema, {INPUT_STEP_EV: {toggle: enabled}})
+            filtered_schema, filtered_input = _strip_hidden_fields(schema, {INPUT_STEP_EV: {toggle: enabled}})
             group = next(group for marker, group in filtered_schema.schema.items() if marker.schema == INPUT_STEP_EV)
             submitted = group(filtered_input[INPUT_STEP_EV])
             assert (field in submitted) is enabled

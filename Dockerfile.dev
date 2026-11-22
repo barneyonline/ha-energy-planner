@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG HA_IMAGE=ghcr.io/home-assistant/home-assistant:2026.10.0
+ARG HA_IMAGE=ghcr.io/home-assistant/home-assistant:2026.11.0
 FROM ${HA_IMAGE}
 
 ARG MYPY_VERSION

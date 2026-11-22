@@ -1336,3 +1336,36 @@ def test_declared_amber_duration_cannot_exceed_explicit_source_cadence():
     assert tariff_source_intervals(state, 15) == []
     assert forecast_series_from_state(state, issued_at=datetime(2026, 11, 4, 8, tzinfo=UTC),
         horizon_hours=1, interval_minutes=15, value_keys=("per_kwh",), value_kind="price") == [None] * 4
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_unrepresentable_tariff_timestamp_leaves_a_gap(declared) -> None:
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    row = {"start_time": "9999-12-31T23:00:00-02:00", "per_kwh": -0.15}
+    if declared:
+        row.update(end_time="9999-12-31T23:30:00-02:00", duration=30)
+    state = FakeState("-0.15", {"forecasts": [row]})
+    series = forecast_series_from_state(
+        state, issued_at=now, horizon_hours=1, interval_minutes=30, value_keys=("per_kwh",), value_kind="price",
+    )
+    assert series == ([None, None] if declared else None)
+    assert latest_forecast_valid_at_from_state(state, value_keys=("per_kwh",)) is None
+    assert forecast_timestamp_status_from_state(state, value_keys=("per_kwh",)) == "untimestamped"
+
+
+@pytest.mark.parametrize("cadence", ["invalid", 1e15])
+def test_ordered_forecast_ignores_invalid_explicit_cadence(cadence) -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": cadence},
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 2.0, None, None]
