@@ -661,7 +661,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   equivalent plan refreshes. The integration warns that provider
   integrations may independently log bounded prompts. Docker smoke coverage
   exercises a response-capable local AI advisor service through Home Assistant
-  Core and verifies accepted bounded advice in Store recommendations.
+  Core, waits for Explain's background task before replanning, and verifies
+  accepted bounded advice and forecast metadata in Store after shutdown.
 - Replay fixtures cover stale inputs, battery floor rejection, EV infeasible
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, bounded helper overrides, opt-in away preconditioning, and
