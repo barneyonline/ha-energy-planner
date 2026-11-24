@@ -7,7 +7,9 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -18,6 +20,8 @@ from homeassistant.helpers import entity_registry
 
 from custom_components.ha_energy_planner import plan_presentation as presentation_module
 from custom_components.ha_energy_planner import sensor as sensor_module
+from custom_components.ha_energy_planner import thermal_learning
+from custom_components.ha_energy_planner.climate_models import MAX_OBSERVATIONS
 from custom_components.ha_energy_planner.const import HVAC_DRY_ZONE_TARGETS_ABSENT
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
 from custom_components.ha_energy_planner.entity import RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
@@ -357,6 +361,58 @@ def test_diagnostic_decision_and_health_sensors_explain_current_plan() -> None:
     ]
     plan.health = "corrupt"
     assert health.value_fn(coordinator) is None
+
+
+def test_decision_summary_reads_thermal_history_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 11, 24, 6, tzinfo=UTC)
+    clock = [now]
+    monkeypatch.setattr(sensor_module.dt_util, "utcnow", lambda: clock[0])
+    windows = [
+        {
+            "at": (now - timedelta(minutes=5 * i)).isoformat(),
+            "minutes": 5,
+            "rate": 2.0,
+            "power": 1.5,
+            "regime": "normal",
+        }
+        for i in reversed(range(thermal_learning.MAX_WINDOWS))
+    ]
+    sources = {
+        f"room_{i}": {
+            "regime": "normal",
+            "loads_kw": windows,
+            "buckets": {mode: {"windows": windows} for mode in ("heat", "cool", "passive")},
+        }
+        for i in range(8)
+    }
+    observations = [
+        {"at": (now - timedelta(minutes=5 * i)).isoformat(), "provenance": "normal"}
+        for i in range(MAX_OBSERVATIONS)
+    ]
+    coordinator = _coordinator(
+        _plan(),
+        store_data={"thermal_model": {"sources": sources}, "climate_engine": {"observations": observations}},
+    )
+    sensor = PlannerSensor(coordinator, next(item for item in SENSORS if item.key == "decision_summary"))
+    started = perf_counter()
+    attrs = sensor.extra_state_attributes
+    elapsed_ms = (perf_counter() - started) * 1000
+    with patch.object(thermal_learning, "instant", wraps=thermal_learning.instant) as reads:
+        assert sensor.extra_state_attributes == attrs
+    print(f"Decision Summary attributes: {elapsed_ms:.3f} ms, {reads.call_count} thermal timestamp reads")
+    climate = attrs["climate"]
+    assert climate["normal_observation_count"] == MAX_OBSERVATIONS
+    assert climate["thermal_learning"]["electrical_load_kw"] == 1.5
+    assert climate["thermal_learning"]["sources"]["room_0"]["modes"] == {
+        mode: "<truncated>" for mode in ("heat", "cool", "passive")
+    }
+    # Each stored timestamp plus one last-observation readiness check per mode.
+    assert reads.call_count <= len(sources) * (4 * len(windows) + 3)
+
+    clock[0] += timedelta(days=14, seconds=1)
+    thermal = sensor.extra_state_attributes["climate"]["thermal_learning"]
+    assert thermal["electrical_load_model_ready"] is False
+    assert thermal["electrical_load_kw"] is None
 
 
 def test_current_load_forecast_sensor_exposes_expected_and_conservative_power() -> None:

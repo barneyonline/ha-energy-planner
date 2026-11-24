@@ -140,3 +140,19 @@ The focused runs used isolated Docker containers with pinned test dependencies,
 and `python3 -m pytest -q` with the seven files above for compatibility.
 Local development and validation performed no release, deployment, live API call
 or production instrumentation.
+
+## Decision Summary thermal diagnostics
+
+Decision Summary attributes include climate learning evidence. Within one read,
+the thermal summary filters each source and mode's windows once, then shares the
+result between retained counts, qualification and current-mode readiness. Shared
+unit load aggregation reuses each parsed timestamp when deduplicating samples.
+Each read evaluates expiry against the current clock.
+
+On Home Assistant 2026.11.0, the synthetic regression in
+`tests/test_sensor.py::test_decision_summary_reads_thermal_history_once` exercised
+eight sources with 96 windows per mode and 17,280 climate observations. Timestamp
+reads fell from 13,080 to 3,096. Individual unprofiled attribute reads took
+7.377 ms before and 2.863 ms after. The test asserts work counts and published
+values, including expiry. These measurements do not reproduce the reported
+756 ms warning or establish its cause on the live host.

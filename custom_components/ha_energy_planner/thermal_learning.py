@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -223,20 +223,27 @@ def update(model: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _recent_windows(rows: list[Any], now: Any) -> list[dict[str, Any]]:
+def _recent_window_entries(rows: list[Any], now: datetime) -> Iterator[tuple[datetime, dict[str, Any]]]:
     """An expired sample must not regain authority when a new sample arrives."""
-    return [row for row in rows if isinstance(row, dict)
-            and (at := instant(row.get("at"))) is not None and timedelta(0) <= now - at <= timedelta(days=14)]
+    minimum_age, maximum_age = timedelta(0), timedelta(days=14)
+    for row in rows:
+        if (isinstance(row, dict) and (at := instant(row.get("at"))) is not None
+                and minimum_age <= now - at <= maximum_age):
+            yield at, row
+
+
+def _recent_windows(rows: list[Any], now: datetime) -> list[dict[str, Any]]:
+    """Return recent windows in their original order."""
+    return [row for _, row in _recent_window_entries(rows, now)]
 
 
 def _load_windows(model: dict[str, Any], now: Any) -> list[dict[str, Any]]:
     """Combine shared-unit measurements without room-order bias or duplicate credit."""
     by_time: dict[datetime, dict[str, Any]] = {}
     for item in model.get("sources", {}).values():
-        for row in _regime_windows(item, item.get("loads_kw", []), now):
-            at = instant(row["at"])
-            assert at is not None  # The same timestamp passed the freshness filter.
-            by_time[at] = row
+        for at, row in _recent_window_entries(item.get("loads_kw", []), now):
+            if row.get("regime") == item.get("regime"):
+                by_time[at] = row
     selected: list[dict[str, Any]] = []
     last = None
     for at in sorted(by_time, reverse=True):
@@ -262,7 +269,11 @@ def _bucket_summary(bucket: dict[str, Any], now: Any, item: dict[str, Any] | Non
     """Recompute readiness from the dated evidence, including between updates."""
     if "windows" not in bucket:
         return {} if candidate is not None else bucket
-    rows = _regime_windows(item or {}, bucket["windows"], now, candidate)
+    return _summarize_windows(_regime_windows(item or {}, bucket["windows"], now, candidate))
+
+
+def _summarize_windows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe a selected set of thermal windows."""
     return {"count": len(rows), "minutes": sum(row["minutes"] for row in rows),
             "rate_c_per_hour": median(row["rate"] for row in rows) if rows else None,
             "last_at": rows[-1]["at"] if rows else None}
@@ -273,9 +284,14 @@ def rate(model: dict[str, Any], zone: str, mode: str, now: Any, *,
     """Readiness belongs to each source/mode and expires independently."""
     item = model.get("sources", {}).get(zone, {})
     bucket = _bucket_summary(item.get("buckets", {}).get(mode, {}), now, item, candidate)
+    return _ready_rate(bucket, now, model.get("learning_enabled", True))
+
+
+def _ready_rate(bucket: dict[str, Any], now: datetime, learning_enabled: bool) -> float | None:
+    """Apply readiness thresholds to current or legacy aggregate evidence."""
     last = instant(bucket.get("last_at"))
     value = finite(bucket.get("rate_c_per_hour"))
-    if (not model.get("learning_enabled", True) or value is None or last is None
+    if (not learning_enabled or value is None or last is None
             or not timedelta(0) <= now - last <= timedelta(days=14)
             or bucket.get("count", 0) < MIN_WINDOWS or bucket.get("minutes", 0) < 60):
         return None
@@ -376,36 +392,53 @@ def bounded_lead_slots(details: dict[str, Any], options: Mapping[str, Any]) -> i
                       floor(float(details["maximum_lead_minutes"]) / interval)))
 
 
-def _qualified_regimes(bucket: dict[str, Any], now: Any) -> list[dict[str, Any]]:
+def _qualified_regimes(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Describe retained qualification separately from current/candidate selection."""
     groups: dict[str | None, list[dict[str, Any]]] = {}
-    for row in _recent_windows(bucket.get("windows", []), now):
+    for row in windows:
         groups.setdefault(row.get("regime"), []).append(row)
     return [{"operating_regime": regime,
              "structured_windows": sum(bool(row.get("conditions")) for row in rows),
-             **_bucket_summary({"windows": rows}, now, {"regime": regime})}
+             **_summarize_windows(rows)}
             for regime, rows in groups.items()
             if len(rows) >= MIN_WINDOWS and sum(row["minutes"] for row in rows) >= 60]
+
+
+def _source_summary(item: dict[str, Any], now: datetime, learning_enabled: bool) -> dict[str, Any]:
+    """Share fresh windows between retained, qualified, and current-mode evidence."""
+    buckets = item.get("buckets", {})
+    recent = {mode: _recent_windows(bucket.get("windows", []), now) for mode, bucket in buckets.items()}
+    modes = {}
+    for mode in ("heat", "cool", "passive"):
+        bucket = buckets.get(mode, {})
+        if "windows" in bucket:
+            bucket = _summarize_windows([row for row in recent[mode] if row.get("regime") == item.get("regime")])
+        modes[mode] = {
+            "ready": _ready_rate(bucket, now, learning_enabled) is not None,
+            **{key: bucket.get(key) for key in ("rate_c_per_hour", "count", "minutes", "last_at")},
+        }
+    return {
+        **{key: item.get(key) for key in (
+            "sensor", "temperature", "reported_at", "input_status", "rejected", "last_rejection",
+        )},
+        "operating_regime": item.get("regime"),
+        "retained_windows": {mode: len(rows) for mode, rows in recent.items()},
+        "retained_qualified_regimes": {mode: _qualified_regimes(rows) for mode, rows in recent.items()},
+        "modes_selection": "current_observed_regime",
+        "modes": modes,
+    }
 
 
 def summary(model: dict[str, Any], now: Any) -> dict[str, Any]:
     """Bounded operator evidence without raw rolling samples."""
     loads = _load_windows(model, now)
-    return {"model_version": model.get("model_version"), "learning_enabled": model.get("learning_enabled", True),
-            "electrical_load_model_ready": len(loads) >= MIN_WINDOWS,
-            "electrical_load_kw": median(row["power"] for row in loads) if loads else None,
-            "sources": {zone: {
-                **{key: item.get(key) for key in (
-                    "sensor", "temperature", "reported_at", "input_status", "rejected", "last_rejection",
-                )},
-                "operating_regime": item.get("regime"),
-                "retained_windows": {mode: len(_recent_windows(bucket.get("windows", []), now))
-                                     for mode, bucket in item.get("buckets", {}).items()},
-                "retained_qualified_regimes": {
-                    mode: _qualified_regimes(bucket, now) for mode, bucket in item.get("buckets", {}).items()},
-                "modes_selection": "current_observed_regime",
-                "modes": {mode: {"ready": rate(model, zone, mode, now) is not None,
-                                 **{key: bucket.get(key) for key in ("rate_c_per_hour", "count", "minutes", "last_at")}}
-                          for mode in ("heat", "cool", "passive")
-                          for bucket in [_bucket_summary(item.get("buckets", {}).get(mode, {}), now, item)]},
-            } for zone, item in model.get("sources", {}).items()}}
+    learning_enabled = model.get("learning_enabled", True)
+    return {
+        "model_version": model.get("model_version"),
+        "learning_enabled": learning_enabled,
+        "electrical_load_model_ready": len(loads) >= MIN_WINDOWS,
+        "electrical_load_kw": median(row["power"] for row in loads) if loads else None,
+        "sources": {
+            zone: _source_summary(item, now, learning_enabled) for zone, item in model.get("sources", {}).items()
+        },
+    }
