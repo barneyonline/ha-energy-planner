@@ -1522,6 +1522,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   `attributes_truncated` marker. Calendar summaries, descriptions, locations,
   and UIDs have explicit byte bounds; adversarial Unicode and nested-payload
   tests cover each dynamic entity metadata path.
+- Decision Summary thermal diagnostics share one freshness pass per source
+  and mode within each attribute read. The work-count and expiry regression in
+  `tests/test_sensor.py` exercises the published attributes with full retained
+  windows. See `docs/entity-publication.md` for measurements.
 - Dry-run actions are recorded as intentionally skipped with the stable
   `dry_run` reason. Plan-wide violations remain on plan health instead of being
   copied to unrelated action rejections, including neutral Enphase restores,
