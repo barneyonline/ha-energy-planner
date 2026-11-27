@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant import auth, loader
+from homeassistant.components.repairs import repairs_flow_manager
 from homeassistant.config_entries import (
     ConfigEntries,
     ConfigEntry,
@@ -298,7 +299,8 @@ def test_repairs_manager_recovers_migration_and_clears_issue(tmp_path):
         try:
             assert not await hass.config_entries.async_setup(entry.entry_id)
             assert await async_setup_component(hass, "repairs", {})
-            manager = hass.data["repairs"]["flow_manager"]
+            manager = repairs_flow_manager(hass)
+            assert manager is not None
             issue_id = migration_issue_id(entry.entry_id)
             form = await manager.async_init(DOMAIN, data={"issue_id": issue_id})
             assert form["step_id"] == "target" and not form["errors"]

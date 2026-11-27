@@ -18,7 +18,7 @@ from math import isfinite
 from time import monotonic, perf_counter
 from typing import Any, cast
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_state_report_event
@@ -61,7 +61,7 @@ from .advice_runtime import (
 )
 from .availability import AvailabilityIdentity, availability_details
 from .calendar_history import calendar_feedback_recheck_delay
-from .climate_inputs import finite
+from .climate_inputs import finite, hvac_feedback_is_assumed, hvac_feedback_is_observed
 from .climate_inputs import temperature_targets_match as _matching_hvac_target
 from .climate_learning import observe
 from .climate_runtime import update_readiness
@@ -841,8 +841,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         location = asset_name(asset)
         old, new = event.data.get("old_state"), event.data.get("new_state")
         equivalent_states = getattr(old, "state", None) == getattr(new, "state", None) and (
-            asset == ActionAsset.DAIKIN
-            or getattr(old, "last_changed", None) == getattr(new, "last_changed", None)
+            hvac_feedback_is_assumed(old) == hvac_feedback_is_assumed(new)
+            if asset == ActionAsset.DAIKIN
+            else getattr(old, "last_changed", None) == getattr(new, "last_changed", None)
         )
         previous_records = None
         for state in ((new,) if equivalent_states else (old, new)):
@@ -900,7 +901,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         external_ev_reservation = getattr(getattr(self, "store", None), "data", {}).get("ev_grid_reservation", {})
         if not entity_ids and external_ev_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True:
             return
-        unavailable_hvac_baselines: dict[str, tuple[Any, str | None]] = {}
+        unavailable_hvac_baselines: dict[str, tuple[State | None, set[str]]] = {}
         unchanged_calendar_feedback: dict[ActionAsset, _UnchangedCalendarFeedback] = {}
         external_ev_stop_pending = False
         unsubscribe_ev_reports: list[Callable[[], None]] = []
@@ -1116,36 +1117,52 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             is_hvac = is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
             startup = not getattr(self.hass, "is_running", True)
             manual_recovery = False
+            optimistic_user_contexts: set[str] = set()
             recovery_baseline = None
             inherited_recovery_context_ids: set[str] = set()
             if is_hvac:
                 old, new = event.data.get("old_state"), event.data.get("new_state")
-                if (
-                    old is not None and old.state not in STATE_UNKNOWN_VALUES
-                    and (new is None or new.state in STATE_UNKNOWN_VALUES)
-                ):
-                    # This is classification evidence only, never a control or
-                    # restoration snapshot. Retire it on the first recovery.
-                    # A fresh user request may first publish failed telemetry;
-                    # its context remains eligible when actual controls arrive.
+                observed_before = old if hvac_feedback_is_observed(old) else None
+                observed_now = hvac_feedback_is_observed(new)
+                if not observed_now and (observed_before is not None or entity_id not in unavailable_hvac_baselines):
+                    # Context attribution also needs an outage record after
+                    # reload. Only prior observed feedback can establish a
+                    # recovery comparison snapshot.
+                    excluded_ids: set[str] = set()
+                    baseline_context_id = getattr(getattr(old, "context", None), "id", None)
+                    if baseline_context_id is not None:
+                        excluded_ids.add(baseline_context_id)
                     loss_context = getattr(event, "context", None)
-                    unavailable_hvac_baselines[entity_id] = (
-                        old, None if getattr(loss_context, "user_id", None) else getattr(loss_context, "id", None),
-                    )
-                recovery_baseline, outage_context_id = unavailable_hvac_baselines.get(entity_id, (None, None))
-                manual_recovery = _is_explicit_hvac_recovery_change(
-                    event, recovery_baseline, outage_context_id,
-                ) and bool(
+                    loss_context_id = getattr(loss_context, "id", None)
+                    if loss_context_id and not getattr(loss_context, "user_id", None):
+                        excluded_ids.add(loss_context_id)
+                    unavailable_hvac_baselines[entity_id] = (observed_before, excluded_ids)
+                recovery_baseline, outage_context_ids = unavailable_hvac_baselines.get(entity_id, (None, set()))
+                can_supersede = bool(
                     is_main_climate or startup or pending_hvac_desired_state is not None
                     or self.store.data.get("ownership", {}).get("hvac_control")
                 )
-                if new is not None and new.state not in STATE_UNKNOWN_VALUES:
-                    inherited_recovery_context_ids = {
-                        context_id for context_id in (
-                            outage_context_id, getattr(getattr(recovery_baseline, "context", None), "id", None),
-                        ) if context_id is not None
-                    }
+                if can_supersede and old is not None and hvac_feedback_is_assumed(new):
+                    # An optimistic state cannot confirm a write. A concrete
+                    # change tied to a fresh user context still establishes intent.
+                    concrete_mode_change = (
+                        old.state not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES
+                        and old.state != new.state
+                    )
+                    if concrete_mode_change or _has_concrete_hvac_attribute_change(old, new):
+                        optimistic_user_contexts = _fresh_hvac_user_context_ids(event, outage_context_ids)
+                        outage_context_ids.update(optimistic_user_contexts)
+                manual_recovery = _is_explicit_hvac_recovery_change(
+                    event, recovery_baseline, outage_context_ids,
+                ) and can_supersede
+                if observed_now:
+                    inherited_recovery_context_ids = outage_context_ids
                     unavailable_hvac_baselines.pop(entity_id, None)
+                if not optimistic_user_contexts and hvac_feedback_is_assumed(old) and hvac_feedback_is_assumed(new):
+                    # Consecutive optimistic polls do not change availability
+                    # or provide new physical evidence for planning.
+                    return
+            explicit_manual_intent = manual_recovery or bool(optimistic_user_contexts)
             if is_hvac and (manual_recovery or _is_hvac_availability_feedback(
                 event, inherited_context_ids=inherited_recovery_context_ids,
             )):
@@ -1156,10 +1173,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 if callable(audit):
                     new = event.data.get("new_state")
                     audit({
-                        "stage": "manual_recovery" if manual_recovery else "availability_feedback",
+                        "stage": ("manual_recovery" if manual_recovery else "manual_optimistic"
+                                  if optimistic_user_contexts else "availability_feedback"),
                         "entity_id": entity_id,
-                        "override_source": "user" if manual_recovery else None,
-                        "user_attributed": manual_recovery,
+                        "override_source": "user" if explicit_manual_intent else None,
+                        "user_attributed": explicit_manual_intent,
                         "context_id": getattr(getattr(event, "context", None), "id", None),
                         "expected": {"mode": getattr(recovery_baseline, "state", None)} if manual_recovery else None,
                         "observed": {
@@ -1168,10 +1186,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                                for key in _HVAC_CONTROL_ATTRIBUTE_KEYS},
                         },
                     }, now=now)
-                if not manual_recovery:
+                if not explicit_manual_intent:
                     self._schedule_debounced_refresh("hvac_availability", debounce_seconds=0, force=True)
                     return
-            if manual_recovery or (startup and is_hvac and _is_explicit_startup_hvac_change(event)):
+            if explicit_manual_intent or (startup and is_hvac and _is_explicit_startup_hvac_change(event)):
                 # Explicit control evidence takes priority even during startup
                 # or recovery, before expected/pending-command matching.
                 feedback_commands.clear()
@@ -2817,7 +2835,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             context.hvac_cycle = dict(cycle)
         context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
         if context.hvac_control and climate_issues and not dry_during_provisional_off_start:
-            context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
+            control = context.hvac_control
+            required_issues = climate_issues
+            if (
+                "climate_zone_unavailable" in climate_issues
+                and control.get("phase") == "away_off" and control.get("main_state_committed") is True
+                and not (control.get("zone_states") or control.get("attempt_snapshot"))
+            ):
+                # A completed head-only stop never acquired these zones. Use
+                # the same capability rules as the original shutdown action.
+                required_issues = CapabilityDiscovery(
+                    self.hass, entry_data, options, hvac_desired_state={"hvac_mode": "off"},
+                ).inspect().hvac.issues
+            if required_issues:
+                control["required_evidence_lost"] = ",".join(required_issues)
         stored_thermal = dict(self.store.data.get("thermal_model", {}))
         thermal_model = update_zone_thermal_model(stored_thermal, thermal_sample(
             context, options, self.hass.states, entry_data.get(CONF_DAIKIN_CLIMATE, ""),
@@ -5245,24 +5276,26 @@ def _has_concrete_hvac_attribute_change(old: Any, new: Any) -> bool:
     return False
 
 
-def _is_explicit_hvac_recovery_change(event: Any, baseline: Any, outage_context_id: str | None) -> bool:
+def _is_explicit_hvac_recovery_change(event: Any, baseline: State | None, excluded_ids: set[str]) -> bool:
     """Protect fresh user controls without inferring intent from a telemetry gap."""
     old, new = event.data.get("old_state"), event.data.get("new_state")
-    if (
-        baseline is None or new is None or new.state in STATE_UNKNOWN_VALUES
-        or (old is not None and old.state not in STATE_UNKNOWN_VALUES)
-    ):
+    if baseline is None or not hvac_feedback_is_observed(new) or hvac_feedback_is_observed(old):
         return False
-    previous_context_ids = {
-        outage_context_id, getattr(getattr(baseline, "context", None), "id", None),
-    }
-    if not any(
-        getattr(context, "user_id", None) and getattr(context, "id", None)
-        and getattr(context, "id", None) not in previous_context_ids
-        for context in (getattr(event, "context", None), getattr(new, "context", None))
-    ):
+    if not _fresh_hvac_user_context_ids(event, excluded_ids):
         return False
     return baseline.state != new.state or _has_concrete_hvac_attribute_change(baseline, new)
+
+
+def _fresh_hvac_user_context_ids(event: Any, excluded_ids: set[str]) -> set[str]:
+    """Attribute an intent only to a new user context, never inherited feedback."""
+    return {
+        context_id
+        for context in (
+            getattr(event, "context", None), getattr(event.data.get("new_state"), "context", None),
+        )
+        if (context_id := getattr(context, "id", None)) and context_id not in excluded_ids
+        and getattr(context, "user_id", None)
+    }
 
 
 def _is_hvac_availability_feedback(event: Any, *, inherited_context_ids: set[str] | None = None) -> bool:
@@ -5274,6 +5307,8 @@ def _is_hvac_availability_feedback(event: Any, *, inherited_context_ids: set[str
     """
     old, new = event.data.get("old_state"), event.data.get("new_state")
     if old is None or new is None:
+        return True
+    if hvac_feedback_is_assumed(new) or hvac_feedback_is_assumed(old):
         return True
     if old.state not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES:
         return False
@@ -5457,7 +5492,8 @@ def _matches_confirmed_zone_feedback(
     parents = {None, command["context_id"], *(activation["context_id"] for activation in activations)}
     # Reject queued events superseded by a newer state, or a changed head setting.
     if (
-        current is None or current.state != new.state or head is None or target is None
+        current is None or hvac_feedback_is_assumed(current) or current.state != new.state
+        or not hvac_feedback_is_observed(head) or target is None
         or any(current.attributes.get(key) != new.attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS)
         or mode not in _ACTIVE_HVAC_MODES or head.state != mode
         or not _matching_hvac_target(head.attributes.get("temperature"), target)
@@ -5542,10 +5578,10 @@ def _matches_disabled_zone_mode_recall(
     ):
         return False
     head, current = hass.states.get(command["entity_id"]), hass.states.get(entity)
-    center = finite(head.attributes.get("temperature")) if head is not None else None
+    center = finite(head.attributes.get("temperature")) if hvac_feedback_is_observed(head) else None
     if (
-        head is None or head.state != mode or center is None or not center - 2 <= target <= center + 2
-        or current is None or current.state != new.state
+        head is None or center is None or head.state != mode or not center - 2 <= target <= center + 2
+        or not hvac_feedback_is_observed(current) or current.state != new.state
         or any(current.attributes.get(key) != new.attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS)
         or (command.get("confirmed_at") is not None and not _matching_hvac_target(
             center, command.get("confirmed_observed", {}).get("target_temperature"),
@@ -5592,6 +5628,8 @@ def _matches_climate_transaction(
         activation = command.get("off_start_head_activation") or {}
         from .zone_control import topology
         head = hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE))) if hass is not None else None
+        if not hvac_feedback_is_observed(head):
+            head = None
         activation_valid = (
             activation.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
             and command.get("entity_id") in topology(entry_data).get("pairs", {})
@@ -5629,9 +5667,7 @@ def _matches_climate_transaction(
                 and all(new_attributes.get(key) is None for key in changed)
                 and all(getattr(context, "parent_id", None) in {None, command["context_id"]}
                         for context in contexts)
-                and hass is not None
-                and (head := hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE)))) is not None
-                and head.state == "dry"):
+                and head is not None and head.state == "dry"):
             return True
         if coupled and not same and _matches_disabled_zone_mode_recall(
             entry_data, command, commands[commands.index(command) + 1:], event, now, hass, changed,
@@ -5695,7 +5731,6 @@ def _matches_climate_transaction(
             bounds = command.get("target_bounds", {})
             lower, upper = finite(bounds.get("min_temp")), finite(bounds.get("max_temp"))
             if coupled and hass is not None:
-                head = hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE)))
                 center = finite(head.attributes.get("temperature")) if head is not None else None
                 if head is not None and head.state == new.state and center is not None:
                     lower, upper = center - 2, center + 2

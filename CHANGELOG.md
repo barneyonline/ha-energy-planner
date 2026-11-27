@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Require observed HVAC feedback for automatic control and restoration. Devices that report assumed state, including Daikin Infrared, can no longer confirm a mode or setpoint change for Energy Planner.
 
 ### 🔧 Improvements
 

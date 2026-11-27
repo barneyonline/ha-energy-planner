@@ -15,7 +15,7 @@ from .adapter_helpers import (
     has_finite_temperature_target,
     zone_temperature_sync_deferred,
 )
-from .climate_inputs import climate_storage_value
+from .climate_inputs import climate_storage_value, hvac_feedback_is_assumed, hvac_feedback_is_observed
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
@@ -113,6 +113,10 @@ class CapabilityDiscovery:
         self._synchronize_zone_targets = synchronized_zone_targets_required(
             hass, entry_data, self.options, hvac_desired_state,
         )
+        desired = hvac_desired_state or {}
+        self._head_only_shutdown = desired.get("hvac_mode") == "off" and not (
+            desired.get("enable_zones") or desired.get("zone_power") or desired.get("zone_intent")
+        )
 
     def inspect(
         self, *, hvac: CapabilityEvidence | None = None, export_ownership: dict[str, Any] | None = None,
@@ -203,16 +207,22 @@ class CapabilityDiscovery:
     def _inspect_hvac(self) -> CapabilityEvidence:
         issues: list[str] = []
         climate = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        climate_state = None
         if not climate:
             issues.append("daikin_climate_not_configured")
-        elif _state_missing(self.hass, climate):
+        elif _state_missing(self.hass, climate, require_observed=True):
             issues.append("daikin_climate_unavailable")
+        else:
+            climate_state = self.hass.states.get(climate)
         automations = _split_entity_values(self.entry_data.get(CONF_CLIMATE_AUTOMATIONS, ""))
         unavailable = [entity_id for entity_id in automations if _state_missing(self.hass, entity_id)]
         if unavailable:
             issues.append("climate_automation_unavailable")
         zones = _split_entity_values(self.entry_data.get(CONF_CLIMATE_ZONES, ""))
-        unavailable_zones = [entity_id for entity_id in zones if _state_missing(self.hass, entity_id)]
+        unavailable_zones = [
+            entity_id for entity_id in zones
+            if _state_missing(self.hass, entity_id, require_observed=not self._head_only_shutdown)
+        ]
         if unavailable_zones:
             issues.append("climate_zone_unavailable")
         synchronize_targets = self._synchronize_zone_targets
@@ -220,15 +230,16 @@ class CapabilityDiscovery:
         zone_targets_unavailable: list[str] = []
         zone_targets_deferred: list[str] = []
         zone_targets_absent_in_dry_mode: list[str] = []
-        climate_state = self.hass.states.get(climate) if climate and not _state_missing(self.hass, climate) else None
         if climate_state is not None and not _has_main_temperature_target(climate_state, synchronize_targets):
             main_target_unavailable.append(str(climate))
             issues.append("main_climate_target_unavailable")
         if synchronize_targets:
             for entity_id in zones:
-                if not entity_id.startswith("climate.") or _state_missing(self.hass, entity_id):
+                if not entity_id.startswith("climate.") or entity_id in unavailable_zones:
                     continue
                 zone_state = self.hass.states.get(entity_id)
+                if self._head_only_shutdown and hvac_feedback_is_assumed(zone_state):
+                    continue
                 if zone_temperature_sync_deferred(zone_state):
                     zone_targets_deferred.append(entity_id)
                 elif (
@@ -392,12 +403,14 @@ def _profile_control_service(profile_entity: str | None) -> str | None:
     return None
 
 
-def _state_missing(hass: HomeAssistant, entity_id: str) -> bool:
+def _state_missing(hass: HomeAssistant, entity_id: str, *, require_observed: bool = False) -> bool:
     states = getattr(hass, "states", None)
     get_state = getattr(states, "get", None)
     if not callable(get_state):
         return True
     state = get_state(entity_id)
+    if require_observed:
+        return not hvac_feedback_is_observed(state)
     if state is None:
         return True
     domain = entity_id.split(".", 1)[0]

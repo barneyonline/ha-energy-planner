@@ -651,6 +651,14 @@ def test_calendar_handles_legacy_non_mapping_climate_ownership():
     assert calendar_module._actual_start(coordinator, action, now) is None
 
 
+def test_calendar_requires_observed_hvac_feedback_for_actual_start():
+    now = datetime.now(UTC)
+    coordinator, action, state, start = _running_coordinator(now, climate=True)
+    assert calendar_module._actual_start(coordinator, action, now) == start
+    state.attributes = {"assumed_state": True}
+    assert calendar_module._actual_start(coordinator, action, now) is None
+
+
 def test_committed_off_coasting_phase_keeps_actual_start():
     now = datetime.now(UTC)
     coordinator, action, state, start = _running_coordinator(now, climate=True)

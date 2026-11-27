@@ -20,13 +20,18 @@ from homeassistant.util import dt as dt_util
 from .adapter_helpers import (
     DeviceTargetUnavailable,
     async_call_device_service,
-    available_state,
     climate_target_snapshot,
     has_finite_temperature_target,
     preserve_cancellation,
     zone_temperature_sync_deferred,
 )
-from .climate_inputs import climate_storage_value, finite, temperature_targets_match
+from .climate_inputs import (
+    climate_storage_value,
+    finite,
+    hvac_feedback_is_assumed,
+    hvac_feedback_is_observed,
+    temperature_targets_match,
+)
 from .const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -38,7 +43,7 @@ from .const import (
 )
 from .daikin_memory import MEMORY_KEY, OFF_START_OPTION, memory_matches, read_activation, read_memory, source_matches
 from .discovery import CapabilityDiscovery, synchronized_zone_targets_required
-from .hvac_cycle import mode_feedback_matches, mode_intent
+from .hvac_cycle import mode_feedback_at, mode_feedback_matches, mode_intent
 from .models import ActionKind, PlanAction
 
 _STATE_CONFIRMATION_TIMEOUT_SECONDS = 30.0
@@ -122,6 +127,12 @@ class HVACCommandResult:
     capability_refused: bool = False
 
 
+@dataclass(slots=True)
+class _OffStartRestoreProgress:
+    dispatched: bool = False
+    assumed_feedback: bool = False
+
+
 class DaikinHVACAdapter:
     """Control Daikin through Home Assistant climate services."""
 
@@ -161,7 +172,7 @@ class DaikinHVACAdapter:
         self._restoring_owned_zone_entities: set[str] = set()
         self._off_start_activation: dict[str, Any] | None = None
         self._off_start_recall_dispatched = False
-        self._restoring_off_start = False
+        self._restoring_off_start: _OffStartRestoreProgress | None = None
         self._off_start_memory: dict[str, Any] | None = None
         self._zone_options: dict[str, Any] = {}
         self._zone_baseline: dict[str, Any] = {}
@@ -291,6 +302,16 @@ class DaikinHVACAdapter:
                     or isinstance(main, dict) and main.get(MEMORY_KEY)
                     or self._zone_baseline.get("off_start_control_data"))
 
+    def _zone_power_restore_can_open(self) -> bool:
+        """Only an authorized Off-start restore may wake an inactive head."""
+        if not self._mode_memory_control():
+            return True
+        if self._restoring_off_start is not None and not (
+            self._manual_override_requested is not None and self._manual_override_requested()
+        ):
+            return True
+        return self._state_value(self.entry_data.get(CONF_DAIKIN_CLIMATE)) in _ACTIVE_HVAC_MODES
+
     def _assert_memory_identity(self) -> None:
         main = self._zone_baseline.get("main_state")
         expected = (self._restoring_memory, self._off_start_memory,
@@ -410,7 +431,8 @@ class DaikinHVACAdapter:
     def _check_pending_takeover_capability(self, respect_manual_override: bool = True) -> None:
         """Protect the head and zones until the first takeover actuator write."""
         if self._awaiting_hvac_actuator and respect_manual_override and not self._restoring_main_state:
-            if issues := self.observe_takeover_capability():
+            issues = list(dict.fromkeys((*self.observe_takeover_capability(), *self._assumed_takeover_issues())))
+            if issues:
                 raise _HVACTakeoverBlocked(issues)
 
     def _allow_off_start_recall(self, head: State | None) -> bool:
@@ -424,8 +446,26 @@ class DaikinHVACAdapter:
         self._off_start_recall_dispatched = recalled_dry
         return recalled_dry
 
+    def _assumed_takeover_issues(self, service: str | None = None) -> list[str]:
+        """Require observed feedback from the head and zones used for demand."""
+        if service == SERVICE_TURN_OFF or self._zone_desired.get("hvac_mode") == "off":
+            return []
+        issues = []
+        head = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        if head and hvac_feedback_is_assumed(self.hass.states.get(head)):
+            issues.append("daikin_climate_unavailable")
+        synchronize_zones = self._synchronized_takeover()
+        enable_zones = self._zone_desired.get("enable_zones")
+        if any(
+            hvac_feedback_is_assumed(self.hass.states.get(entity_id))
+            for entity_id in self._zone_entities()
+            if synchronize_zones or (enable_zones and not entity_id.startswith("climate."))
+        ):
+            issues.append("climate_zone_unavailable")
+        return issues
+
     def _observe_followup_takeover(self, service: str | None = None) -> tuple[str, ...]:
-        """Read current Dry capability and retain observations for the takeover outcome."""
+        """Recheck feedback while settling takeover and preserve the observed issues."""
         if self._awaiting_hvac_actuator:
             return ()
         allow_recalled_dry = False
@@ -437,6 +477,7 @@ class DaikinHVACAdapter:
             tuple(self.observe_takeover_capability(allow_recalled_dry=True)) if allow_recalled_dry
             else self._live_dry_issues()
         )
+        issues = tuple(dict.fromkeys((*issues, *self._assumed_takeover_issues(service))))
         if issues:
             self._late_takeover_issues = tuple(dict.fromkeys((*self._late_takeover_issues, *issues)))
         return issues
@@ -467,7 +508,8 @@ class DaikinHVACAdapter:
     async def _async_command(
         self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any],
         *, emergency_off: bool = False, respect_manual_override: bool = True,
-        scheduler_guard: bool = False, takeover_write: bool = False, **kwargs: Any
+        scheduler_guard: bool = False, takeover_write: bool = False,
+        restoring_zone_power: bool = False, **kwargs: Any
     ) -> State | None:
         """Issue a contextual command and return the state captured before command preparation."""
         entity_id = str(data.get(ATTR_ENTITY_ID))
@@ -658,6 +700,19 @@ class DaikinHVACAdapter:
                 raise
 
         def on_dispatch() -> None:
+            head = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+            needs_head = entity_id != head and (
+                domain == "climate" or entity_id in pairs or takeover_write or restoring_zone_power
+            )
+            if hvac_feedback_is_assumed(hass.states.get(entity_id)) or (
+                needs_head and head and hvac_feedback_is_assumed(hass.states.get(head))
+            ):
+                if self._restoring_off_start is not None and tracks_confirmation:
+                    self._restoring_off_start.assumed_feedback = True
+                raise DeviceTargetUnavailable("hvac_feedback_assumed")
+            if (restoring_zone_power and service == SERVICE_TURN_ON
+                    and not self._zone_power_restore_can_open()):
+                raise DeviceTargetUnavailable("hvac_zone_restore_head_inactive")
             if first_actuator:
                 # Only an actuator write that reaches Home Assistant can
                 # recall remembered Dry during an Off start.
@@ -678,6 +733,8 @@ class DaikinHVACAdapter:
             if self._command_callback is not None:
                 self._command_callback({**record, "stage": "issued"})
             record["dispatched"] = True
+            if self._restoring_off_start is not None and tracks_confirmation:
+                self._restoring_off_start.dispatched = True
 
         try:
             await async_call_device_service(hass, domain, service, data, on_dispatch=on_dispatch, **kwargs)
@@ -704,6 +761,10 @@ class DaikinHVACAdapter:
                     rejection.unsent_command = record
                     rejection.prior_confirmation = prior_confirmation
                 raise rejection from error
+            if local_refusal and tracks_confirmation:
+                self._state(entity_id)  # Capture assumed feedback even when target preflight stopped dispatch.
+                self._unconfirmed_main_mode = unconfirmed_before
+                await self._async_retire_unsent_command(record, prior_confirmation)
             raise
         return observed
 
@@ -756,7 +817,7 @@ class DaikinHVACAdapter:
             **record,
             "stage": "confirmed" if confirmed else "readback_failed",
             "observed": values,
-            "feedback_changed_at": getattr(observed, "last_changed", None),
+            "feedback_changed_at": mode_feedback_at(observed),
             "failure_category": None if confirmed else "ConfirmationTimeout",
         }
         if self._async_cycle_callback is not None and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE):
@@ -1517,9 +1578,10 @@ class DaikinHVACAdapter:
             if (saved_main_state or {}).get("hvac_mode") == "off" and not (
                 self._manual_override_requested is not None and self._manual_override_requested()
             ):
-                await self._async_apply_hvac_state(
-                    main, {"hvac_mode": "off"}, respect_zone_manual_override=False, emergency_off=True,
-                )
+                with preserve_cancellation(error):
+                    await self._async_apply_hvac_state(
+                        main, {"hvac_mode": "off"}, respect_zone_manual_override=False, emergency_off=True,
+                    )
             raise
 
     async def _async_restore(
@@ -1940,13 +2002,10 @@ class DaikinHVACAdapter:
         """Restore captured zone states."""
         unresolved: dict[str, Any] = {}
         for entity_id, state in states.items():
-            if (self._mode_memory_control() and state == "on"
-                    and (not self._restoring_off_start or self._manual_override_requested is not None
-                         and self._manual_override_requested())
-                    and not entity_id.startswith("climate.")
-                    and self._state_value(str(self.entry_data.get(CONF_DAIKIN_CLIMATE))) == "off"):
-                # A manually superseded head stays Off; opening a Daikin zone
-                # can otherwise recall its previous active mode.
+            if (state == "on" and not entity_id.startswith("climate.")
+                    and not self._zone_power_restore_can_open()):
+                # Opening a Daikin zone can wake a manually superseded head.
+                # Without observed active mode, retain the On baseline.
                 if self._state_value(entity_id) != "on":
                     unresolved[entity_id] = state
                 continue
@@ -2007,6 +2066,7 @@ class DaikinHVACAdapter:
                             service_data,
                             blocking=True,
                             respect_manual_override=False,
+                            restoring_zone_power=True,
                         )
                     else:
                         await self._async_command(
@@ -2016,6 +2076,7 @@ class DaikinHVACAdapter:
                             service_data,
                             blocking=True,
                             respect_manual_override=False,
+                            restoring_zone_power=True,
                             context=service_context,
                         )
                     confirmed = await self._async_confirm_state(
@@ -2165,12 +2226,15 @@ class DaikinHVACAdapter:
                 # captured identity enforced across guard and Store awaits.
                 self._restoring_memory = memory
                 try:
-                    await self._async_restore_main_state_preserving_manual(
+                    stopped = await self._async_restore_main_state_preserving_manual(
                         main_entity, {"hvac_mode": "off"}, emergency_off=True,
                     )
                 finally:
                     self._restoring_memory = None
-            else:
+                if not stopped and self._state_value(main_entity) is None:
+                    main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+                    return False, False, dict(zones)
+            if self._state_value(main_entity) == "off" and not self._unconfirmed_main_mode:
                 observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
                 if observed is None:
                     main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
@@ -2181,14 +2245,18 @@ class DaikinHVACAdapter:
             return False, False, dict(zones)
         main_state["off_start_restore_attempted"] = True
         main_state["zone_recovery_blocker"] = "off_start_restore_incomplete"
-        if self._async_persist_main_state is not None:
-            await self._async_persist_main_state(deepcopy(main_state))
         pending = dict(zones)
         self._restoring_memory = memory
         self._restoring_owned_zone_entities = set(zones)
-        self._restoring_off_start = True
+        progress = _OffStartRestoreProgress()
+        self._restoring_off_start = progress
+        marker_saved = False
+        interruption: BaseException | None = None
         main_ok = False
         try:
+            if self._async_persist_main_state is not None:
+                await self._async_persist_main_state(deepcopy(main_state))
+            marker_saved = True
             mode = memory["acquired_mode"]
             normal = memory["modes"][mode]
             current_power = {actuator: self._state_value(actuator) for actuator in memory["pairs"]}
@@ -2252,26 +2320,49 @@ class DaikinHVACAdapter:
                 pending = {entity: value for entity, value in pending.items() if entity.startswith("climate.")}
                 pending.update(unfinished_on)
                 pending.update(unfinished_power)
+        except BaseException as error:
+            interruption = error
+            raise
         finally:
             # Even cancellation and malformed persisted evidence retain Off as
             # the known safe power baseline. Manual main supersession still wins.
-            if self._set_pending_main_restore is not None:
-                self._set_pending_main_restore(main_state)
             try:
-                await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+                with preserve_cancellation(interruption):
+                    if self._set_pending_main_restore is not None:
+                        self._set_pending_main_restore(main_state)
+                    await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+            except BaseException as error:
+                interruption = error
+                raise
             finally:
-                self._restoring_off_start = False
-                self._restoring_memory = None
-                self._restoring_owned_zone_entities.clear()
-                self._off_start_activation = None
+                with preserve_cancellation(interruption):
+                    self._restoring_off_start = None
+                    self._restoring_memory = None
+                    self._restoring_owned_zone_entities.clear()
+                    self._off_start_activation = None
+                    # A marker save that never returned could have committed.
+                    # Restoration itself could not dispatch before that save.
+                    if not progress.dispatched and (
+                        progress.assumed_feedback or not marker_saved or isinstance(interruption, CancelledError)
+                    ):
+                        main_state.pop("off_start_restore_attempted", None)
+                        main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+                        if self._async_persist_main_state is not None:
+                            await self._async_persist_main_state({
+                                **deepcopy(main_state), "off_start_restore_attempted": False,
+                            })
         if main_ok and not pending:
             # Verify all modes after the mandatory shutdown cleanup, rather
             # than claiming success from visible HA targets alone.
             observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
+            if observed is None:
+                main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+                return False, False, dict(zones)
             if not memory_matches(observed, memory, zones):
                 main_ok, pending = False, dict(zones)
         if pending or not main_ok:
-            main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
+            if main_state.get("off_start_restore_attempted"):
+                main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
             # Partial acknowledgements preceded a mode change or a failed
             # shutdown. Keep the full owned set for the next native readback.
             return main_ok, False, dict(zones)
@@ -2283,6 +2374,8 @@ class DaikinHVACAdapter:
         """Restore dependent targets before removing the mode that exposes them."""
         if main_state.get(MEMORY_KEY):
             return await self._async_restore_off_start(main_entity, main_state, zones)
+        if main_state and hvac_feedback_is_assumed(self.hass.states.get(main_entity)):
+            return False, False, dict(zones)
         from .zone_control import topology
         config = topology(self.entry_data)
         independent = bool(config.get("supported") and zones
@@ -3158,7 +3251,14 @@ class DaikinHVACAdapter:
         return snapshot
 
     def _state(self, entity_id: str | None) -> State | None:
-        return available_state(self.hass, entity_id)
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if (self._restoring_off_start is not None
+                and (entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE)
+                     or entity_id in self._restoring_owned_zone_entities
+                     or entity_id in (self._restoring_memory or {}).get("pairs", {}))
+                and hvac_feedback_is_assumed(state)):
+            self._restoring_off_start.assumed_feedback = True
+        return state if hvac_feedback_is_observed(state) else None
 
     def _state_value(self, entity_id: str | None) -> str | None:
         state = self._state(entity_id)

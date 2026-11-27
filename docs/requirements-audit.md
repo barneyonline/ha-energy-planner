@@ -2099,6 +2099,21 @@ or live deployment was performed; live cycle acceptance remains outstanding.
   recovery reject feedback queued across expiry after a valid guard wait. Regression:
   `tests/test_hvac_adapter.py::test_review_recovery_guard_setup_cannot_confirm_past_original_deadline`.
 
+- Assumed HVAC state cannot establish capability, dispatch authority,
+  a confirmed command or mode cycle, an isolated coast, a calendar start,
+  or an operating interval for thermal learning.
+  Head-only away shutdown and continued ownership depend on observed head
+  feedback. An unowned assumed zone remains visible in input diagnostics.
+  A telemetry gap preserves earlier observations and original restoration
+  settings. A concrete change with fresh user attribution still establishes
+  manual intent. A refused command retires its unsent intent. If assumed
+  feedback prevents every actuator write, AirBase recovery retains its
+  restoration attempt and the exact owned baseline. Regressions cover
+  discovery, the HVAC adapter and coordinator, the calendar, mode cycles,
+  independent zone control, AirBase recovery, and thermal learning.
+  [Control behavior](planning-and-control.md#availability-and-manual-overrides) ·
+  [Home Assistant 2026.12 review](ha-2026.12-compatibility.md)
+
 ## Zone feedback and adaptive thermal preparation
 
 - Zone temperature selectors preserve advanced mappings; `zone_temperature.py` applies mapped comfort and target checks in both policies.

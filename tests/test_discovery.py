@@ -81,6 +81,26 @@ class FakeHass:
         self.services = FakeServices(services)
 
 
+@pytest.mark.parametrize(
+    ("assumed_entity", "reason"),
+    [
+        ("climate.daikin", "daikin_climate_unavailable"),
+        ("climate.zone", "climate_zone_unavailable"),
+        ("switch.zone", "climate_zone_unavailable"),
+    ],
+)
+def test_discovery_requires_observed_hvac_feedback(assumed_entity, reason) -> None:
+    states = {"climate.daikin": "heat", "climate.zone": "heat", "switch.zone": "on"}
+    states[assumed_entity] = FakeState(states[assumed_entity], {"temperature": 21, "assumed_state": True})
+    report = CapabilityDiscovery(
+        FakeHass(states, set()),
+        {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"]},
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    ).inspect().hvac
+    assert not report.supported
+    assert report.issues == [reason]
+
+
 def test_discovery_reports_supported_controls() -> None:
     hass = FakeHass(
         {

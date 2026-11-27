@@ -39,6 +39,11 @@ def mode_feedback_matches(record: dict[str, Any], mode: str | None) -> bool:
     return service == "set_hvac_mode" and mode == record.get("requested", {}).get("hvac_mode")
 
 
+def mode_feedback_at(state: Any) -> datetime | None:
+    """Date the observed snapshot even when an optimistic mode was unchanged."""
+    return instant(getattr(state, "last_updated", None)) or instant(getattr(state, "last_changed", None))
+
+
 def cycle_active(cycle: dict[str, Any], now: datetime, minutes: int,
                  desired_mode: str | None, current_mode: str | None) -> bool:
     """Block automatic starts/direction changes; safe stops remain immediate."""

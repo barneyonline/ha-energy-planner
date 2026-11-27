@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
 from .adapter_helpers import available_state, preserve_cancellation
 from .adapter_helpers import profile_control_service as _profile_control_service_for_target
+from .climate_inputs import hvac_feedback_is_observed
 from .climate_runtime import command_rejection
 from .command_models import ControlAction, ManualControlAction
 from .const import (
@@ -87,7 +88,7 @@ from .hvac_control import (
     discard_superseded_confirmation,
     pending_hvac_confirmation,
 )
-from .hvac_cycle import cycle_active, reconcile_cycle, record_cycle
+from .hvac_cycle import cycle_active, mode_feedback_at, reconcile_cycle, record_cycle
 from .models import (
     ActionAsset,
     ActionKind,
@@ -3658,6 +3659,20 @@ class Executor:
         """Persist evolving main rollback evidence before a thermostat command."""
         ownership = deepcopy(dict(self.store.data.get("ownership", {})))
         hvac_control = dict(ownership.get("hvac_control", {}))
+        if main_state.get("off_start_restore_attempted") is False:
+            # The adapter proved the attempt never dispatched an actuator.
+            # Retire only the marker for the exact, still-owned recovery.
+            for control in (hvac_control, hvac_control.get("attempt_snapshot", {})):
+                saved = control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY)
+                if (isinstance(saved, dict) and saved.get("off_start_restore_attempted")
+                        and saved.get("off_start_memory") == main_state["off_start_memory"]):
+                    saved.pop("off_start_restore_attempted")
+                    saved["zone_recovery_blocker"] = main_state["zone_recovery_blocker"]
+                    ownership["hvac_control"] = hvac_control
+                    await self.store.async_save_ownership(ownership)
+                    await self._async_flush_provisional_state()
+                    return
+            return
         # Enrich remembered-mode evidence without replacing the original cycle
         # target with a later phase snapshot, including if we stop mid-command.
         baseline = dict(main_state)
@@ -3737,9 +3752,9 @@ class Executor:
         if cycle.get("entity_id") != entity or self.hass is None or not entity:
             return
         state = self.hass.states.get(entity)
-        if state is None:
+        if not hvac_feedback_is_observed(state):
             return
-        updated = reconcile_cycle(cycle, dt_util.utcnow(), state.state, getattr(state, "last_changed", None),
+        updated = reconcile_cycle(cycle, dt_util.utcnow(), state.state, mode_feedback_at(state),
                                   getattr(state, "last_reported", getattr(state, "last_updated", None)))
         if updated != cycle:
             await self.store.async_save_hvac_cycle(updated)
@@ -3752,7 +3767,7 @@ class Executor:
             return False
         state = self.hass.states.get(entity) if self.hass is not None and entity else None
         return cycle_active(cycle, now, int(self.options.get("hvac_min_cycle_minutes", 20)),
-                            desired_mode, state.state if state is not None else None)
+                            desired_mode, state.state if hvac_feedback_is_observed(state) else None)
 
     def _configure_pending_hvac_adapter(
         self, adapter: DaikinHVACAdapter, pending: dict[str, Any],

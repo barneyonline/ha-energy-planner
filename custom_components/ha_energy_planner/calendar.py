@@ -14,6 +14,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .calendar_history import update_calendar_history
+from .climate_inputs import hvac_feedback_is_assumed
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DAIKIN_CLIMATE,
@@ -310,6 +311,7 @@ def _actual_start(
         state = _read_calendar_state(states, mapping.get(CONF_DAIKIN_CLIMATE), state_overrides)
         if (not control.get("main_state_committed") or control.get("required_evidence_lost")
                 or state is None or state.state not in {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"}
+                or hvac_feedback_is_assumed(state)
                 or (state.state == "off" and action.desired_state.get("hvac_mode") != "off")
                 or (action.desired_state.get("hvac_mode") is not None
                     and state.state != action.desired_state["hvac_mode"])
