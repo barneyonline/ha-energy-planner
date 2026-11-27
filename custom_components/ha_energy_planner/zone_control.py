@@ -10,7 +10,7 @@ from copy import deepcopy
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from .climate_inputs import finite, instant
+from .climate_inputs import finite, hvac_feedback_is_observed, instant
 from .models import DecisionContext, InputHealth, OccupancyState
 
 if TYPE_CHECKING:
@@ -299,7 +299,7 @@ def _live_context(hass: Any, data: dict[str, Any], options: dict[str, Any],
     return DecisionContext(
         now, "zone-readback", [], None, None, OccupancyState.UNKNOWN, InputHealth.HEALTHY,
         climate_inputs=inputs, hvac_control=previous,
-        current_hvac_mode=head.state if head is not None else None,
+        current_hvac_mode=head.state if hvac_feedback_is_observed(head) else None,
         occupied_temperature_low_c=helper("climate_target_low_entity"),
         occupied_temperature_high_c=helper("climate_target_high_entity"),
     )

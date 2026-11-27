@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.util import dt as dt_util
 
-from .climate_inputs import read_climate_inputs
+from .climate_inputs import hvac_feedback_is_observed, read_climate_inputs
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -1241,7 +1241,7 @@ class InputManager:
         if not entity_id:
             return None, None, None
         state = self._state(entity_id)
-        if not self._valid_state(state):
+        if not hvac_feedback_is_observed(state):
             return None, None, f"{config_key}_unavailable"
         attributes = getattr(state, "attributes", {}) or {}
         temperature = _finite_float_or_none(_attribute_value(attributes, "current_temperature"))

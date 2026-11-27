@@ -10,7 +10,7 @@ from math import ceil, floor
 from statistics import median
 from typing import Any
 
-from .climate_inputs import finite, instant
+from .climate_inputs import finite, hvac_feedback_is_assumed, instant
 from .const import (
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES,
@@ -59,31 +59,39 @@ def sample(context: DecisionContext, options: dict[str, Any], states: Any, head:
     sources = temperatures(context)
     if not sources:
         sources = {"head": {"temperature_entity": head, "temperature": context.current_hvac_temperature_c}}
+    topology = context.climate_inputs.get("zone_topology", {})
+    pairs = topology.get("pairs", {})
+    controls = {
+        entity: states.get(entity) for entity in dict.fromkeys((
+            head, *context.climate_zone_entities, *pairs, *pairs.values(),
+            *(zone for zone in sources if zone != "head"),
+        ))
+    }
+    assumed_feedback = any(hvac_feedback_is_assumed(state) for state in controls.values())
+    regime = None
+    control_readback = None
+    if topology.get("supported") and not assumed_feedback:
+        control_keys = [head, *sorted(pairs), *sorted(
+            climate for actuator, climate in pairs.items() if getattr(controls[actuator], "state", None) == "on"
+        )]
+        observed = [(key, getattr(controls[key], "state", None),
+                     finite(getattr(controls[key], "attributes", {}).get("temperature"))) for key in control_keys]
+        regime = sha256(str(observed).encode()).hexdigest()[:24]
+        control_readback = [list(row) for row in observed]
+    transition = instant(context.hvac_control.get("zone_transition_at"))
     readings = {}
     for zone, room in sources.items():
         entity = room.get("temperature_entity")
         state = states.get(entity)
         reported = getattr(state, "last_reported", getattr(state, "last_updated", None))
-        topology = context.climate_inputs.get("zone_topology", {})
-        transition = instant(context.hvac_control.get("zone_transition_at"))
         # Static source identity must survive normal damper cycling and reload.
         # Old transient identities cannot be safely migrated to a stable regime.
         identity = _source_identity(context, entity, head)
-        regime = None
-        conditions = None
-        if topology.get("supported"):
-            controls = [head, *sorted(topology["pairs"]), *sorted(
-                climate for actuator, climate in topology["pairs"].items()
-                if getattr(states.get(actuator), "state", None) == "on")]
-            observed = [(key, getattr(states.get(key), "state", None),
-                         finite(getattr(states.get(key), "attributes", {}).get("temperature")))
-                        for key in controls]
-            regime = sha256(str(observed).encode()).hexdigest()[:24]
-            conditions = {"version": 1, "identity": identity, "controls": [list(row) for row in observed]}
-        actuator = states.get(zone) if zone != "head" else states.get(head)
+        conditions = {"version": 1, "identity": identity, "controls": control_readback} if control_readback else None
+        actuator = controls[head if zone == "head" else zone]
         actuator_state = getattr(actuator, "state", "unknown")
         zone_mode = context.current_hvac_mode
-        if actuator_state in {"unknown", "unavailable"}:
+        if assumed_feedback or actuator_state in {"unknown", "unavailable"}:
             zone_mode = None
         elif actuator_state == "off":
             zone_mode = "off"
@@ -103,8 +111,10 @@ def sample(context: DecisionContext, options: dict[str, Any], states: Any, head:
         "mode": context.current_hvac_mode,
         "power": context.current_hvac_power_kw,
         "power_source_type": context.climate_inputs.get("power_source_type"),
-        "zones": {entity: getattr(states.get(entity), "state", None) for entity in context.climate_zone_entities},
-        "intervention": any(override.kind == "manual_hvac" for override in context.active_overrides) or bool(
+        "zones": {entity: getattr(controls[entity], "state", None) for entity in context.climate_zone_entities},
+        "intervention": assumed_feedback or any(
+            override.kind == "manual_hvac" for override in context.active_overrides
+        ) or bool(
             context.hvac_control.get("command_confirmation") or context.hvac_control.get("pending_restore")
             or context.hvac_control.get("required_evidence_lost")
             or (context.hvac_control.get("phase") == "preconditioning"

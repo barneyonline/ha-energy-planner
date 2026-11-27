@@ -1565,7 +1565,7 @@ def test_review_coast_persists_confirmed_recovery_temperature(monkeypatch, mode,
     assert comfort_breached(c, mode, coasting=True)
 
 
-@pytest.mark.parametrize('failure', ['sensor', 'reopened', 'comfort', 'head_restarted'])
+@pytest.mark.parametrize('failure', ['sensor', 'reopened', 'comfort', 'head_restarted', 'assumed_head', 'assumed_zone'])
 def test_review_coast_rechecks_after_final_confirmation(monkeypatch, failure):
     c = isolated_boundary()
     hass = device(c)
@@ -1583,6 +1583,10 @@ def test_review_coast_rechecks_after_final_confirmation(monkeypatch, failure):
             hass.states.values[BED] = 'on'
         elif failure == 'comfort':
             hass.states.values['sensor.living'].state = '22'
+        elif failure == 'assumed_head':
+            hass.states.values['climate.head'] = FakeState('off', {'temperature': 19, 'assumed_state': True})
+        elif failure == 'assumed_zone':
+            hass.states.values[BED] = FakeState('off', {'assumed_state': True})
         else:
             hass.states.values['climate.head'] = FakeState('cool', {'temperature': 19})
         return result
@@ -1591,6 +1595,7 @@ def test_review_coast_rechecks_after_final_confirmation(monkeypatch, failure):
     adapter.set_zone_control_context(DEFAULT_OPTIONS, c.hvac_control)
     result = asyncio.run(adapter.async_execute(_action(desired)))
     assert not result.applied
+    assert result.confirmed_zone_intent is None
 
 
 def test_review_coast_confirmation_keeps_latest_physical_intent(monkeypatch):

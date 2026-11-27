@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .const import (
     CONF_AMBER_IMPORT_PRICE,
@@ -30,9 +30,23 @@ from .const import (
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_WEATHER,
+    STATE_UNKNOWN_VALUES,
 )
 from .forecasts import tariff_source_intervals
 from .planner_values import finite_float
+
+if TYPE_CHECKING:
+    from homeassistant.core import State
+
+
+def hvac_feedback_is_assumed(state: State | None) -> bool:
+    """Identify a provider's optimistic HVAC state."""
+    return bool((getattr(state, "attributes", None) or {}).get("assumed_state"))
+
+
+def hvac_feedback_is_observed(state: State | None) -> TypeGuard[State]:
+    """Require available, non-optimistic feedback for physical HVAC evidence."""
+    return state is not None and state.state not in STATE_UNKNOWN_VALUES and not hvac_feedback_is_assumed(state)
 
 
 def finite(value: Any) -> float | None:
@@ -245,7 +259,7 @@ def read_climate_inputs(
         return value
 
     main = state(data.get(CONF_DAIKIN_CLIMATE))
-    attrs = main.attributes if main else {}
+    attrs = main.attributes if hvac_feedback_is_observed(main) else {}
     arrival_state = state(data.get(CONF_HVAC_ARRIVAL))
     arrival = None
     if arrival_state is not None:
@@ -283,7 +297,7 @@ def read_climate_inputs(
                 "maximum_humidity": finite(mapping.get("maximum_humidity")),
                 **({"cooling_equipment_offset_c": finite(mapping["cooling_equipment_offset_c"])}
                    if "cooling_equipment_offset_c" in mapping else {}),
-                "enabled": bool(zone and zone.state not in {"off", "unknown", "unavailable"}),
+                "enabled": hvac_feedback_is_observed(zone) and zone.state != "off",
             }
     forecast: list[dict[str, Any]] = []
     forecast_state = state(data.get(CONF_HVAC_IRRADIANCE_FORECAST))
@@ -330,7 +344,7 @@ def read_climate_inputs(
         "zones": zones,
         "zone_topology": read_topology(hass, data),
         "zone_actuator_states": {
-            entity: current.state if (current := state(entity)) is not None else None
+            entity: current.state if hvac_feedback_is_observed(current := state(entity)) else None
             for entity in topology(data).get("pairs", {})
         },
         "sources": sources,

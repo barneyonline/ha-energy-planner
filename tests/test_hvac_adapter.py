@@ -360,6 +360,7 @@ def test_dry_feedback_after_head_write_blocks_the_pending_zone_target(
 
 @pytest.mark.parametrize("stage", [
     "service_failure", "missing_readback", "after_final_readback", "transient_readback", "pending_readback",
+    "assumed_zone_and_dry",
 ])
 def test_dry_during_final_confirmation_preserves_outcome_and_restores(
     monkeypatch: pytest.MonkeyPatch, stage: str,
@@ -379,8 +380,12 @@ def test_dry_during_final_confirmation_preserves_outcome_and_restores(
 
     def publish_dry() -> None:
         hass.states.values[head] = FakeState("dry", {"temperature": 20})
-        hass.states.values[first_zone] = FakeState("dry", {"zone_id": 0, "temperature": "malformed"})
-        hass.states.values[last_zone] = FakeState("dry", {"zone_id": 1})
+        if stage == "assumed_zone_and_dry":
+            hass.states.values[first_zone] = FakeState("dry", {"zone_id": 0})
+            hass.states.values[last_zone] = FakeState("dry", {"zone_id": 1, "assumed_state": True})
+        else:
+            hass.states.values[first_zone] = FakeState("dry", {"zone_id": 0, "temperature": "malformed"})
+            hass.states.values[last_zone] = FakeState("dry", {"zone_id": 1})
 
     dispatch = hass.services.async_call
     read_state = adapter._state
@@ -440,7 +445,8 @@ def test_dry_during_final_confirmation_preserves_outcome_and_restores(
     })))
 
     assert not result.applied
-    assert result.capability_issues == ("climate_zone_target_unavailable", HVAC_DRY_ZONE_TARGETS_ABSENT)
+    issue = "climate_zone_unavailable" if stage == "assumed_zone_and_dry" else "climate_zone_target_unavailable"
+    assert result.capability_issues == (issue, HVAC_DRY_ZONE_TARGETS_ABSENT)
     assert True in observations
     if stage in {"transient_readback", "pending_readback"}:
         assert False in observations[observations.index(True) + 1:]
@@ -453,6 +459,7 @@ def test_dry_during_final_confirmation_preserves_outcome_and_restores(
         "after_final_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
         "transient_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
         "pending_readback": f"climate_zone_target_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
+        "assumed_zone_and_dry": f"climate_zone_unavailable,{HVAC_DRY_ZONE_TARGETS_ABSENT}",
     }[stage]
     if stage == "pending_readback":
         assert command_sequence == ["acknowledge takeover", "restore", "restore", "restore"]
@@ -558,6 +565,142 @@ def test_dry_after_first_zone_switch_blocks_followup_actuators(
     assert result.rollback_succeeded is True
     assert hass.states.get(first).state == "off"
     assert hass.states.get(head).attributes["temperature"] == 21
+
+
+@pytest.mark.parametrize("scenario", ["demand", "shutdown", "already_assumed_before_shutdown"])
+def test_assumed_synchronized_zone_blocks_followup_demand_and_preserves_shutdown(monkeypatch, scenario):
+    head, zone, switch = "climate.daikin", "climate.zone", "switch.zone"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"temperature": 21, "zone_id": 0}),
+        switch: "off",
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [switch, zone]})
+    adapter.set_zone_control_context({CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}, {})
+    dispatch = hass.services.async_call
+    if scenario == "already_assumed_before_shutdown":
+        hass.states.values[zone].attributes = {"assumed_state": True, "zone_id": 0}
+
+    async def assume_zone_after_first_actuator(domain, service, data, **kwargs):
+        await dispatch(domain, service, data, **kwargs)
+        if (service, data["entity_id"]) in {("turn_on", switch), ("turn_off", head)}:
+            hass.states.values[zone].attributes["assumed_state"] = True
+
+    hass.services.async_call = assume_zone_after_first_actuator
+    desired = {"hvac_mode": "off"}
+    if scenario == "demand":
+        desired.update(hvac_mode="cool", target_temperature=20, enable_zones=True, configured_zones_only=True)
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+    assert result.command_sent
+    if scenario != "demand":
+        assert result.applied
+        assert hass.states.get(head).state == "off"
+        assert hass.services.calls == [("climate", "turn_off", {"entity_id": head})]
+    else:
+        assert not result.applied
+        assert "climate_zone_unavailable" in result.capability_issues
+        assert hass.states.get(head).attributes["temperature"] == 21
+        assert all(payload.get("temperature") != 20 for _, _, payload in hass.services.calls)
+    assert hass.states.get(switch).state == "off"
+
+
+def test_assumed_head_during_final_zone_readback_blocks_takeover(monkeypatch):
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        zone: FakeState("cool", {"temperature": 22, "zone_id": 0}),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]})
+    zone_confirmed = False
+    loss_queued = False
+
+    def assume_head():
+        hass.states.values[head].attributes["assumed_state"] = True
+
+    def observe_command(record):
+        nonlocal zone_confirmed, loss_queued
+        if record["stage"] != "confirmed":
+            return
+        if record["entity_id"] == zone:
+            zone_confirmed = True
+        elif record["entity_id"] == head and zone_confirmed and not loss_queued:
+            loss_queued = True
+            asyncio.get_running_loop().call_soon(assume_head)
+
+    adapter.set_command_callback(observe_command)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": True,
+    })))
+    assert loss_queued and not result.applied
+    assert "daikin_climate_unavailable" in result.capability_issues
+
+
+@pytest.mark.parametrize("feedback_loss", ["before_setpoint", "during_setpoint", "unused_zone_climate"])
+def test_legacy_takeover_requires_observed_feedback_from_enabled_dampers(monkeypatch, feedback_loss):
+    head, climate, opened, closed = "climate.daikin", "climate.zone", "switch.open", "switch.closed"
+    hass = FakeHass({
+        head: FakeState("cool", {"temperature": 21}),
+        climate: FakeState("cool", {"temperature": 22}),
+        opened: FakeState("on"),
+        closed: "off",
+    })
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_RECONCILIATION_TIMEOUT_SECONDS", 0)
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [opened, closed, climate],
+    })
+    dispatch = hass.services.async_call
+
+    async def lose_zone_feedback(domain, service, data, **kwargs):
+        await dispatch(domain, service, data, **kwargs)
+        if feedback_loss == "before_setpoint" and (service, data["entity_id"]) == ("turn_on", closed):
+            hass.states.values[opened].attributes["assumed_state"] = True
+        if service == "set_temperature" and data.get("temperature") == 20 and feedback_loss != "before_setpoint":
+            target = climate if feedback_loss == "unused_zone_climate" else opened
+            hass.states.values[target].attributes["assumed_state"] = True
+
+    hass.services.async_call = lose_zone_feedback
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True, "configured_zones_only": False,
+    })))
+    if feedback_loss == "unused_zone_climate":
+        assert result.applied and result.capability_issues == ()
+        assert hass.states.get(head).attributes["temperature"] == 20
+    else:
+        assert not result.applied and "climate_zone_unavailable" in result.capability_issues
+        assert hass.states.get(head).attributes["temperature"] == 21
+        assert hass.states.get(closed).state == "off"
+    if feedback_loss == "before_setpoint":
+        assert all(payload.get("temperature") != 20 for _, _, payload in hass.services.calls)
+
+
+def test_noop_legacy_takeover_still_requires_observed_damper_at_confirmation():
+    head, damper = "climate.daikin", "switch.zone"
+    hass = FakeHass({head: FakeState("cool", {"temperature": 20}), damper: FakeState("on")})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [damper]})
+
+    async def run():
+        def lose_feedback():
+            hass.states.values[damper].attributes["assumed_state"] = True
+
+        asyncio.get_running_loop().call_soon(lose_feedback)
+        return await adapter.async_execute(_action({
+            "hvac_mode": "cool", "target_temperature": 20, "enable_zones": True,
+        }))
+
+    result = asyncio.run(run())
+    assert not result.applied and result.reason == "climate_zone_unavailable"
+    assert not hass.services.calls
 
 
 @pytest.mark.parametrize(
@@ -1889,8 +2032,11 @@ def test_hvac_restore_retains_unrestorable_climate_zone_snapshot(
     assert hass.services.calls == []
 
 
-def test_hvac_action_fails_closed_when_climate_unavailable() -> None:
+@pytest.mark.parametrize("head_state", [None, FakeState("heat", {"temperature": 21, "assumed_state": True})])
+def test_hvac_action_fails_closed_when_climate_unavailable(head_state) -> None:
     hass = FakeHass({"automation.climate": "on"})
+    if head_state is not None:
+        hass.states.values["climate.daikin"] = head_state
     adapter = DaikinHVACAdapter(
         hass,
         {
@@ -1903,6 +2049,74 @@ def test_hvac_action_fails_closed_when_climate_unavailable() -> None:
     assert result.reason == "daikin_climate_unavailable"
     assert result.rollback_succeeded is True
     assert hass.services.calls == []
+
+
+@pytest.mark.parametrize(("domain", "entity", "service", "initial", "requested"), [
+    ("climate", "climate.daikin", "set_temperature", FakeState("heat", {"temperature": 19}), {"temperature": 21}),
+    ("switch", "switch.zone", "turn_on", FakeState("off"), {}),
+])
+def test_assumed_feedback_refuses_dispatch_and_discards_unsent_intent(domain, entity, service, initial, requested):
+    hass = FakeHass({entity: initial})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["switch.zone"]})
+    persisted = []
+
+    async def persist(record):
+        persisted.append(record)
+        if record is not None:
+            hass.states.values[entity] = FakeState(initial.state, {"assumed_state": True})
+
+    adapter.set_confirmation_persistence_callback(persist)
+    if domain == "switch":
+        hass.states.values[entity] = FakeState("off", {"assumed_state": True})
+    with pytest.raises(hvac_adapter_module.DeviceTargetUnavailable, match="hvac_feedback_assumed"):
+        asyncio.run(adapter._async_command(hass, domain, service, {"entity_id": entity, **requested}))
+    assert not hass.services.calls
+    assert adapter._recovery_confirmation is None
+    if domain == "climate":
+        assert persisted[0]["requested"] == requested and persisted[-1] is None
+    else:
+        assert not persisted
+
+
+def test_assumed_match_cannot_confirm_hvac_or_complete_restoration(monkeypatch):
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    entity = "climate.daikin"
+    baseline = {"hvac_mode": "heat", "target_temperature": 19}
+    hass = FakeHass({entity: FakeState("heat", {"temperature": 19, "assumed_state": True})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: entity})
+
+    async def run():
+        assert not await adapter._async_confirm_hvac_state(entity, baseline)
+        blocked = await adapter.async_restore(saved_main_state=baseline)
+        assert not blocked.applied and blocked.saved_main_state == baseline
+        assert not hass.services.calls
+        hass.states.values[entity] = FakeState("heat", {"temperature": 19})
+        restored = await adapter.async_restore(saved_main_state=blocked.saved_main_state)
+        assert restored.applied and not restored.saved_main_state
+        assert not hass.services.calls
+
+    asyncio.run(run())
+
+
+def test_assumed_head_prevents_dependent_zone_dispatch_after_persistence():
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({head: FakeState("heat", {"temperature": 19}), zone: FakeState("heat", {"temperature": 19})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]})
+    persisted = []
+
+    async def persist(record):
+        persisted.append(record)
+        if record and record["entity_id"] == zone:
+            hass.states.values[head].attributes["assumed_state"] = True
+
+    adapter.set_confirmation_persistence_callback(persist)
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "heat", "target_temperature": 21, "enable_zones": True, "configured_zones_only": True,
+    })))
+    assert not result.applied
+    assert result.saved_main_state["target_temperature"] == 19
+    assert [(service, values["entity_id"]) for _, service, values in hass.services.calls] == [("set_temperature", head)]
+    assert persisted[-1] is None
 
 
 def test_hvac_action_fails_closed_when_takeover_snapshot_is_incomplete() -> None:

@@ -241,6 +241,38 @@ def test_sampling_captures_fresh_report_and_uncertain_command():
     assert missing['sources']['head']['reported_at'] is None
 
 
+@pytest.mark.parametrize("assumed_entity", ["climate.head", "switch.main", ZONE])
+def test_assumed_hvac_feedback_breaks_learning_interval_without_discarding_history(assumed_entity):
+    c = context()
+    c.climate_inputs["zone_topology"] = {"supported": True, "pairs": {"switch.main": ZONE}}
+    states = {
+        "climate.head": SimpleNamespace(state="cool", attributes={"temperature": 24}),
+        "switch.main": SimpleNamespace(state="on", attributes={}),
+        ZONE: SimpleNamespace(state="cool", attributes={"temperature": 24}),
+        "sensor.room": SimpleNamespace(),
+    }
+
+    def reading(step):
+        c.created_at = NOW + timedelta(minutes=step * 5)
+        c.climate_inputs["zones"][ZONE]["temperature"] = 24 - step * 0.1
+        states["sensor.room"].last_updated = c.created_at
+        return sample(c, DEFAULT_OPTIONS, states, "climate.head")
+
+    model = update(update({}, reading(0)), reading(1))
+    first_window = model["sources"][ZONE]["buckets"]["cool"]["windows"][0]
+    states[assumed_entity].attributes["assumed_state"] = True
+    uncertain = reading(2)
+    assert uncertain["sources"][ZONE]["conditions"] is None
+    model = update(model, uncertain)
+    assert model["sources"][ZONE]["anchor"] is None
+    assert model["sources"][ZONE]["last_rejection"] == "intervention_or_uncertain_command"
+    states[assumed_entity].attributes.pop("assumed_state")
+    model = update(model, reading(3))
+    assert model["sources"][ZONE]["buckets"]["cool"]["windows"] == [first_window]
+    model = update(model, reading(4))
+    assert model["sources"][ZONE]["buckets"]["cool"]["count"] == 2
+
+
 def test_zone_temperature_options_preserve_mappings_and_actuators():
     original = {'climate_zone_entities': [ZONE], 'hvac_zone_mappings': {ZONE:{'humidity':'sensor.humidity'}}}
     entry = SimpleNamespace(data=original, options={'hvac_precondition_lead_minutes':60})

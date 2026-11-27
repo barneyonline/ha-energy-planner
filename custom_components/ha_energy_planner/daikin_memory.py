@@ -15,7 +15,7 @@ from urllib.parse import unquote
 
 from homeassistant.helpers import entity_registry
 
-from .climate_inputs import finite
+from .climate_inputs import finite, hvac_feedback_is_observed
 from .const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -119,7 +119,7 @@ async def read_memory(
         head = hass.states.get(data[CONF_DAIKIN_CLIMATE])
         if (
             selected is None
-            or head is None
+            or not hvac_feedback_is_observed(head)
             or not (
                 control.get("pow") == "0"
                 and head.state == "off"
@@ -197,7 +197,7 @@ async def read_memory(
         for actuator, climate in pairs.items():
             state = hass.states.get(actuator)
             expected = {"0": "off", "1": "on"}.get(powers[indices[climate]])
-            if state is None or expected is None or state.state != expected:
+            if not hvac_feedback_is_observed(state) or expected is None or state.state != expected:
                 return None
             result["power"][actuator] = expected
         return result
@@ -259,7 +259,7 @@ async def read_activation(hass: Any, data: dict[str, Any]) -> dict[str, Any] | N
             or control.get("pow") != "0"
             or mode is None
             or target is None
-            or head is None
+            or not hvac_feedback_is_observed(head)
             or head.state != "off"
             or finite(head.attributes.get("temperature")) != target
         ):

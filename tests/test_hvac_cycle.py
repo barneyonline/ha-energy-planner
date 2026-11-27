@@ -394,7 +394,30 @@ def test_aborted_mandatory_stop_retains_the_earlier_unresolved_start(monkeypatch
     assert not hass.services.calls
 
 
-def test_late_stop_feedback_starts_rest_from_the_observed_stop(monkeypatch):
+def test_release_retires_unsent_stop_when_target_becomes_assumed_unavailable():
+    hass = FakeHass({HEAD: FakeState("heat", {"temperature": 20})})
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": {"main_state": {"hvac_mode": "off"}}}
+    executor = Executor(store, hass=hass, entry_data={"daikin_climate_entity": HEAD}, options=OPTIONS)
+    save = store.async_save_ownership
+
+    async def lose_feedback_after_intent(ownership):
+        await save(ownership)
+        record = ownership.get("hvac_control", {}).get("command_confirmation")
+        if record is not None and record["service"] == "turn_off":
+            hass.states.values[HEAD] = FakeState("unavailable", {"assumed_state": True})
+
+    store.async_save_ownership = lose_feedback_after_intent
+    result = asyncio.run(executor.async_release_hvac_control("hvac_comfort_handoff"))
+    assert result.reason == "hvac_release_failed"
+    assert not hass.services.calls
+    assert "pending" not in store.data["hvac_cycle"]
+    assert "command_confirmation" not in store.data["ownership"]["hvac_control"]
+    assert store.data["ownership"]["hvac_control"]["main_state"] == {"hvac_mode": "off"}
+
+
+@pytest.mark.parametrize("feedback", ["mode_transition", "assumed_then_observed", "adapter_confirmation"])
+def test_late_stop_feedback_starts_rest_from_the_observed_stop(monkeypatch, feedback):
     from types import SimpleNamespace
 
     late_stop = STOP + timedelta(minutes=22)
@@ -402,13 +425,29 @@ def test_late_stop_feedback_starts_rest_from_the_observed_stop(monkeypatch):
     monkeypatch.setattr(adapter_module.dt_util, "utcnow", lambda: now)
     cycle = record_cycle({}, mode_record(), STOP)
     hass = FakeHass({})
-    hass.states.values[HEAD] = SimpleNamespace(state="off", attributes={"temperature": 20},
-                                             last_changed=late_stop, last_reported=now)
+    state = SimpleNamespace(
+        state="off", attributes={"temperature": 20},
+        last_changed=late_stop if feedback == "mode_transition" else STOP, last_reported=now,
+    )
+    if feedback != "mode_transition":
+        state.last_updated = STOP
+    hass.states.values[HEAD] = state
     # FakeStates deliberately accepts its typed FakeState only; return native-like feedback directly.
     monkeypatch.setattr(hass.states, "get", lambda entity: hass.states.values.get(entity))
     store = FakeStore()
     store.data["hvac_cycle"] = cycle
     executor = Executor(store, hass=hass, entry_data={"daikin_climate_entity": HEAD}, options=OPTIONS)
+    hass.states.values[HEAD].attributes["assumed_state"] = True
+    asyncio.run(executor.async_reconcile_hvac_cycle())
+    assert store.data["hvac_cycle"] == cycle
+    hass.states.values[HEAD].attributes.pop("assumed_state")
+    if feedback != "mode_transition":
+        state.last_updated = late_stop
+    if feedback == "adapter_confirmation":
+        adapter = DaikinHVACAdapter(hass, executor.entry_data)
+        wire(executor, adapter, {"restore_main": {"hvac_mode": "off"}})
+        adapter._last_commands[HEAD] = mode_record()
+        asyncio.run(adapter._record_confirmation(HEAD, True))
     action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat", "target_temperature": 24})
     asyncio.run(executor.async_evaluate(_plan(now, action)))
     assert store.data["outcomes"][-1].reason == "hvac_min_cycle_active"
@@ -416,7 +455,8 @@ def test_late_stop_feedback_starts_rest_from_the_observed_stop(monkeypatch):
     assert not hass.services.calls
     assert executor._hvac_cycle_active("heat", late_stop + timedelta(minutes=20) - timedelta(microseconds=1))
     assert not executor._hvac_cycle_active("heat", late_stop + timedelta(minutes=20))
-    assert store.flush_count > 0
+    if feedback != "adapter_confirmation":
+        assert store.flush_count > 0
 
 
 def test_reconciliation_requires_fresh_matching_feedback_even_after_deadline():

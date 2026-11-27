@@ -232,10 +232,11 @@ The original Off power is still requested, and unresolved settings remain for
 the operator. The check runs again after persistence and scheduler-guard waits.
 
 A mode-aware restoration gets one durable automatic attempt. Failure or
-interruption retains the original evidence and requests shutdown; subsequent
-retries wait for available head feedback. If the head is active or a prior mode
+interruption retains the original evidence and requests shutdown. If assumed
+feedback or cancellation prevents every actuator write, the attempt remains
+available. Subsequent retries wait for observed head feedback. If the head is active or a prior mode
 write is still uncertain, a retry can request shutdown with the captured
-controller and manual authority checks. Once Off is confirmed, retries use
+controller and manual authority checks. Once Off is confirmed, recovery uses
 read-only vendor verification without renewing the scheduler guard. A separate
 unsettled command or schedule write still uses its own guard. Partial zone
 acknowledgements before shutdown do not retire targets from the set that must

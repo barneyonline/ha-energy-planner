@@ -149,6 +149,14 @@ entry hides its repair, and removing the entry clears it. Startup adopts saved
 notices from earlier versions, preserves ignored repairs that are still pending,
 and clears notices for migrated or removed entries.
 
+When upgrading Home Assistant Core to 2026.12, check custom Recorder URLs whose
+database names or SQLite paths contain literal percent escapes. For example,
+write `%2520` in the URL to keep a filename containing literal `%20`. After
+the upgrade, verify that the mapped household load, EV charging and vehicle
+SoC entities still have their pre-upgrade history. Home Assistant's default
+Recorder database is unaffected.
+[Recorder compatibility review](ha-2026.12-compatibility.md#custom-recorder-urls-may-open-a-different-database)
+
 The Store envelope remains version 1; audit normalization removes the duplicate
 `outcomes` list in favor of `execution_audit`. A file-only downgrade is not a
 supported rollback procedure. Restore the complete matching pre-upgrade backup

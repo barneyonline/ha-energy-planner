@@ -18,7 +18,9 @@ from test_zone_temperature import NOW
 
 from custom_components.ha_energy_planner import hvac_adapter as adapter_module
 from custom_components.ha_energy_planner.const import (
+    CONF_DAIKIN_CLIMATE,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    CONF_HVAC_ZONE_CONTROL,
     HVAC_DRY_TAKEOVER_SUMMARY,
     HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
@@ -434,16 +436,299 @@ def test_restoration_manual_zone_supersession_preserves_user_target(system, supe
     asyncio.run(run())
 
 
-def test_failed_attempt_can_finish_from_read_only_confirmed_memory(system):
+@pytest.mark.parametrize("assumed_entity", [None, "climate.head", BED])
+def test_failed_attempt_needs_observed_read_only_memory_to_finish(system, assumed_entity):
     s = system
 
     async def run():
         await s.adapter.async_prepare_off_start(_action(s.desired))
         zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
         main["off_start_restore_attempted"] = True
+        device = s.entry.runtime_data.device
+        read = device.update_status
+
+        async def update(*args, **kwargs):
+            await read(*args, **kwargs)
+            if assumed_entity is not None:
+                previous = s.hass.states.get(assumed_entity)
+                s.hass.states.values[assumed_entity] = FakeState(
+                    previous.state, {**previous.attributes, "assumed_state": True},
+                )
+
+        device.update_status = update
         result = await s.adapter.async_restore({}, zones, main)
-        assert result.applied
+        assert result.applied is (assumed_entity is None)
+        if assumed_entity is not None:
+            assert result.reason == "hvac_zone_restore_pending"
+            assert result.saved_main_state[MEMORY_KEY] == main[MEMORY_KEY]
+            assert result.saved_zone_states == zones
         assert not s.hass.services.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("blocked_by", ["assumed_feedback", "rejected_shutdown"])
+def test_attempted_airbase_release_verifies_memory_immediately_after_confirmed_shutdown(system, blocked_by):
+    from test_executor import FakeStore
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+
+    async def run():
+        head = "climate.head"
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
+        main["off_start_restore_attempted"] = True
+        await s.hass.services.async_call("climate", "turn_on", {"entity_id": head})
+        s.hass.services.calls.clear()
+        store = FakeStore()
+        store.data["ownership"] = {"hvac_control": {"main_state": main, "zone_states": zones}}
+        executor = Executor(store, hass=s.hass, entry_data=s.data)
+        save = store.async_save_ownership
+        dispatch = s.hass.services.async_call
+
+        async def lose_feedback_after_intent(ownership):
+            await save(ownership)
+            record = ownership.get("hvac_control", {}).get("command_confirmation")
+            if record and record["service"] == "turn_off":
+                s.hass.states.values[head].attributes["assumed_state"] = True
+
+        async def reject_shutdown(domain, service, data, **kwargs):
+            assert (domain, service, data["entity_id"]) == ("climate", "turn_off", head)
+            raise OSError("synthetic shutdown rejection")
+
+        if blocked_by == "assumed_feedback":
+            store.async_save_ownership = lose_feedback_after_intent
+        else:
+            s.hass.services.async_call = reject_shutdown
+        blocked = await executor.async_release_hvac_control("hvac_comfort_handoff")
+        assert blocked.reason == (
+            "hvac_zone_restore_pending" if blocked_by == "assumed_feedback" else "hvac_zone_restore_operator_required"
+        )
+        assert store.data["ownership"]["hvac_control"]["main_state"]["off_start_restore_attempted"]
+        assert not s.hass.services.calls
+
+        s.hass.states.values[head].attributes.pop("assumed_state", None)
+        store.async_save_ownership = save
+        s.hass.services.async_call = dispatch
+        finished = await executor.async_release_hvac_control("hvac_comfort_handoff")
+        assert finished.reason == "hvac_control_released"
+        assert [service for _, service, _ in s.hass.services.calls] == ["turn_off"]
+        assert "hvac_control" not in store.data["ownership"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("assumed_entity", ["climate.head", BED])
+def test_assumed_feedback_cannot_spend_undispatched_airbase_restoration(system, assumed_entity):
+    from test_executor import FakeStore
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+
+    async def run():
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
+        assert (await s.adapter.async_execute(_action(s.desired))).applied
+        if assumed_entity == BED:
+            # The paired damper still provides airflow evidence after its
+            # restoration baseline is superseded.
+            await s.adapter._async_apply_hvac_state("climate.head", {"hvac_mode": "off"})
+            zones.pop(BED)
+            zones.pop(BED_CLIMATE)
+        s.hass.services.calls.clear()
+        before = s.hass.states.get(assumed_entity)
+        store = FakeStore()
+        store.data["ownership"] = {"hvac_control": {"main_state": main, "zone_states": zones}}
+        executor = Executor(store, hass=s.hass, entry_data=s.data)
+        save = store.async_save_ownership
+        feedback_lost = False
+
+        async def lose_feedback_after_marker(ownership):
+            nonlocal feedback_lost
+            await save(ownership)
+            current = ownership.get("hvac_control", {}).get("main_state", {})
+            if current.get("off_start_restore_attempted") and not feedback_lost:
+                feedback_lost = True
+                s.hass.states.values[assumed_entity] = FakeState(
+                    before.state, {**before.attributes, "assumed_state": True},
+                )
+
+        store.async_save_ownership = lose_feedback_after_marker
+        blocked = await executor.async_release_hvac_control("hvac_comfort_handoff")
+        assert blocked.reason == "hvac_zone_restore_pending"
+        assert feedback_lost and not s.hass.services.calls
+        saved = store.data["ownership"]["hvac_control"]["main_state"]
+        assert "off_start_restore_attempted" not in saved
+        assert saved[MEMORY_KEY] == main[MEMORY_KEY]
+        s.hass.states.values[assumed_entity] = before
+        s.publish()
+        if assumed_entity == "climate.head":
+            restored = await executor.async_release_hvac_control("hvac_comfort_handoff")
+            assert restored.reason == "hvac_control_released"
+            assert "hvac_control" not in store.data["ownership"]
+            assert s.hass.states.get("climate.head").state == "off"
+
+    asyncio.run(run())
+
+
+def test_airbase_assumed_feedback_at_dispatch_keeps_attempt_when_observation_returns_in_cleanup(system):
+    s = system
+
+    async def run():
+        head = "climate.head"
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
+        restore = DaikinHVACAdapter(s.hass, s.data)
+
+        async def lose_feedback_for_power_dispatch(record):
+            attributes = s.hass.states.values[head].attributes
+            if record and record["entity_id"] == head and record["service"] == "turn_on":
+                attributes["assumed_state"] = True
+            elif record is None:
+                attributes.pop("assumed_state", None)
+
+        restore.set_confirmation_persistence_callback(lose_feedback_for_power_dispatch)
+        result = await restore.async_restore({}, zones, main)
+        assert result.reason == "hvac_zone_restore_pending"
+        assert "off_start_restore_attempted" not in result.saved_main_state
+        assert not s.hass.services.calls
+        assert "assumed_state" not in s.hass.states.get(head).attributes
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("interruption", [
+    "marker_save", "marker_save_unowned_damper", "activation_read", "activation_read_unowned_damper",
+    "cleanup_confirmation", "cleanup_refund_failure",
+])
+def test_airbase_restoration_cancellation_survives_lost_feedback(system, interruption):
+    from test_executor import FakeStore
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+
+    async def run():
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
+        assumed_entity = "climate.head"
+        if interruption.endswith("_unowned_damper"):
+            assert (await s.adapter.async_execute(_action(s.desired))).applied
+            await s.adapter._async_apply_hvac_state("climate.head", {"hvac_mode": "off"})
+            s.hass.services.calls.clear()
+            zones.pop(BED)
+            zones.pop(BED_CLIMATE)
+            assumed_entity = BED
+        store = FakeStore()
+        store.data["ownership"] = {"hvac_control": {"main_state": main, "zone_states": zones}}
+        executor = Executor(store, hass=s.hass, entry_data=s.data)
+        save = store.async_save_ownership
+        markers = []
+
+        async def lose_feedback(*args, **kwargs):
+            current = s.hass.states.get(assumed_entity)
+            s.hass.states.values[assumed_entity] = FakeState(
+                current.state, {**current.attributes, "assumed_state": True},
+            )
+            raise asyncio.CancelledError
+
+        async def persist_marker(ownership):
+            snapshot = ownership["hvac_control"]["main_state"]
+            attempted = snapshot.get("off_start_restore_attempted", False)
+            markers.append(attempted)
+            if interruption in {"activation_read", "cleanup_refund_failure"} and not attempted:
+                raise OSError("synthetic marker reset failure")
+            await save(ownership)
+            if interruption.startswith("marker_save") and attempted:
+                await lose_feedback()
+
+        if interruption.startswith("activation_read"):
+            s.entry.runtime_data.device.update_status = lose_feedback
+        if interruption.startswith("cleanup_"):
+            async def interrupt_off_confirmation(*args, **kwargs):
+                # Reject activation without an actuator call. Cancellation
+                # arrives at the Off readback await in mandatory cleanup.
+                s.values.control["pow"] = "1"
+                task = asyncio.current_task()
+                asyncio.get_running_loop().call_soon(task.cancel)
+
+            s.entry.runtime_data.device.update_status = interrupt_off_confirmation
+        store.async_save_ownership = persist_marker
+        with pytest.raises(asyncio.CancelledError):
+            await executor.async_release_hvac_control("hvac_comfort_handoff")
+        assert markers == [True, False]
+        saved = store.data["ownership"]["hvac_control"]["main_state"]
+        assert saved.get("off_start_restore_attempted", False) is (
+            interruption in {"activation_read", "cleanup_refund_failure"}
+        )
+        assert not s.hass.services.calls
+
+    asyncio.run(run())
+
+
+def test_airbase_late_assumed_feedback_keeps_undispatched_attempt_waiting(system):
+    s = system
+
+    async def run():
+        head = "climate.head"
+        memory = await read_memory(s.hass, s.data, "heat")
+        await s.hass.services.async_call("climate", "turn_on", {"entity_id": head})
+        s.hass.services.calls.clear()
+        restore = DaikinHVACAdapter(s.hass, s.data)
+        heat_stages = 0
+
+        def lose_feedback_at_final_mode(snapshot):
+            nonlocal heat_stages
+            if snapshot.get("hvac_mode") == "heat":
+                heat_stages += 1
+                if heat_stages == 2:
+                    s.hass.states.values[head].attributes["assumed_state"] = True
+
+        restore.set_pending_main_restore_callback(lose_feedback_at_final_mode)
+        result = await restore.async_restore(
+            saved_zone_states={MAIN: "on"}, saved_main_state={"hvac_mode": "off", MEMORY_KEY: memory},
+        )
+        assert heat_stages == 2 and not s.hass.services.calls
+        assert result.reason == "hvac_zone_restore_pending"
+        assert "off_start_restore_attempted" not in result.saved_main_state
+        assert result.saved_main_state["zone_recovery_blocker"] == "off_start_restore_waiting_for_feedback"
+
+    asyncio.run(run())
+
+
+def test_airbase_final_assumed_readback_keeps_dispatched_attempt_waiting(system):
+    s = system
+
+    async def run():
+        head = "climate.head"
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        zones, main = s.adapter.takeover_snapshot()[1], s.adapter.main_takeover_snapshot()
+        assert (await s.adapter.async_execute(_action(s.desired))).applied
+        s.hass.services.calls.clear()
+        device = s.entry.runtime_data.device
+        read = device.update_status
+
+        async def lose_final_readback(resources, **kwargs):
+            await read(resources, **kwargs)
+            if "aircon/get_zone_setting" in resources and s.hass.states.get(head).state == "off":
+                s.hass.states.values[head].attributes["assumed_state"] = True
+
+        device.update_status = lose_final_readback
+        blocked = await DaikinHVACAdapter(s.hass, s.data).async_restore({}, zones, main)
+        assert blocked.reason == "hvac_zone_restore_pending"
+        assert blocked.saved_main_state["off_start_restore_attempted"] is True
+        assert s.hass.services.calls
+
+        s.hass.states.values[head].attributes.pop("assumed_state")
+        device.update_status = read
+        s.hass.services.calls.clear()
+        finished = await DaikinHVACAdapter(s.hass, s.data).async_restore(
+            {}, blocked.saved_zone_states, blocked.saved_main_state,
+        )
+        assert finished.applied and not s.hass.services.calls
 
     asyncio.run(run())
 
@@ -609,6 +894,19 @@ def test_refresh_compensation_is_separate_from_lifecycle_and_survives_reload(sys
         initial = {**deepcopy(main), "off_start_restore_attempted": True}
         await executor._async_persist_provisional_hvac_main_state(initial)
         assert store.data["ownership"]["hvac_control"]["main_state"]["off_start_restore_attempted"]
+        await executor._async_persist_provisional_hvac_main_state({
+            **attempt, "off_start_restore_attempted": False,
+            "zone_recovery_blocker": "off_start_restore_waiting_for_feedback",
+        })
+        control = store.data["ownership"]["hvac_control"]
+        assert control["main_state"]["off_start_restore_attempted"]
+        assert "off_start_restore_attempted" not in control["attempt_snapshot"]["main_state"]
+        control.pop("attempt_snapshot")
+        await executor._async_persist_provisional_hvac_main_state({
+            **attempt, "off_start_restore_attempted": False,
+            "zone_recovery_blocker": "off_start_restore_waiting_for_feedback",
+        })
+        assert "attempt_snapshot" not in store.data["ownership"]["hvac_control"]
 
     asyncio.run(run())
 
@@ -1249,7 +1547,7 @@ def test_mode_memory_requires_physical_count_dry_bounds_and_stable_identity(syst
     assert not s.hass.services.calls
 
 
-@pytest.mark.parametrize("invalid", ["missing_source", "unsupported_mode", "missing_head", "timeout"])
+@pytest.mark.parametrize("invalid", ["missing_source", "unsupported_mode", "missing_head", "assumed_head", "timeout"])
 def test_activation_read_is_not_an_invented_restoration_baseline(system, invalid):
     from custom_components.ha_energy_planner.daikin_memory import read_activation
 
@@ -1260,6 +1558,8 @@ def test_activation_read_is_not_an_invented_restoration_baseline(system, invalid
         s.values.control["mode"] = "3"
     elif invalid == "missing_head":
         del s.hass.states.values["climate.head"]
+    elif invalid == "assumed_head":
+        s.hass.states.values["climate.head"].attributes["assumed_state"] = True
     else:
 
         async def timeout(*args, **kwargs):
@@ -1488,6 +1788,54 @@ def test_manual_head_release_confirms_owned_inactive_zone_memory_without_wake(sy
         assert result.applied and not s.hass.services.calls
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("head_change", ["already_assumed", "manual_off_during_dispatch"])
+def test_manual_head_release_does_not_open_zone_without_observed_active_head(system, head_change):
+    s = system
+    s.hass.states.values[BED] = "off"
+    restore = DaikinHVACAdapter(s.hass, s.data)
+    restore.set_zone_control_context({}, {"off_start_control_data": s.data})
+    if head_change == "already_assumed":
+        s.hass.states.values["climate.head"].attributes["assumed_state"] = True
+    else:
+        s.hass.states.values["climate.head"].state = "heat"
+        manual_override = False
+
+        async def manual_off(record):
+            nonlocal manual_override
+            if record and record["entity_id"] == BED and record["service"] == "turn_on":
+                manual_override = True
+                s.hass.states.values["climate.head"].state = "off"
+                s.publish()
+
+        restore.set_manual_override_check(lambda: manual_override)
+        restore.set_confirmation_persistence_callback(manual_off)
+    result = asyncio.run(restore.async_restore(saved_zone_states={BED: "on"}))
+    assert not result.applied
+    assert result.saved_zone_states == {BED: "on"}
+    assert not s.hass.services.calls
+    assert s.hass.states.get("climate.head").state == "off"
+
+
+@pytest.mark.parametrize("still_configured", [False, True])
+def test_legacy_zone_release_cannot_wake_assumed_head(system, still_configured):
+    from test_executor import FakeStore
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+    data = dict(s.data) if still_configured else {CONF_DAIKIN_CLIMATE: "climate.head"}
+    data.pop(CONF_HVAC_ZONE_CONTROL, None)
+    s.hass.states.values["climate.head"].attributes["assumed_state"] = True
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": {"zone_states": {BED: "on"}}}
+    executor = Executor(store, hass=s.hass, entry_data=data)
+    result = asyncio.run(executor.async_release_hvac_control("manual_hvac_override", preserve_main_state=True))
+    assert result.reason == "hvac_release_failed"
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {BED: "on"}
+    assert not s.hass.services.calls
+    assert s.hass.states.get("climate.head").state == "off"
 
 
 @pytest.mark.parametrize("readback", ["unavailable", "other_controller"])
