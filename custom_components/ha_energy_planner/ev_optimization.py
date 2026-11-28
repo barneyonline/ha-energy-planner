@@ -13,7 +13,7 @@ from math import sqrt
 from statistics import median
 from typing import Any, NotRequired, TypedDict
 
-from .ev import EVChargeAllocation, EVChargeSchedule, _charge_cost_components
+from .ev import ChargeEconomics, EVChargeAllocation, EVChargeSchedule
 from .ev_policy import finite, strategy
 from .ev_runtime import timestamp
 from .models import DecisionContext
@@ -72,10 +72,9 @@ class ChargeSlot:
     import_price: float
     normal_price: bool
     daylight: bool
-
-    @property
-    def hours(self) -> float:
-        return (self.end - self.start).total_seconds() / 3600
+    hours: float
+    carbon_intensity: float
+    economics: ChargeEconomics
 
 
 @dataclass(slots=True)
@@ -94,45 +93,81 @@ class Simulation:
     dwell_violations: int
 
 
-def _rate(context: DecisionContext, soc: float, fallback: float, *, expected: bool = False) -> float:
-    model = context.ev_evidence.get("performance", {})
-    _, key = _SOC_BANDS[bisect_right(_SOC_BAND_STARTS, soc, lo=1) - 1]
-    band = model.get("bands", {}).get(key, {})
-    aggregate = model.get("aggregate", {})
-    row = band if band.get("sessions", 0) >= 3 and band.get("minutes", 0) >= 60 else aggregate
-    rate = finite(row.get("soc_per_kwh")) if row.get("minutes", 0) >= 60 else None
-    if rate is None or rate <= 0:
-        return fallback
-    if row is aggregate:
-        rate = min(rate, fallback / 0.9)  # Do not extrapolate favourable efficiency into an unobserved band.
-    return rate if expected else rate * 0.9
+@dataclass(frozen=True, slots=True)
+class _ChargeBand:
+    endpoint: float
+    fraction: float
+    conservative_rate: float
+    expected_rate: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ChargeCurve:
+    bands: tuple[_ChargeBand, ...]
+    measured: bool
+    observed_minutes: float
+
+
+def _charge_model_row(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _charge_model_count(row: Mapping[str, Any], key: str) -> float:
+    value = row.get(key)
+    return value if isinstance(value, (int, float)) else 0
+
+
+def _charge_curve(context: DecisionContext, fallback: float) -> _ChargeCurve:
+    model = _charge_model_row(context.ev_evidence.get("performance"))
+    aggregate = _charge_model_row(model.get("aggregate"))
+    model_bands = {key: _charge_model_row(row) for key, row in _charge_model_row(model.get("bands")).items()}
+    observed_minutes = _charge_model_count(aggregate, "minutes")
+    bands = []
+    for endpoint, key in _SOC_BANDS:
+        band = model_bands.get(key, {})
+        sessions, minutes = _charge_model_count(band, "sessions"), _charge_model_count(band, "minutes")
+        rate_row = band if sessions >= 3 and minutes >= 60 else aggregate
+        # Preserve the original delivery selection for unordered legacy values such as NaN.
+        delivery_row = aggregate if sessions < 3 or minutes < 60 else band
+        rate = finite(rate_row.get("soc_per_kwh")) if _charge_model_count(rate_row, "minutes") >= 60 else None
+        delivery_minutes = _charge_model_count(delivery_row, "minutes")
+        fraction = finite(delivery_row.get("delivery_fraction")) if delivery_minutes >= 60 else None
+        if rate is None or rate <= 0:
+            conservative = expected = fallback
+        else:
+            # Do not extrapolate favourable efficiency into an unobserved band.
+            expected = min(rate, fallback / 0.9) if rate_row is aggregate else rate
+            conservative = expected * 0.9
+        bands.append(_ChargeBand(endpoint, min(max(fraction if fraction is not None else 1, 0), 1),
+                                 conservative, expected))
+    measured = observed_minutes >= 60 or any(
+        _charge_model_count(row, "minutes") >= 60 and _charge_model_count(row, "sessions") >= 3
+        for row in model_bands.values()
+    )
+    return _ChargeCurve(tuple(bands), measured, observed_minutes)
 
 
 def _charge_interval(
-    context: DecisionContext,
+    curve: tuple[_ChargeBand, ...],
     soc: float,
     target: float,
     power: float,
     hours: float,
-    fallback: float,
     *,
     expected: bool = False,
 ) -> tuple[float, float, float]:
     """Integrate delivered power and efficiency through learned SOC bands."""
     energy = duration = 0.0
-    model = context.ev_evidence.get("performance", {})
-    for boundary, key in _SOC_BANDS:
-        endpoint = min(boundary, target)
+    for band in curve:
+        endpoint = min(band.endpoint, target)
         if endpoint <= soc:
             continue
-        row = model.get("bands", {}).get(key, {})
-        if row.get("sessions", 0) < 3 or row.get("minutes", 0) < 60:
-            row = model.get("aggregate", {})
-        fraction = finite(row.get("delivery_fraction")) if row.get("minutes", 0) >= 60 else None
-        delivered_power = power * min(max(fraction if fraction is not None else 1, 0), 1)
+        delivered_power = power * band.fraction
         if delivered_power <= 0:
             break
-        rate = _rate(context, soc, fallback, expected=expected)
+        # Floating-point integration can leave SOC just below the previous boundary.
+        rate_band = curve[bisect_right(_SOC_BAND_STARTS, soc, lo=1) - 1]
+        rate = rate_band.expected_rate if expected else rate_band.conservative_rate
         segment = min(max(hours - duration, 0), (endpoint - soc) / rate / delivered_power)
         used = segment * delivered_power
         soc += used * rate
@@ -246,6 +281,7 @@ def optimise_ev(
     excluded_capacity = 0
     forecast_missing = False
     covered_until = context.created_at
+    unknown_carbon = max((finite(s.carbon_intensity_g_per_kwh) or 0 for s in context.slots), default=0)
     for index, source in enumerate(context.slots):
         start = max(source.valid_at, context.created_at)
         end = min(interval_end(source, interval.total_seconds() / 60), ready_by)
@@ -286,7 +322,12 @@ def optimise_ev(
             continue
         daylight = any(w.start <= start and end <= w.end for w in context.daylight_windows)
         if price <= normal_limit or emergency and price <= emergency_limit:
-            slots.append(ChargeSlot(index, start, end, power, price, price <= normal_limit, daylight))
+            intensity = finite(source.carbon_intensity_g_per_kwh)
+            slots.append(ChargeSlot(
+                index, start, end, power, price, price <= normal_limit, daylight,
+                (end - start).total_seconds() / 3600,
+                max(intensity if intensity is not None else unknown_carbon, 0), ChargeEconomics.from_slot(source),
+            ))
     forecast_missing |= covered_until < ready_by
     by_index = {slot.index: slot for slot in slots}
     battery_simulate = _battery_simulator(context, options, interval)
@@ -306,7 +347,6 @@ def optimise_ev(
         if scenarios:
             battery_reason = "uncertain_profile_conservative_scenarios"
 
-    unknown_carbon = max((finite(s.carbon_intensity_g_per_kwh) or 0 for s in context.slots), default=0)
     evaluations = 0
     results: list[Simulation] = []
     cached: dict[tuple[tuple[int, float], ...], Simulation | None] = {}
@@ -323,17 +363,20 @@ def optimise_ev(
     daylight_available = daylight_enabled and any(slot.daylight for slot in slots)
     # Telemetry can carry an empty or immature model. Only a rate difference
     # can make the two projections diverge; both apply the same delivery fraction.
-    projections_differ = any(
-        _rate(context, start, soc_per_kwh, expected=True) != _rate(context, start, soc_per_kwh)
-        for start in _SOC_BAND_STARTS
-    )
+    charge_curve = _charge_curve(context, soc_per_kwh)
+    curve = charge_curve.bands
+    projections_differ = any(band.expected_rate != band.conservative_rate for band in curve)
+    seed_rate = min(soc_per_kwh, curve[bisect_right(_SOC_BAND_STARTS, current_soc, lo=1) - 1].conservative_rate)
+    continuity_tolerance = timedelta(seconds=1)
+    delivery_paused = context.ev_charging is True and context.ev_evidence.get("delivery_status") in {
+        "stalled", "unavailable",
+    }
 
     def project_delivery(soc: float, item: ChargeSlot, power: float) -> tuple[float, float, float, float]:
         """Project conservative delivery for candidate ranking and final allocations."""
-        if (item.index == 0 and context.ev_charging is True
-                and context.ev_evidence.get("delivery_status") in {"stalled", "unavailable"}):
+        if item.index == 0 and delivery_paused:
             power = 0.0
-        after, energy, hours = _charge_interval(context, soc, target, power, item.hours, soc_per_kwh)
+        after, energy, hours = _charge_interval(curve, soc, target, power, item.hours)
         return power, after, energy, hours
 
     def simulate(signature: tuple[tuple[int, float], ...]) -> Simulation | None:
@@ -367,7 +410,7 @@ def optimise_ev(
                     return None
             elif abs(power - charge_rate_kw) > 1e-6:
                 return None
-            contiguous = item.start <= previous_end + timedelta(seconds=1)
+            contiguous = item.start <= previous_end + continuity_tolerance
             if continuous and started and not contiguous:
                 return None
             if previous_active and not contiguous:
@@ -391,7 +434,7 @@ def optimise_ev(
             physical_end = item.start + timedelta(hours=duration_hours) if after >= target - 1e-6 else item.end
             if projections_differ:
                 expected_after, expected_energy, expected_hours = _charge_interval(
-                    context, expected_soc, target, prediction_power, item.hours, soc_per_kwh, expected=True
+                    curve, expected_soc, target, prediction_power, item.hours, expected=True,
                 )
             else:
                 expected_after, expected_energy, expected_hours = after, energy, duration_hours
@@ -402,23 +445,21 @@ def optimise_ev(
             # Price, carbon, battery and emergency budgets must include that exposure.
             if prediction_power == 0:
                 expected_energy, expected_hours = power * item.hours, item.hours
-            source = context.slots[index]
             if not item.normal_price:
                 exposure_energy = expected_energy if prediction_power == 0 else energy
                 exposure_hours = expected_hours if prediction_power == 0 else duration_hours
-                _, _, exposure_grid = _charge_cost_components(
-                    source, exposure_energy / exposure_hours if exposure_hours else 0,
+                _, _, exposure_grid = item.economics.components(
+                    exposure_energy / exposure_hours if exposure_hours else 0,
                 )
                 increment = exposure_grid * exposure_hours * (item.import_price - normal_limit)
                 if extra + increment > budget + 1e-8:
                     return None
                 extra += increment
-            expected_effective, _, expected_grid = _charge_cost_components(
-                source, expected_energy / expected_hours if expected_hours else 0
+            expected_effective, _, expected_grid = item.economics.components(
+                expected_energy / expected_hours if expected_hours else 0,
             )
             cost += expected_energy * (expected_effective if expected_effective is not None else item.import_price)
-            intensity = finite(source.carbon_intensity_g_per_kwh)
-            carbon += expected_grid * expected_hours * max(intensity if intensity is not None else unknown_carbon, 0)
+            carbon += expected_grid * expected_hours * item.carbon_intensity
             if item.daylight:
                 daylight_energy += energy
             powers[index] = power
@@ -482,7 +523,7 @@ def optimise_ev(
         # checks band transitions and additional chronological slots are explored.
         for item in ordered:
             chosen[item.index] = item.power_kw
-            remaining -= item.power_kw * item.hours * min(soc_per_kwh, _rate(context, current_soc, soc_per_kwh))
+            remaining -= item.power_kw * item.hours * seed_rate
             if remaining <= 0:
                 break
         return chosen
@@ -507,7 +548,7 @@ def optimise_ev(
             add({item.index: item.power_kw for item in eligible})
             add(fill(list(reversed(eligible))))
             ranked = sorted(
-                eligible, key=lambda s: (_charge_cost_components(context.slots[s.index], s.power_kw)[0], s.start)
+                eligible, key=lambda s: (s.economics.components(s.power_kw)[0], s.start)
             )
             add(fill(ranked))
             daylight_ranked = sorted(ranked, key=lambda s: not s.daylight)
@@ -547,7 +588,8 @@ def optimise_ev(
     normal_capacity_soc = current_soc
     for item in normal:
         normal_capacity_soc, _, _ = _charge_interval(
-            context, normal_capacity_soc, 100, item.power_kw, item.hours, soc_per_kwh)
+            curve, normal_capacity_soc, 100, item.power_kw, item.hours,
+        )
     normal_shortfall_proven = normal_capacity_soc < target - 1e-6 or continuous and capability is None
     if not normal_feasible and emergency and normal_shortfall_proven:
         generate(slots)
@@ -664,7 +706,9 @@ def optimise_ev(
                 retained_reason = "minimum_dwell_active"
     capacity_soc = current_soc
     for item in slots:
-        capacity_soc, _, _ = _charge_interval(context, capacity_soc, 100, item.power_kw, item.hours, soc_per_kwh)
+        capacity_soc, _, _ = _charge_interval(
+            curve, capacity_soc, 100, item.power_kw, item.hours,
+        )
     status = "valid_schedule"
     if best.schedule.infeasible:
         status = (
@@ -686,7 +730,7 @@ def optimise_ev(
         item = by_index[index]
         _, after, energy, duration = project_delivery(soc, item, power)
         source = context.slots[index]
-        effective, solar, grid = _charge_cost_components(source, energy / duration if duration else 0)
+        effective, solar, grid = item.economics.components(energy / duration if duration else 0)
         best.schedule.allocations.append(EVChargeAllocation(
             source.valid_at, energy / item.hours, after - soc, item.import_price, effective, solar, grid,
             source.carbon_intensity_g_per_kwh,
@@ -721,14 +765,8 @@ def optimise_ev(
         "projected_departure_soc": round(best.schedule.scheduled_soc_percent, 3),
         "maximum_recoverable_soc": round(capacity_soc, 3),
         "delivery_status": context.ev_evidence.get("delivery_status", "configured_estimate"),
-        "charging_model_source": "measured"
-        if (context.ev_evidence.get("performance", {}).get("aggregate", {}).get("minutes", 0) >= 60
-            or any(row.get("minutes", 0) >= 60 and row.get("sessions", 0) >= 3
-                   for row in context.ev_evidence.get("performance", {}).get("bands", {}).values()))
-        else "configured_or_recorder_calibration",
-        "charging_model_observed_minutes": context.ev_evidence.get("performance", {})
-        .get("aggregate", {})
-        .get("minutes", 0),
+        "charging_model_source": "measured" if charge_curve.measured else "configured_or_recorder_calibration",
+        "charging_model_observed_minutes": charge_curve.observed_minutes,
         "modelled_incremental_cost": round(best.cost, 4),
         "estimated_grid_carbon_g": round(best.carbon, 3),
         "battery_cost_reason": battery_reason,

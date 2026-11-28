@@ -34,6 +34,12 @@ def finite(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def native_limit_value_matches(state: Any, value: float) -> bool:
+    """Compare a native number readback with its setpoint at write precision."""
+    observed = finite(getattr(state, "state", None))
+    return observed is not None and abs(observed - value) < 1e-6
+
+
 def power_limit_options(options: Mapping[str, Any]) -> dict[str, float]:
     """Retain the finite settings required to interpret one native EV limit."""
     return {

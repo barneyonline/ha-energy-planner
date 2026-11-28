@@ -308,6 +308,12 @@ class FakeStore:
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         self.data["ownership"] = ownership
 
+    async def async_publish_ev_release(self, stage, is_current) -> bool:
+        if not is_current():
+            return False
+        self.data.update(stage())
+        return True
+
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         self.data["command_rate_limits"] = limits
 

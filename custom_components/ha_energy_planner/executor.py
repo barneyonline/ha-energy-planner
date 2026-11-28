@@ -6,12 +6,15 @@ import asyncio
 import logging
 import sys
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, cast
 
-from homeassistant.core import Context, HomeAssistant, State
+from homeassistant.core import Context, HomeAssistant, State, callback
+from homeassistant.helpers.event import async_track_state_change_event, async_track_state_report_event
 from homeassistant.util import dt as dt_util
 
 from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
@@ -22,8 +25,10 @@ from .climate_runtime import command_rejection
 from .command_models import ControlAction, ManualControlAction
 from .const import (
     CONF_BYPASS_SAFETY_GATES,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DRY_RUN,
@@ -50,7 +55,9 @@ from .const import (
     EV_RESERVATION_EXTERNAL_BASELINE,
     EV_RESERVATION_EXTERNAL_POWER_OPTIONS,
     EV_RESERVATION_EXTERNAL_TOPOLOGY,
+    EV_RESERVATION_HANDOFF_PENDING,
     EV_RESERVATION_RETAIN_WHEN_UNLOADED,
+    EV_SIGNAL_CLOCK_HANDOFFS,
     HVAC_DRY_RELEASE_DURING_OFF_START,
     HVAC_DRY_ZONE_TARGETS_ABSENT,
     HVAC_PENDING_AUTOMATION_OFF,
@@ -67,7 +74,7 @@ from .enphase_control import EnphaseControlTransaction
 from .enphase_export_limit import ExportLimitControl, RetryApply, preserve_retry_on_reload
 from .enphase_export_limit import evidence as export_limit_evidence
 from .enphase_export_limit import target_identity as export_target_identity
-from .ev import ev_charging_state_proves_safe
+from .ev import ev_charging_state_for_stop, ev_charging_state_proves_safe
 from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import (
     _ev_action_wants_power,
@@ -77,8 +84,32 @@ from .ev_control import (
     reserve_ev_grid_capacity,
 )
 from .ev_policy import finite, power_capability, power_limit_options
-from .ev_runtime import allocation_deadline, price_stop_required, settle_spending, timestamp
-from .ev_telemetry import measured, reported_at, sample_ev, suspension_identity, vehicle_suspension_evidence
+from .ev_runtime import (
+    EV_CAP_FEEDBACK_CLOCK_INVALID,
+    EV_RETIRED_CAP_KW,
+    MAX_EV_CAP_HISTORY,
+    EVImplicitSignalClock,
+    EVRestoreFeedback,
+    NativeEVStopObservations,
+    allocation_deadline,
+    check_ev_cap_feedback_clock,
+    ev_cap_may_become_active,
+    invalidate_ev_cap_feedback_clock,
+    price_stop_required,
+    settle_spending,
+    timestamp,
+)
+from .ev_telemetry import (
+    current_sample_reported_at,
+    measured,
+    reported_at,
+    sample_ev,
+    stop_signal_reported_at,
+    suspension_identity,
+    unverified_positive_power,
+    updated_ev_signal_clock,
+    vehicle_suspension_evidence,
+)
 from .export_limit_policy import EXPORT_ASSET
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
 from .hvac_control import (
@@ -175,6 +206,167 @@ _EV_SAFETY_PLAN_ISSUES = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _NativeEVRelease:
+    adapter: EVChargerAdapter
+    result: EVCommandResult
+    stopped_at: datetime
+    result_index: int
+    reason_index: int
+    restore_active_baseline: bool
+
+
+@dataclass(slots=True)
+class _ProvisionalEVCapacity:
+    entry_data: dict[str, Any]
+    options: dict[str, Any]
+    retained_load_kw: float
+
+
+@dataclass(slots=True)
+class _EVSignalClockHandoff:
+    binding: tuple[str | None, str | None, str | None, str | None, str | None]
+    signals: dict[str, tuple[EVImplicitSignalClock, State | None]]
+    clocks: dict[str, EVImplicitSignalClock]
+    subscriptions: list[Callable[[], None]] = field(default_factory=list)
+
+    def observe(
+        self, hass: HomeAssistant, reservations: dict[str, dict[str, Any]], entry_id: str,
+        rate_kw: float, grid_limit_kw: float, cap_options: dict[str, Any], *, native: bool,
+    ) -> None:
+        """Retain original device evidence while neither coordinator is running."""
+        control_id, charging_id, connection_id, limit_id, power_id = self.binding
+        signal_ids = (control_id, charging_id, connection_id, power_id)
+        reports = tuple(dict.fromkeys(entity for entity in signal_ids if entity))
+        sources = (*reports, limit_id) if limit_id and limit_id not in reports else reports
+        if self.subscriptions or not sources:
+            return
+
+        def cap_kw(state: State | None) -> float:
+            limit = power_capability(state, cap_options)
+            return limit.current * limit.kw_per_unit if limit is not None else 0.0
+
+        def reserve(at: datetime) -> dict[str, Any] | None:
+            reservation = reservations.get(entry_id)
+            if reservation is None and native:
+                limit_state = hass.states.get(limit_id) if limit_id else None
+                reservation = reservations[entry_id] = {
+                    "load_kw": max(rate_kw, cap_kw(limit_state)), "limit_kw": grid_limit_kw,
+                    "reserved_at": at.isoformat(), EV_RESERVATION_RETAIN_WHEN_UNLOADED: True,
+                }
+            return reservation
+
+        def retain_power(
+            state: State | None, receipt: datetime | None, clock: EVImplicitSignalClock | None,
+            now: datetime, boundary: datetime | None,
+        ) -> None:
+            at = current_sample_reported_at(state, now, received_at=receipt, signal_clock=clock)
+            draw: float | None
+            if at is None:
+                fallback = unverified_positive_power(state, now, receipt)
+                if fallback is None:
+                    return
+                draw, receipt = fallback
+            else:
+                draw = measured(state, now, "power")
+                receipt = at
+            if not draw:
+                return
+            reservation = reserve(receipt)
+            if reservation is None:
+                return
+            activity_changed = at is None and _note_ev_activity(reservation, receipt)
+            proof_changed = _retain_ev_cap_readback(reservation, draw, at)
+            if boundary is not None and at is not None and at < boundary:
+                if proof_changed:
+                    reservation[EV_RESERVATION_HANDOFF_PENDING] = True
+                return
+            observed = _positive_float(reservation.get("observed_load_kw"))
+            load_increased = _raise_ev_draw_reservation(reservation, draw)
+            draw_changed = _note_ev_draw_report(reservation, draw, at)
+            if activity_changed or proof_changed or load_increased or draw > observed or draw_changed:
+                reservation[EV_RESERVATION_HANDOFF_PENDING] = True
+            if not native and limit_id is not None:
+                retain_limit(hass.states.get(limit_id), observed_draw=draw)
+
+        def retain_limit(state: State | None, *, observed_draw: float | None = None) -> None:
+            current = reservations.get(entry_id)
+            if current is None or (limit := cap_kw(state)) <= _positive_float(current.get("load_kw")):
+                return
+            if not native:
+                topology = _external_ev_topology(current)
+                if observed_draw is None:
+                    meter = hass.states.get(power_id) if power_id else None
+                    observed_draw = measured(meter, dt_util.utcnow(), "power") or 0
+                if topology is None or not _external_ev_limit_supported(hass, topology, observed_draw):
+                    return
+            current.update(load_kw=limit, observed_limit_kw=limit)
+            current.pop("confirmed_power_limit", None)
+            current[EV_RESERVATION_HANDOFF_PENDING] = True
+
+        def retain(entity_id: str, state: State | None, previous: State | None, receipt: datetime | None) -> None:
+            now = dt_util.utcnow()
+            boundary = None
+            if (current := reservations.get(entry_id)) is not None:
+                boundary, clock_changed = check_ev_cap_feedback_clock(current, now)
+                if clock_changed:
+                    current[EV_RESERVATION_HANDOFF_PENDING] = True
+            if entity_id == limit_id:
+                retain_limit(state)
+                return
+            changed_clock, clock = updated_ev_signal_clock(
+                state, previous, self.clocks.get(entity_id), receipt,
+            )
+            if clock is not None:
+                self.clocks[entity_id] = clock
+                self.signals[entity_id] = (clock, state)
+            else:
+                self.clocks.pop(entity_id, None)
+                self.signals.pop(entity_id, None)
+            if entity_id == power_id:
+                retain_power(state, receipt, clock, now, boundary)
+            elif state is not None:
+                previous_activity = None if changed_clock or "sampled_at_utc" in state.attributes else getattr(
+                    previous, "state", None,
+                )
+                if ev_cap_may_become_active(
+                    entity_id, previous_activity, state.state, control_ids=(control_id,), charging_id=charging_id,
+                ) and (at := stop_signal_reported_at(
+                    state, now, received_at=receipt, implicit_clock=clock,
+                )) is not None:
+                    current = reserve(at)
+                    if current is None:
+                        return
+                    if _note_ev_activity(current, at):
+                        current[EV_RESERVATION_HANDOFF_PENDING] = True
+                if not native and limit_id and ev_cap_may_become_active(
+                    entity_id, getattr(previous, "state", None), state.state,
+                    control_ids=(control_id, connection_id), charging_id=charging_id,
+                ):
+                    retain_limit(hass.states.get(limit_id))
+
+        @callback
+        def changed(event: Any) -> None:
+            state = event.data["new_state"]
+            retain(event.data["entity_id"], state, event.data["old_state"], state.last_updated if state else None)
+
+        @callback
+        def reported(event: Any) -> None:
+            state = event.data["new_state"]
+            receipt = event.data["last_reported"]
+            retain(event.data["entity_id"], state, state, receipt)
+
+        self.subscriptions.append(async_track_state_change_event(hass, sources, changed))
+        if reports:
+            self.subscriptions.append(async_track_state_report_event(hass, reports, reported))
+        for entity_id in sources:
+            retain(entity_id, hass.states.get(entity_id), None, None)
+
+    def close(self) -> None:
+        while self.subscriptions:
+            self.subscriptions.pop()()
+
+
 class Executor:
     """Evaluate due actions behind the planner safety gate."""
 
@@ -222,7 +414,10 @@ class Executor:
         self.ev_start_limit_feedback: tuple[str, float] | None = None
         self.ev_allocation_deadline_callback: Any = None
         self.ev_grid_reservation_persisted: Callable[[], None] | None = None
-        self._provisional_ev_capacity: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self.ev_grid_draw_observed: Callable[[], None] | None = None
+        self._provisional_ev_capacity: _ProvisionalEVCapacity | None = None
+        self._ev_unload_draw: tuple[tuple[str | None, ...], NativeEVStopObservations] | None = None
+        self._native_ev_signal_clocks = self._adopt_native_ev_signal_clocks()
         self._ev_safety_stop_attempted_plan_id: str | None = None
         self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
         self._restore_notification_update_pending = False
@@ -621,6 +816,8 @@ class Executor:
         owned_manual_stop = bool(
             not enabled and (self._owned_ev_control_topology() is not None or isinstance(previous_reservation, dict))
         )
+        saved_ev = previous_ownership.get("ev_smart_charging_state", {}) if not enabled else {}
+        native_stop = "ev_power_limit_entity" in saved_ev
         if not enabled:
             self.ev_start_feedback_expected_until = None
         power_limit = action.desired_state.get("power_limit")
@@ -642,22 +839,34 @@ class Executor:
             confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
             confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
         )
+        metered_cap_start = limit_context is not None and bool(ev_entry_data.get("ev_power_entity"))
+        guarded_cap_stop = False
         if enabled and (action.desired_state.get("power_limit") or manual_lease is not None):
             manual_plan_action = PlanAction(action.action_id, plan_id, now, now + timedelta(minutes=5),
                                             ActionAsset.EV, ActionKind.EV_START, action.desired_state, [], [], 0, 1)
             self.ev_start_limit_feedback = limit_feedback
-            try:
-                result = await manual_adapter.async_execute(manual_plan_action)
-            except asyncio.CancelledError:
-                if charge_now_guard is not None and manual_lease is not None:
-                    # Cancellation after dispatch can leave an unconfirmed start.
-                    self.ev_allocation_deadline_callback(min(manual_lease, charge_now_prior_deadline or manual_lease))
-                raise
-            finally:
-                self.ev_start_limit_feedback = None
-        elif (not enabled and "ev_power_limit_entity" in
-              self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})):
-            result = await manual_adapter.async_restore(self.store.data["ownership"]["ev_smart_charging_state"])
+            with ExitStack() as observations:
+                if metered_cap_start:
+                    self._observe_native_ev_adapter(observations, manual_adapter, ev_entry_data)
+                try:
+                    result = await manual_adapter.async_execute(manual_plan_action)
+                    if metered_cap_start:
+                        result, guarded_cap_stop = await self._async_settle_guarded_cap_stop(manual_adapter, result)
+                except (Exception, asyncio.CancelledError):
+                    if charge_now_guard is not None and manual_lease is not None:
+                        # Interrupted dispatch or persistence can leave an unconfirmed start.
+                        self.ev_allocation_deadline_callback(
+                            min(manual_lease, charge_now_prior_deadline or manual_lease),
+                        )
+                    raise
+                finally:
+                    self.ev_start_limit_feedback = None
+        elif native_stop:
+            with ExitStack() as observations:
+                self._observe_native_ev_adapter(observations, manual_adapter, ev_entry_data)
+                result = await manual_adapter.async_restore(saved_ev)
+                if _ev_result_proves_safe(result):
+                    result, _ = await self._async_settle_native_stop(manual_adapter, result, saved_ev)
         else:
             result = await manual_adapter.async_set_charging(enabled)
         if charge_now_guard is not None and manual_lease is not None:
@@ -666,16 +875,17 @@ class Executor:
             elif result.command_sent and not _ev_result_proves_safe(result):
                 # An unconfirmed attempt may require recovery, but cannot extend the previous lease.
                 self.ev_allocation_deadline_callback(min(manual_lease, charge_now_prior_deadline or manual_lease))
-            elif result.safe_state_confirmed is True:
+            elif result.safe_state_confirmed is True and not guarded_cap_stop:
                 await self._async_end_ev_exposure(safe_stop_confirmed=True)
         if charge_now_guard is not None and not result.applied and (
             not result.command_sent or result.rollback_succeeded is True
         ):
             self._reconcile_ev_start_feedback_expectation(result)
-            await self._async_rollback_ev_start(
-                previous_reservation, previous_ownership, stopped=result.safe_state_confirmed is True,
-                command_sent=result.command_sent,
-            )
+            if not guarded_cap_stop:
+                await self._async_rollback_ev_start(
+                    previous_reservation, previous_ownership, stopped=result.safe_state_confirmed is True,
+                    command_sent=result.command_sent,
+                )
             if result.command_sent:
                 await self._async_record_command_attempt(action, now)
             await self._async_record_manual_ev_outcome(
@@ -692,19 +902,18 @@ class Executor:
                     telemetry["version"] = 1
                     telemetry["command_exposure"] = {"at": dispatch_at.isoformat(), "cost_per_hour": 0}
                     await self.store.async_save_ev_telemetry(telemetry)
-        if not enabled:
+        if not enabled and not native_stop:
             if _ev_result_proves_safe(result):
                 await self._async_end_ev_exposure(safe_stop_confirmed=True)
             result = _normalized_ev_stop_result(
                 result,
                 require_safe=owned_manual_stop,
             )
-        if charge_now_guard is not None and not result.applied and result.safe_state_confirmed is True:
-            # Stop proof clears grid load even if the original native power
-            # limit still needs restoration. Keep that ownership for recovery.
-            self._release_ev_grid_reservation()
-        else:
-            self._reconcile_ev_grid_reservation(action, result, previous_reservation)
+        if not guarded_cap_stop:
+            if not native_stop:
+                self._reconcile_ev_grid_reservation(action, result, previous_reservation)
+            elif not result.applied:
+                self._retain_ev_grid_reservation_when_unloaded()
         await self.async_persist_ev_grid_reservation()
         if result.command_sent:
             await self._async_record_command_attempt(action, now)
@@ -751,11 +960,12 @@ class Executor:
             ownership.setdefault(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY, self._ev_capacity_inputs(ev_entry_data))
             await self.store.async_save_ownership(ownership)
         elif not enabled and _ev_result_proves_safe(result) and result.applied:
-            await self._async_end_ev_exposure(safe_stop_confirmed=True)
-            ownership = dict(self.store.data.get("ownership", {}))
-            for key in _EV_OWNERSHIP_KEYS:
-                ownership.pop(key, None)
-            await self.store.async_save_ownership(ownership)
+            if not native_stop:
+                await self._async_end_ev_exposure(safe_stop_confirmed=True)
+                ownership = dict(self.store.data.get("ownership", {}))
+                for key in _EV_OWNERSHIP_KEYS:
+                    ownership.pop(key, None)
+                await self.store.async_save_ownership(ownership)
             await self.async_resolve_restore_notifications("ev")
         elif enabled and provisional_ownership and not self._has_ev_grid_reservation():
             await self._async_clear_provisional_ev_ownership()
@@ -1169,11 +1379,14 @@ class Executor:
                     self._expect_ev_start_feedback()
             else:
                 self.ev_start_feedback_expected_until = None
-            if not wants_power:
-                saved_ev = self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})
-                if "ev_power_limit_entity" in saved_ev:
-                    action.desired_state["restore_power_limit"] = saved_ev["ev_power_limit_entity"]
-                    action.desired_state["restore_power_limit_unit"] = saved_ev.get("ev_power_limit_unit")
+            saved_ev = (
+                self.store.data.get("ownership", {}).get("ev_smart_charging_state", {}) if not wants_power else {}
+            )
+            native_stop = "ev_power_limit_entity" in saved_ev
+            guarded_rollback = False
+            if native_stop:
+                action.desired_state["restore_power_limit"] = saved_ev["ev_power_limit_entity"]
+                action.desired_state["restore_power_limit_unit"] = saved_ev.get("ev_power_limit_unit")
             if ev_preparation_rejection is not None:
                 ev_result = EVCommandResult(False, ev_preparation_rejection, {}, {})
             else:
@@ -1182,33 +1395,42 @@ class Executor:
                     if (value := finite(limit.get("value"))) is not None:
                         limit_context = Context()
                         self.ev_start_limit_feedback = (limit_context.id, value)
-                ev_adapter = EVChargerAdapter(
-                    self.hass,
-                    ev_entry_data,
-                    command_guard=command_guard,
-                    start_guard=start_guard,
-                    power_limit_context=limit_context,
-                    stopped_power_limit_baseline=(
-                        self._ev_stopped_power_limit_baseline(ev_entry_data) if limit_context else None
-                    ),
-                    power_options=dict(self.options),
-                    confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
-                    confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
-                )
-                try:
-                    ev_result = await ev_adapter.async_execute(action)
-                except (Exception, asyncio.CancelledError):
-                    if start_guard is not None:
-                        # Dispatch may already have happened when execution is interrupted.
-                        retain_bounded_recovery()
-                    raise
-                finally:
-                    if limit_context is not None:
-                        self.ev_start_limit_feedback = None
+                metered_cap_start = limit_context is not None and bool(ev_entry_data.get("ev_power_entity"))
+                with ExitStack() as observations:
+                    ev_adapter = EVChargerAdapter(
+                        self.hass,
+                        ev_entry_data,
+                        command_guard=command_guard,
+                        start_guard=start_guard,
+                        power_limit_context=limit_context,
+                        stopped_power_limit_baseline=(
+                            self._ev_stopped_power_limit_baseline(ev_entry_data) if limit_context else None
+                        ),
+                        power_options=dict(self.options),
+                        confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
+                        confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
+                    )
+                    if native_stop or metered_cap_start:
+                        self._observe_native_ev_adapter(observations, ev_adapter, ev_entry_data)
+                    try:
+                        ev_result = await ev_adapter.async_execute(action)
+                        if native_stop and _ev_result_proves_safe(ev_result):
+                            ev_result, _ = await self._async_settle_native_stop(ev_adapter, ev_result, saved_ev)
+                        elif metered_cap_start:
+                            ev_result, guarded_rollback = await self._async_settle_guarded_cap_stop(
+                                ev_adapter, ev_result,
+                            )
+                    except (Exception, asyncio.CancelledError):
+                        if start_guard is not None:
+                            # Dispatch may already have happened when execution is interrupted.
+                            retain_bounded_recovery()
+                        raise
+                    finally:
+                        if limit_context is not None:
+                            self.ev_start_limit_feedback = None
             if ev_start_rejection is not None and ev_result.reason == "ev_grid_projection_stale":
                 ev_result = replace(ev_result, reason=ev_start_rejection)
-            guarded_rollback = False
-            if start_guard is not None and not ev_result.applied:
+            if start_guard is not None and not ev_result.applied and not guarded_rollback:
                 stopped = ev_result.safe_state_confirmed is True
                 if not ev_result.command_sent or ev_result.rollback_succeeded is True:
                     self.ev_start_feedback_expected_until = None if stopped else previous_expected_start
@@ -1216,11 +1438,6 @@ class Executor:
                         previous_reservation, previous_ownership, stopped=stopped, command_sent=ev_result.command_sent,
                         previous_spending=None if stopped else previous_spending,
                     )
-                    guarded_rollback = True
-                elif stopped:
-                    # A stop may be confirmed before the original cap can be restored.
-                    self.ev_start_feedback_expected_until = None
-                    self._release_ev_grid_reservation()
                     guarded_rollback = True
                 if stopped:
                     await self._async_end_ev_exposure(safe_stop_confirmed=True)
@@ -1244,8 +1461,10 @@ class Executor:
                 self._reconcile_ev_start_feedback_expectation(ev_result)
             # Consume the adapter's confirmation before yielding to notification
             # or ledger I/O. Later power events must supersede this evidence.
-            if not guarded_rollback:
+            if not guarded_rollback and not native_stop:
                 self._reconcile_ev_grid_reservation(action, ev_result, previous_reservation)
+            elif native_stop and not ev_result.applied:
+                self._retain_ev_grid_reservation_when_unloaded()
             vehicle_declined = _ev_expected_refusal(ev_result)
             if ev_result.reason == "ev_vehicle_suspended" or ev_result.post_state.get("vehicle_refusal_feedback"):
                 await self._async_remember_ev_refusal(
@@ -1256,7 +1475,8 @@ class Executor:
             no_change = ev_result.reason == "already_in_desired_state" or vehicle_declined
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             if not _ev_action_wants_power(action) and safe_stop_confirmed:
-                await self._async_end_ev_exposure(safe_stop_confirmed=True)
+                if not native_stop:
+                    await self._async_end_ev_exposure(safe_stop_confirmed=True)
                 if ev_result.applied:
                     await self.async_resolve_restore_notifications("ev")
 
@@ -1276,7 +1496,7 @@ class Executor:
                     )
                 )
             )
-            action_applied = safe_stop_confirmed if planner_owned_stop else ev_result.applied
+            action_applied = safe_stop_confirmed if planner_owned_stop and not native_stop else ev_result.applied
             if action_applied and _ev_action_wants_power(action):
                 await self._async_dismiss_plan_fallback_notification(
                     self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID)
@@ -1291,7 +1511,7 @@ class Executor:
                 "ev_stop_not_confirmed"
                 if planner_owned_stop and ev_result.applied and not safe_stop_confirmed
                 else "ev_safe_stop_compensated"
-                if planner_owned_stop and safe_stop_confirmed and not ev_result.applied
+                if planner_owned_stop and not native_stop and safe_stop_confirmed and not ev_result.applied
                 else ev_result.reason
             )
             if ev_result.command_sent:
@@ -1299,12 +1519,13 @@ class Executor:
             if (not action_applied and not vehicle_declined
                     and (ev_start_rejection is None or not guarded_rollback)):
                 pause_duration = ACTION_BACKOFF_DURATION
-                retry_limit_reached = planner_owned_stop and _ev_safety_stop_attempt_limit_reached(
+                stop_unconfirmed = not safe_stop_confirmed
+                retry_limit_reached = planner_owned_stop and stop_unconfirmed and _ev_safety_stop_attempt_limit_reached(
                     self.store.data.get("execution_audit"),
                     now,
                     additional_failures=1,
                 )
-                if planner_owned_stop or (safety_ev_stop and ev_result.command_sent):
+                if stop_unconfirmed and (planner_owned_stop or (safety_ev_stop and ev_result.command_sent)):
                     await self._async_record_ev_safety_stop_failure(
                         now,
                         retry_limit_reached=retry_limit_reached,
@@ -1319,14 +1540,14 @@ class Executor:
                     now,
                     result_reason,
                     pause_duration,
-                    safety_stop_failure=planner_owned_stop,
+                    safety_stop_failure=planner_owned_stop and stop_unconfirmed,
                 )
             if planner_owned_stop and not action_applied and self.entry_id:
                 # Let another controllable EV shed load after this claimant
                 # failed, while retaining this entry's uncertain reservation.
                 self._clear_ev_grid_shedding_claim(self.entry_id)
             await self.async_persist_ev_grid_reservation()
-            if action_applied and planner_owned_stop:
+            if action_applied and planner_owned_stop and not native_stop:
                 ownership_data = dict(self.store.data.get("ownership", {}))
                 for key in _EV_OWNERSHIP_KEYS:
                     ownership_data.pop(key, None)
@@ -2067,6 +2288,69 @@ class Executor:
         """Restore planner ownership state and notify the user."""
         return await self._async_restore_safe_state(reason, assets=None, preserve_export_retry=preserve_export_retry)
 
+    def ev_restore_feedback(self) -> EVRestoreFeedback:
+        """Describe the saved feedback used to restore owned or reserved charging."""
+        ownership = self.store.data.get("ownership", {})
+        command_entity = ownership.get(_EV_COMMAND_ENTITY_OWNERSHIP_KEY)
+        saved_state = ownership.get("ev_smart_charging_state")
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "")
+        if not saved_state and not _planner_controlled_ev_reservation(reservation):
+            return EVRestoreFeedback()
+        entry_data = self._ev_restore_entry_data(ownership)
+        controls = (command_entity, entry_data.get(CONF_EV_CHARGER), entry_data.get(CONF_EV_SMART_CHARGING))
+        saved_limit = saved_state.get("ev_power_limit_entity") if isinstance(saved_state, dict) else None
+        saved_unit = saved_state.get("ev_power_limit_unit") if isinstance(saved_state, dict) else None
+        return EVRestoreFeedback(
+            control_entity_ids=tuple(target for target in controls if isinstance(target, str) and target),
+            charging_entity_id=entry_data.get(CONF_EV_CHARGING),
+            connection_entity_id=entry_data.get(CONF_EV_CONNECTED),
+            power_entity_id=entry_data.get("ev_power_entity") if saved_limit is not None else None,
+            native_limit_entity_id=entry_data.get("ev_power_limit_entity"),
+            native_limit_value=finite(saved_limit),
+            native_limit_unit=saved_unit,
+        )
+
+    def _ev_restore_entry_data(self, ownership: dict[str, Any]) -> dict[str, Any]:
+        topology = ownership.get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
+        if not isinstance(topology, dict):
+            return self.entry_data
+        capacity_inputs = ownership.get(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY, {})
+        connected = capacity_inputs.get(CONF_EV_CONNECTED) if isinstance(capacity_inputs, dict) else None
+        return {**topology, CONF_EV_CONNECTED: connected} if isinstance(connected, str) else dict(topology)
+
+    def managed_ev_feedback(self, entry_data: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Use the original EV meter and limiter until control is released."""
+        topology = self.store.data.get("ownership", {}).get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
+        data = topology if isinstance(topology, dict) else entry_data
+        return data.get("ev_power_entity"), data.get("ev_power_limit_entity")
+
+    def remapped_owned_ev_feedback(self, entry_data: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Return original power and native-cap sources missing from the current watch."""
+        power_id, limit_id = self.managed_ev_feedback(entry_data)
+        current_power = entry_data.get("ev_power_entity")
+        current_limit = entry_data.get("ev_power_limit_entity")
+        return (
+            power_id if power_id != current_power or (limit_id and not current_limit) else None,
+            limit_id if limit_id != current_limit else None,
+        )
+
+    def hvac_restore_entity_ids(self) -> tuple[str, ...]:
+        """Return saved actuator and guard inputs needed by HVAC restoration."""
+        from .daikin_memory import owned_control_data
+
+        ownership = self.store.data.get("ownership", {})
+        automations = ownership.get("climate_automations", {})
+        control = ownership.get("hvac_control", {})
+        if not automations and not control:
+            return ()
+        data = owned_control_data(self.entry_data, control)
+        targets = [*automations, *control.get("zone_states", {})]
+        for key in (CONF_DAIKIN_CLIMATE, CONF_CLIMATE_CHANGE_FROM_SCHEDULER, CONF_CLIMATE_SCHEDULER_GUARD_TIMER):
+            if isinstance(entity := data.get(key), str) and entity:
+                targets.append(entity)
+        return tuple(dict.fromkeys(targets))
+
     async def async_restore_device_control(self, asset: str, reason: str) -> ActionOutcome:
         """Restore planner ownership for exactly one device control area."""
         if asset not in {"ev", "daikin", "enphase", EXPORT_ASSET}:
@@ -2081,6 +2365,19 @@ class Executor:
         preserve_export_retry: bool = False,
     ) -> ActionOutcome:
         """Restore all planner ownership or the selected device control areas."""
+        with ExitStack() as observations:
+            return await self._async_restore_devices(
+                reason, assets=assets, preserve_export_retry=preserve_export_retry, observations=observations,
+            )
+
+    async def _async_restore_devices(
+        self,
+        reason: str,
+        *,
+        assets: set[str] | None,
+        preserve_export_retry: bool,
+        observations: ExitStack,
+    ) -> ActionOutcome:
         command_guard = self.ev_command_guard()
         now = dt_util.utcnow()
         ownership = dict(self.store.data.get("ownership", {}))
@@ -2088,10 +2385,11 @@ class Executor:
         results: list[EVCommandResult | HVACCommandResult | EnphaseCommandResult] = []
         reasons = [reason]
         restore_failed = False
+        ev_save_error: Exception | None = None
+        native_release: _NativeEVRelease | None = None
 
         ev_state = dict(ownership.get("ev_smart_charging_state", {}))
         ev_command_entity_id = ownership.get(_EV_COMMAND_ENTITY_OWNERSHIP_KEY)
-        ev_control_topology = ownership.get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
         reservations = self._ev_grid_reservations()
         current_reservation = (
             reservations.get(self.entry_id) if self.entry_id and isinstance(reservations, dict) else None
@@ -2105,7 +2403,9 @@ class Executor:
         restore_ev = (assets is None or "ev" in assets) and command_guard() and self.ev_restore_guard()
         hvac_in_scope = assets is None or "daikin" in assets
         restore_hvac = hvac_in_scope and self.hvac_restore_guard()
-        restore_enphase = assets is None or "enphase" in assets
+        restore_enphase = (assets is None or "enphase" in assets) and (
+            enphase_owned or reason != "startup_recovery_save_failed"
+        )
         if assets is None and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
             preserve_export = preserve_export_retry or reason in {
                 "startup_grace_unsafe", "startup_auto_recovery", "startup_control_paused",
@@ -2141,9 +2441,7 @@ class Executor:
         elif self.hass is not None:
             if restore_ev and (ev_state or has_ev_reservation):
                 try:
-                    ev_entry_data = (
-                        dict(ev_control_topology) if isinstance(ev_control_topology, dict) else self.entry_data
-                    )
+                    ev_entry_data = self._ev_restore_entry_data(ownership)
                     ev_adapter = EVChargerAdapter(
                         self.hass,
                         ev_entry_data,
@@ -2151,6 +2449,8 @@ class Executor:
                         confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                         confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
                     )
+                    if "ev_power_limit_entity" in ev_state:
+                        self._observe_native_ev_adapter(observations, ev_adapter, ev_entry_data)
                     ev_stop_required = assets == {"ev"} and reason in {"ev_control_disabled", "ev_allocation_expired"}
                     if ev_stop_required and "ev_power_limit_entity" not in ev_state:
                         # Disabling control or expiring a charging lease requires
@@ -2174,23 +2474,33 @@ class Executor:
                     failed_assets.add("ev")
                     self._retain_ev_grid_reservation_when_unloaded()
                 else:
+                    restore_active_baseline = not ev_stop_required and _restored_ev_baseline_is_active(ev_state)
+                    release_native = "ev_power_limit_entity" in ev_state
+                    if release_native and _ev_result_proves_safe(ev_result):
+                        native_release = _NativeEVRelease(
+                            ev_adapter, ev_result, ev_result.stopped_at or dt_util.utcnow(), len(results), len(reasons),
+                            restore_active_baseline,
+                        )
+                    elif not release_native and _ev_result_proves_safe(ev_result):
+                        try:
+                            await self._async_end_ev_exposure(safe_stop_confirmed=True)
+                        except Exception as error:
+                            ev_save_error = error
                     results.append(ev_result)
                     reasons.append(ev_result.reason)
-                    if _ev_result_proves_safe(ev_result):
-                        await self._async_end_ev_exposure(safe_stop_confirmed=True)
-                    if ev_result.applied:
+                    if not ev_result.applied:
+                        restore_failed = True
+                        failed_assets.add("ev")
+                        self._retain_ev_grid_reservation_when_unloaded()
+                    elif native_release is None:
                         for key in _EV_OWNERSHIP_KEYS:
                             remaining_ownership.pop(key, None)
-                        if not ev_stop_required and _restored_ev_baseline_is_active(ev_state):
+                        if restore_active_baseline:
                             self._retain_external_ev_grid_reservation(
                                 ev_entry_data, capacity_inputs=ownership.get(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY),
                             )
                         else:
                             self._release_ev_grid_reservation()
-                    else:
-                        restore_failed = True
-                        failed_assets.add("ev")
-                        self._retain_ev_grid_reservation_when_unloaded()
 
             restore_hvac = restore_hvac and self.hvac_restore_guard()
             if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
@@ -2364,7 +2674,11 @@ class Executor:
             for key in _EV_OWNERSHIP_KEYS:
                 remaining_ownership.pop(key, None)
 
-        await self.async_persist_ev_grid_reservation()
+        try:
+            await self.async_persist_ev_grid_reservation()
+        except Exception as error:
+            # Release the other devices through their own safety and persistence gates.
+            ev_save_error = ev_save_error or error
         export_result = None
         if restore_export and self.hass is not None and ownership.get(EXPORT_ASSET, {}).get("baseline"):
             export_result, export_reason, _sent = await ExportLimitControl(
@@ -2390,6 +2704,58 @@ class Executor:
             copy_pending_confirmation(
                 remaining_ownership["hvac_control"], self.store.data.get("ownership", {}).get("hvac_control"),
             )
+        if native_release is not None:
+            ev_adapter = native_release.adapter
+            restore_active_baseline = native_release.restore_active_baseline
+
+            settled = False
+            ev_result = native_release.result
+            if ev_save_error is None:
+                try:
+                    ev_result, settled = await self._async_publish_native_ev_stop(
+                        ev_adapter, native_release.result, ev_state, native_release.stopped_at,
+                        retain_external=restore_active_baseline,
+                    )
+                except Exception as error:
+                    ev_save_error = error
+            if ev_save_error is not None and not settled:
+                ev_result = ev_adapter.revalidate_native_restore(ev_result, ev_state)
+                if ev_result.applied:
+                    ev_result = replace(ev_result, applied=False, reason="ev_restore_retry_needed")
+            if settled:
+                if ev_result.applied and restore_active_baseline:
+                    self._retain_external_ev_grid_reservation(
+                        ev_entry_data, capacity_inputs=ownership.get(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY),
+                    )
+                    try:
+                        await self.async_persist_ev_grid_reservation()
+                    except Exception as error:
+                        ev_save_error = error
+                elif ev_result.applied:
+                    self._release_ev_grid_reservation()
+                if callable(self.ev_allocation_deadline_callback):
+                    self.ev_allocation_deadline_callback(None)
+                if ev_result.applied:
+                    for key in _EV_OWNERSHIP_KEYS:
+                        remaining_ownership.pop(key, None)
+            if not ev_result.applied:
+                results[native_release.result_index] = ev_result
+                reasons[native_release.reason_index] = ev_result.reason
+                restore_failed = True
+                failed_assets.add("ev")
+                self._retain_ev_grid_reservation_when_unloaded()
+                try:
+                    await self.async_persist_ev_grid_reservation()
+                except Exception as error:
+                    ev_save_error = ev_save_error or error
+            # Merge other device outcomes without restoring untouched ownership fields.
+            live_ownership = dict(self.store.data.get("ownership", {}))
+            for key in ownership.keys() - remaining_ownership.keys():
+                live_ownership.pop(key, None)
+            live_ownership.update({
+                key: value for key, value in remaining_ownership.items() if ownership.get(key, _MISSING) != value
+            })
+            remaining_ownership = live_ownership
         await self.store.async_save_ownership(remaining_ownership)
         pre_state: dict[str, Any] = {}
         post_state: dict[str, Any] = {}
@@ -2422,7 +2788,102 @@ class Executor:
             restored_assets=attempted_assets - failed_assets - pending_assets,
             unresolved_assets=failed_assets | pending_assets,
         )
+        if ev_save_error is not None:
+            raise ev_save_error
         return outcome
+
+    async def _async_publish_native_ev_stop(
+        self,
+        adapter: EVChargerAdapter,
+        result: EVCommandResult,
+        saved_state: dict[str, Any],
+        stopped_at: datetime,
+        *,
+        retain_external: bool = False,
+        release_capacity_on_stop: bool = False,
+    ) -> tuple[EVCommandResult, bool]:
+        """Publish stop bookkeeping and, when the cap is restored, native ownership release."""
+        candidate = result
+        evidence = adapter.native_restore_stop_evidence()
+        if evidence is None:
+            return adapter.revalidate_native_restore(result, saved_state), False
+        stopped_at = evidence.settlement_time(stopped_at)
+        activity_at = evidence.activity_at
+
+        def stage() -> dict[str, Any]:
+            changes: dict[str, Any] = {}
+            if candidate.applied:
+                changes["ownership"] = {
+                    key: value for key, value in self.store.data.get("ownership", {}).items()
+                    if key not in _EV_OWNERSHIP_KEYS
+                }
+            if not retain_external and (candidate.applied or release_capacity_on_stop):
+                changes["ev_grid_reservation"] = {"active": False}
+            if (limits := self._confirmed_ev_stop_limits(stopped_at)) is not None:
+                changes["command_rate_limits"] = limits
+            if (telemetry := self._settled_ev_exposure(stopped_at)) is not None:
+                changes["ev_telemetry"] = telemetry
+            return changes
+
+        def is_current() -> bool:
+            current = adapter.native_restore_stop_evidence()
+            return (
+                current is not None and current.activity_at == activity_at
+                and current.settlement_time(stopped_at) == stopped_at
+                and (not candidate.applied or adapter.native_restore_limit_is_current(saved_state))
+            )
+
+        if await self.store.async_publish_ev_release(stage, is_current):
+            return result, True
+        candidate = adapter.revalidate_native_restore(result, saved_state)
+        latest = adapter.native_restore_stop_evidence()
+        if _ev_result_proves_safe(candidate) and latest is not None:
+            activity_at = latest.activity_at
+            stopped_at = latest.settlement_time(stopped_at)
+            # Restage once with current bookkeeping if evidence changed during the save.
+            if await self.store.async_publish_ev_release(stage, is_current):
+                return candidate, True
+            candidate = adapter.revalidate_native_restore(candidate, saved_state)
+        if candidate.applied:
+            candidate = replace(candidate, applied=False, reason="ev_restore_retry_needed")
+        return candidate, False
+
+    async def _async_settle_native_stop(
+        self, adapter: EVChargerAdapter, result: EVCommandResult, saved_state: dict[str, Any],
+        *, release_capacity_on_stop: bool = False,
+    ) -> tuple[EVCommandResult, bool]:
+        stopped_at = result.stopped_at or dt_util.utcnow()
+        try:
+            await self.async_persist_ev_grid_reservation()
+            updated, settled = await self._async_publish_native_ev_stop(
+                adapter, result, saved_state, stopped_at, release_capacity_on_stop=release_capacity_on_stop,
+            )
+        except (Exception, asyncio.CancelledError):
+            try:
+                await self.async_persist_ev_grid_reservation()
+            except Exception:  # Keep the original failure and retain dirty evidence for recovery.
+                _LOGGER.exception("Could not persist the retained EV grid reservation")
+            raise
+        if settled:
+            if updated.applied or release_capacity_on_stop:
+                self._release_ev_grid_reservation()
+            if callable(self.ev_allocation_deadline_callback):
+                self.ev_allocation_deadline_callback(None)
+        return updated, settled
+
+    async def _async_settle_guarded_cap_stop(
+        self, adapter: EVChargerAdapter, result: EVCommandResult,
+    ) -> tuple[EVCommandResult, bool]:
+        """Admit a metered start compensation through the native stop ledger."""
+        if result.applied or result.safe_state_confirmed is not True:
+            return result, False
+        saved = (result.post_state if result.power_limit_superseded else
+                 self.store.data.get("ownership", {}).get("ev_smart_charging_state", {}))
+        stop = replace(result, applied=result.rollback_succeeded is True)
+        updated, settled = await self._async_settle_native_stop(adapter, stop, saved, release_capacity_on_stop=True)
+        if settled:
+            self.ev_start_feedback_expected_until = None
+        return replace(result, safe_state_confirmed=settled, rollback_succeeded=settled and updated.applied), settled
 
     def _dry_off_start_finished(self) -> bool:
         """Verify the provisional start before retiring its Dry-only release."""
@@ -3136,18 +3597,30 @@ class Executor:
             return "ev_external_reservation_topology_changed" if _ev_action_wants_power(action) else None, None
         if _ev_action_wants_power(action) and reservations.get(self.entry_id, {}).get("pending_power_limit"):
             self.sync_ev_grid_reservation()
-        pending = reservations.get(self.entry_id, {}).get("pending_power_limit")
-        confirmed_at = reservations.get(self.entry_id, {}).get("confirmed_power_at")
+        previous_feedback = reservations.get(self.entry_id, {})
         result = reserve_ev_grid_capacity(reservations, self.entry_id, action, context, now, self.options)
         if result[0] is None and _ev_action_wants_power(action):
             # Planning can replace executor inputs during an acquisition.
             # Read feedback and any restored cap on the original charger.
             entry_data = dict(self.entry_data)
-            self._provisional_ev_capacity = (entry_data, self._ev_capacity_inputs(entry_data))
-        if pending and self.entry_id in reservations:
-            reservations[self.entry_id]["pending_power_limit"] = pending
-        if confirmed_at and self.entry_id in reservations:
-            reservations[self.entry_id]["confirmed_power_at"] = confirmed_at
+            self._provisional_ev_capacity = _ProvisionalEVCapacity(
+                entry_data, self._ev_capacity_inputs(entry_data), _positive_float(previous_feedback.get("load_kw")),
+            )
+            reservation = reservations[self.entry_id]
+            for key in (
+                "pending_power_limit", "confirmed_power_at", "confirmed_cap_kw", "observed_load_at",
+                "observed_load_kw", "observed_report_kw", "observed_activity_at", "cap_reduction",
+                EV_RETIRED_CAP_KW,
+            ):
+                if value := previous_feedback.get(key):
+                    reservation[key] = value
+            requested_cap = action.desired_state.get("power_limit")
+            if (previous_feedback.get("confirmed_power_limit") is True
+                    and isinstance(requested_cap, dict)
+                    and requested_cap.get("entity_id") == entry_data.get("ev_power_limit_entity")
+                    and finite(requested_cap.get("physical_power_kw"))
+                    == reservation["load_kw"] == previous_feedback.get("load_kw")):
+                reservation["confirmed_power_limit"] = True
         return result
 
     def _ev_start_headroom_available(self, action: ControlAction, context: DecisionContext | None) -> bool:
@@ -3166,28 +3639,38 @@ class Executor:
             _positive_float(self.options.get(CONF_GRID_IMPORT_LIMIT_KW)),
         ) is None
 
-    async def _async_end_ev_exposure(self, *, safe_stop_confirmed: bool = False) -> None:
+    def _confirmed_ev_stop_limits(self, stopped_at: datetime) -> dict[str, Any] | None:
         limits = dict(self.store.data.get("command_rate_limits", {}))
-        if safe_stop_confirmed and (
+        if (
             _EV_SAFETY_STOP_FAILED_AT_KEY in limits or _ev_safety_stop_backoff_active(
-                self.store.data.get("execution_audit"), dt_util.utcnow(), limits=limits,
+                self.store.data.get("execution_audit"), stopped_at, limits=limits,
             )
         ):
             # A proven safe stop closes the failed command episode. Retain an
             # acknowledgement so historical audit failures cannot revive it.
             limits.pop(_EV_SAFETY_STOP_FAILED_AT_KEY, None)
-            limits[_EV_SAFE_STOP_CONFIRMED_AT_KEY] = dt_util.utcnow()
-            await self.store.async_save_command_rate_limits(limits)
-        if callable(self.ev_allocation_deadline_callback):
-            self.ev_allocation_deadline_callback(None)
+            limits[_EV_SAFE_STOP_CONFIRMED_AT_KEY] = stopped_at
+            return limits
+        return None
+
+    def _settled_ev_exposure(self, stopped_at: datetime) -> dict[str, Any] | None:
         telemetry = self.store.data.get("ev_telemetry", {})
         if telemetry.get("command_exposure"):
-            telemetry = settle_spending(telemetry, dt_util.utcnow())
+            telemetry = settle_spending(telemetry, stopped_at)
             telemetry.pop("command_exposure", None)
             # The preceding sample is no longer an unmetered billing exposure.
             # Keep the physical reservation independent for unresolved recovery.
             if isinstance(last_sample := telemetry.get("last_sample"), dict):
                 telemetry["last_sample"] = {**last_sample, "reserved_kw": 0}
+            return telemetry
+        return None
+
+    async def _async_end_ev_exposure(self, *, safe_stop_confirmed: bool = False) -> None:
+        if safe_stop_confirmed and (limits := self._confirmed_ev_stop_limits(dt_util.utcnow())) is not None:
+            await self.store.async_save_command_rate_limits(limits)
+        if callable(self.ev_allocation_deadline_callback):
+            self.ev_allocation_deadline_callback(None)
+        if (telemetry := self._settled_ev_exposure(dt_util.utcnow())) is not None:
             await self.store.async_save_ev_telemetry(telemetry)
 
     def _reconcile_ev_grid_reservation(
@@ -3197,12 +3680,14 @@ class Executor:
         previous_reservation: dict[str, Any] | None,
     ) -> None:
         """Reconcile a provisional reservation with the command outcome."""
+        provisional = self._provisional_ev_capacity
         self._provisional_ev_capacity = None
         wants_power = _ev_action_wants_power(action)
         rollback_succeeded = getattr(result, "rollback_succeeded", None) is True
         command_sent = bool(getattr(result, "command_sent", False))
-        confirmed_power = _positive_float(getattr(result, "post_state", {}).get("confirmed_power_kw"))
-        pending = getattr(result, "post_state", {}).get("pending_power_limit")
+        post_state = getattr(result, "post_state", {})
+        confirmed_power = _positive_float(post_state.get("confirmed_power_kw"))
+        pending = post_state.get("pending_power_limit")
         reservations = self._ev_grid_reservations()
         if reservations is not None and self.entry_id and self._external_ev_topology_changed(
             reservations.get(self.entry_id), action,
@@ -3211,24 +3696,42 @@ class Executor:
         if (wants_power and result.applied and isinstance(pending, dict)
                 and reservations is not None and self.entry_id in reservations):
             reservation = reservations[self.entry_id]
-            previous_pending = (previous_reservation or {}).get("pending_power_limit", {})
-            # A no-op must not move the original confirmation boundary forward.
-            reservation["pending_power_limit"] = previous_pending if (
-                isinstance(previous_pending, dict)
-                and all(previous_pending.get(key) == pending.get(key)
+            now = dt_util.utcnow()
+            check_ev_cap_feedback_clock(reservation, now)
+            retained_pending = reservation.get("pending_power_limit")
+            same_pending_limit = (
+                isinstance(retained_pending, dict)
+                and all(retained_pending.get(key) == pending.get(key)
                         for key in ("entity_id", "value", "unit", "physical_power_kw"))
-            ) else pending
+            )
+            confirmed_cap = finite(reservation.get("confirmed_cap_kw"))
+            retired_cap = finite(reservation.get(EV_RETIRED_CAP_KW))
+            requested_cap = finite(pending.get("physical_power_kw"))
+            same_confirmed_limit = (
+                (requested_cap is not None and requested_cap in (confirmed_cap, retired_cap))
+                or (confirmed_cap is None and timestamp(reservation.get("confirmed_power_at")) is not None)
+            )
+            if getattr(result, "power_limit_written", False) or (not same_pending_limit and not same_confirmed_limit):
+                reservation["pending_power_limit"] = pending
+                if check_ev_cap_feedback_clock(reservation, now)[1]:
+                    confirmed_power = 0
+            elif not same_pending_limit:
+                # Reading the same setting without a write cannot renew an
+                # already consumed cap or retire a subsequent physical peak.
+                confirmed_power = 0
         if wants_power and result.applied and confirmed_power > 0:
-            reservations = self._ev_grid_reservations()
             if reservations is not None and self.entry_id and self.entry_id in reservations:
-                reservations[self.entry_id]["load_kw"] = confirmed_power
-                reservations[self.entry_id]["observed_load_kw"] = confirmed_power
-                reservations[self.entry_id]["confirmed_power_at"] = (
-                    timestamp(getattr(result, "post_state", {}).get("confirmed_power_at")) or dt_util.utcnow()
-                ).isoformat()
-                reservations[self.entry_id]["confirmed_power_limit"] = True
-                reservations[self.entry_id].pop("pending_power_limit", None)
-                reservations[self.entry_id].pop("observed_limit_kw", None)
+                reservation = reservations[self.entry_id]
+                now = dt_util.utcnow()
+                check_ev_cap_feedback_clock(reservation, now)
+                confirmed_at = timestamp(post_state.get("confirmed_power_at")) or now
+                if confirmed_at > now:
+                    invalidate_ev_cap_feedback_clock(reservation)
+                    reservation[EV_RETIRED_CAP_KW] = confirmed_power
+                    return
+                if not _ev_cap_report_is_current(reservation, confirmed_power, confirmed_at):
+                    return
+                _record_ev_cap_confirmation(reservation, confirmed_power, confirmed_at)
         if wants_power and not result.applied:
             if rollback_succeeded:
                 self._release_ev_grid_reservation()
@@ -3236,7 +3739,7 @@ class Executor:
                 if previous_reservation is None:
                     self._release_ev_grid_reservation()
                 else:
-                    self._restore_ev_grid_reservation(previous_reservation)
+                    self._restore_ev_grid_reservation(previous_reservation, provisional=provisional)
             else:
                 self._retain_ev_grid_reservation_when_unloaded()
         elif not wants_power:
@@ -3258,11 +3761,54 @@ class Executor:
 
     def _restore_ev_grid_reservation(
         self, reservation: dict[str, Any], *, cap_rollback_confirmed: bool = False,
+        provisional: _ProvisionalEVCapacity | None = None,
     ) -> None:
         """Restore a prior reservation while retaining independent feedback."""
+        provisional = provisional or self._provisional_ev_capacity
         reservations = self._ev_grid_reservations()
         if reservations is not None and self.entry_id:
             current = reservations.get(self.entry_id, {})
+            pending = reservation.get("pending_power_limit")
+            if isinstance(pending, dict) and pending.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is True:
+                reservation = dict(reservation)
+                invalidate_ev_cap_feedback_clock(reservation)
+            elif ("confirmed_power_at" in reservation and isinstance(proof := reservation.get("cap_reduction"), dict)
+                  and proof.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is True):
+                # The shared proof was retired while its snapshot still held the old timestamp.
+                reservation = dict(reservation)
+                reservation.pop("confirmed_power_at")
+            confirmed_at = timestamp(current.get("confirmed_power_at"))
+            previous_confirmation = timestamp(reservation.get("confirmed_power_at"))
+            confirmed_load = _positive_float(current.get("load_kw"))
+            if (not cap_rollback_confirmed and confirmed_load > 0 and confirmed_at is not None
+                    and (previous_confirmation is None or confirmed_at > previous_confirmation)):
+                # An unsent acquisition can still confirm the previous command's reduction.
+                reservation = {
+                    **reservation,
+                    "load_kw": confirmed_load,
+                    "observed_load_kw": _positive_float(current.get("observed_load_kw")) or confirmed_load,
+                    "confirmed_power_at": confirmed_at.isoformat(),
+                }
+                _copy_retained_ev_cap_evidence(reservation, current)
+            elif (current and previous_confirmation is not None
+                  and (confirmed_at is None or confirmed_at < previous_confirmation)
+                  and isinstance(reduction := reservation.get("cap_reduction"), dict)):
+                # A contradictory sample can retract the snapshot's proof while
+                # the acquisition is saving. Later reports may have moved on
+                # from that sample by the time we restore the snapshot.
+                reservation = dict(reservation)
+                if provisional is not None and not cap_rollback_confirmed:
+                    reservation["load_kw"] = max(
+                        _positive_float(reservation.get("load_kw")), provisional.retained_load_kw,
+                    )
+                    _copy_retained_ev_cap_evidence(reservation, current)
+                else:
+                    _reopen_ev_cap_reduction(reservation, reduction)
+            elif (confirmed_at == previous_confirmation
+                  and current.get("cap_reduction") != reservation.get("cap_reduction")
+                  and isinstance(proof := current.get("cap_reduction"), dict)):
+                # The newest proof can survive while older evidence is disputed.
+                reservation = {**reservation, "cap_reduction": _retained_ev_cap_proof(proof)}
             observed_kw = _positive_float(current.get("observed_load_kw"))
             observed_limit_kw = _positive_float(current.get("observed_limit_kw"))
             if cap_rollback_confirmed and (live_limit_kw := self._live_ev_grid_limit_kw()) is not None:
@@ -3279,11 +3825,17 @@ class Executor:
                 if observed_limit_kw > _positive_float(reservation.get("observed_limit_kw")):
                     reservation["observed_limit_kw"] = observed_limit_kw
                 reservation.pop("confirmed_power_limit", None)
-            if (reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
-                    and (reported := timestamp(current.get("observed_load_at"))) is not None):
+            if (reported := timestamp(current.get("observed_load_at"))) is not None:
                 # An equally high sample can still supersede older stop evidence.
-                previous_report = timestamp(reservation.get("observed_load_at")) or reported
-                reservation = {**reservation, "observed_load_at": max(reported, previous_report).isoformat()}
+                reservation = dict(reservation)
+                report_kw = _positive_float(current.get("observed_report_kw")) or observed_kw or confirmed_load
+                _retain_ev_cap_readback(reservation, report_kw, reported)
+                _note_ev_draw_report(reservation, report_kw, reported)
+            if (active_at := timestamp(current.get("observed_activity_at"))) is not None and (
+                (previous_active := timestamp(reservation.get("observed_activity_at"))) is None
+                or active_at > previous_active
+            ):
+                reservation["observed_activity_at"] = active_at.isoformat()
             reservations[self.entry_id] = reservation
 
     def _retain_ev_grid_reservation_when_unloaded(self) -> None:
@@ -3304,7 +3856,10 @@ class Executor:
     def _live_ev_grid_limit_kw(self) -> float | None:
         """Read the current physical cap using the acquisition's original settings."""
         assert self.hass is not None
-        entry_data, options = self._provisional_ev_capacity or (self.entry_data, self.options)
+        provisional = self._provisional_ev_capacity
+        entry_data, options = (provisional.entry_data, provisional.options) if provisional else (
+            self.entry_data, self.options,
+        )
         limit_id = entry_data.get("ev_power_limit_entity")
         state = self.hass.states.get(limit_id) if limit_id else None
         limit = power_capability(state, options)
@@ -3352,20 +3907,6 @@ class Executor:
         topology = _external_ev_topology(self.store.data.get("ev_grid_reservation")) or {}
         return (*_ev_stop_inputs(topology), topology.get("ev_power_limit_entity"), topology.get(CONF_EV_CONNECTED))
 
-    def _external_ev_limit_supported(self, topology: dict[str, Any], observed_load_kw: float) -> bool:
-        """Require connection and evidence of activity before counting an external cap."""
-        from .ev import ev_charging_state_proves_active
-
-        if connection(state_value(self.hass, topology.get(CONF_EV_CONNECTED))) is False:
-            return False
-        if observed_load_kw > 0:
-            return True
-        charging = state_value(self.hass, topology.get(CONF_EV_CHARGING))
-        control = topology.get(CONF_EV_CHARGER) or topology.get(CONF_EV_SMART_CHARGING)
-        return ev_charging_state_proves_active(charging) or (
-            charging in STATE_UNKNOWN_VALUES and connection(state_value(self.hass, control)) is True
-        )
-
     def _retain_observed_ev_load_after_rollback(self, *, command_sent: bool) -> bool:
         """Keep independent charger load when a first start is rolled back."""
         reservations = self._ev_grid_reservations()
@@ -3376,7 +3917,8 @@ class Executor:
             return False
         assert self.hass is not None
         self.sync_ev_grid_reservation()
-        entry_data, capacity_inputs = self._provisional_ev_capacity or (
+        provisional = self._provisional_ev_capacity
+        entry_data, capacity_inputs = (provisional.entry_data, provisional.options) if provisional else (
             self.entry_data, self._ev_capacity_inputs(self.entry_data),
         )
         observed_load_kw = _positive_float(current.get("observed_load_kw"))
@@ -3385,7 +3927,7 @@ class Executor:
             # A power callback may have sampled the rejected start's own
             # setpoint. After compensation use the live, restored limit.
             observed_limit_kw = self._live_ev_grid_limit_kw() or 0
-        if observed_limit_kw and not self._external_ev_limit_supported(entry_data, observed_load_kw):
+        if observed_limit_kw and not _external_ev_limit_supported(self.hass, entry_data, observed_load_kw):
             observed_limit_kw = 0
         retained_kw = max(observed_load_kw, observed_limit_kw)
         if not retained_kw:
@@ -3397,8 +3939,10 @@ class Executor:
             "observed_load_kw": observed_load_kw,
             "observed_limit_kw": observed_limit_kw,
         }
-        if "observed_load_at" in current:
-            reservations[self.entry_id]["observed_load_at"] = current["observed_load_at"]
+        reservations[self.entry_id].update({
+            key: current[key] for key in ("observed_load_at", "observed_report_kw", "observed_activity_at")
+            if key in current
+        })
         self._retain_external_ev_grid_reservation(entry_data, capacity_inputs=capacity_inputs)
         self._provisional_ev_capacity = None
         return True
@@ -3419,15 +3963,15 @@ class Executor:
             return False
         latest_stop_feedback = None
         control_id, charging_id, power_id = _ev_stop_inputs(topology)
+        activity_at = timestamp(reservation.get("observed_activity_at"))
+        boundary = max(reserved_at, activity_at or reserved_at)
         if control_id:
-            control = self.hass.states.get(control_id)
-            control_at = _fresh_ev_stop_report(control, now)
+            control, control_at = self._external_ev_stop_source(control_id, now)
             if control_at is None or connection(getattr(control, "state", None)) is not False:
                 return False
             latest_stop_feedback = control_at
         if charging_id:
-            charging = self.hass.states.get(charging_id)
-            charging_at = _fresh_ev_stop_report(charging, now)
+            charging, charging_at = self._external_ev_stop_source(charging_id, now)
             if charging_at is None or not ev_charging_state_proves_safe(getattr(charging, "state", None)):
                 return False
             latest_stop_feedback = max(latest_stop_feedback or charging_at, charging_at)
@@ -3435,72 +3979,177 @@ class Executor:
             return False
         if power_id:
             power_state = self.hass.states.get(power_id)
-            power_at = reported_at(power_state)
+            clock = self._ev_meter_clock(power_state)
+            power_at = current_sample_reported_at(power_state, now, signal_clock=clock)
             observed_at = timestamp(reservation.get("observed_load_at")) or reserved_at
-            return (power_at is not None and power_at > max(reserved_at, observed_at)
+            return (power_at is not None and power_at > max(boundary, observed_at)
                     and measured(power_state, now, "power") == 0)
-        return latest_stop_feedback > reserved_at
+        return latest_stop_feedback > boundary
 
-    async def async_release_stopped_external_ev_grid_capacity(self) -> None:
+    def _external_ev_stop_source(self, entity_id: str, now: datetime) -> tuple[State | None, datetime | None]:
+        assert self.hass is not None
+        state = self.hass.states.get(entity_id)
+        at = current_sample_reported_at(state, now, signal_clock=self._native_ev_signal_clocks.get(entity_id))
+        if at is None and state is not None and "sampled_at_utc" in state.attributes:
+            self.note_external_ev_signal_clock(entity_id, state, None)
+        return state, at
+
+    def release_stopped_external_ev_grid_capacity(self) -> bool:
         """Retire external load accounting without obtaining charger ownership."""
-        if self.external_ev_grid_stop_confirmed():
-            self._release_ev_grid_reservation()
-            await self.async_persist_ev_grid_reservation()
+        if not self.external_ev_grid_stop_confirmed():
+            return False
+        self._release_ev_grid_reservation()
+        return True
 
-    def note_ev_grid_power_report(self, power_state: State) -> bool:
+    def note_ev_grid_power_report(
+        self, power_state: State, *, on_evidence_changed: Callable[[], None] | None = None,
+        received_at: datetime | None = None,
+    ) -> bool:
         """Retain newly usable draw and keep later stop evidence ordered."""
+        now = dt_util.utcnow()
+        clock = self._ev_meter_clock(power_state, received_at)
         reservations = self._ev_grid_reservations() or {}
-        reservation = reservations.get(self.entry_id or "", {})
-        observed = measured(power_state, dt_util.utcnow(), "power")
-        if observed is not None and observed > _positive_float(reservation.get("load_kw")):
-            return self.sync_ev_grid_reservation(power_state=power_state)
-        _note_ev_draw_report(reservation, observed, reported_at(power_state))
+        reservation = reservations.get(self.entry_id or "")
+        if not isinstance(reservation, dict):
+            return self.sync_ev_grid_reservation(
+                power_state=power_state, received_at=received_at, on_evidence_changed=on_evidence_changed,
+            )
+        external_topology = _external_ev_topology(reservation)
+        topology = external_topology
+        if topology is None and self._provisional_ev_capacity is not None:
+            topology = self._provisional_ev_capacity.entry_data
+        if topology is None:
+            topology = self.store.data.get("ownership", {}).get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
+        if isinstance(topology, dict) and power_state.entity_id != topology.get("ev_power_entity"):
+            return False
+        confirmed_at, clock_changed = check_ev_cap_feedback_clock(reservation, now)
+        if clock_changed:
+            increased = self.sync_ev_grid_reservation(
+                power_state=power_state, received_at=received_at, on_evidence_changed=on_evidence_changed,
+            )
+            if not increased:
+                if on_evidence_changed is None:
+                    self._notify_ev_draw_changed(reservation)
+                else:
+                    on_evidence_changed()
+            return increased
+        observed = measured(power_state, now, "power")
+        reported = current_sample_reported_at(power_state, now, received_at=received_at, signal_clock=clock)
+        if reported is None:
+            fallback = unverified_positive_power(power_state, now, received_at)
+            if fallback is None:
+                return False
+            draw, receipt = fallback
+            increased = _raise_ev_draw_reservation(reservation, draw)
+            if _note_ev_activity(reservation, receipt) and not increased:
+                self._notify_ev_draw_changed(reservation)
+            return increased
+        new_external_meter_activity = False
+        if observed and external_topology and external_topology.get("ev_power_limit_entity"):
+            previous_draw = timestamp(reservation.get("observed_load_at"))
+            # An unchanged report can make an old positive meter usable without a state-change event.
+            new_external_meter_activity = previous_draw is None or (now - previous_draw).total_seconds() > 600
+        reduction = reservation.get("cap_reduction")
+        if (
+            "pending_power_limit" in reservation
+            or new_external_meter_activity
+            or (observed is not None and observed > _positive_float(reservation.get("load_kw")))
+            or (isinstance(reduction, dict) and observed is not None and reported is not None
+                and (_ev_cap_readback_changes_proof(reduction, observed, reported) or any(
+                    _ev_cap_readback_changes_proof(proof, observed, reported)
+                    for proof in reduction.get("history", ())
+                )))
+        ):
+            return self.sync_ev_grid_reservation(
+                power_state=power_state, received_at=received_at, on_evidence_changed=on_evidence_changed,
+            )
+        if (observed is not None and observed > 0 and reported is not None
+                and (confirmed_at is None or reported >= confirmed_at)):
+            reservation["observed_load_kw"] = max(_positive_float(reservation.get("observed_load_kw")), observed)
+            if _note_ev_draw_report(reservation, observed, reported):
+                self._notify_ev_draw_changed(reservation)
         return False
 
-    def sync_ev_grid_reservation(self, *, power_state: Any = None, limit_state: State | None = None) -> bool:
+    def sync_ev_grid_reservation(
+        self, *, power_state: Any = None, limit_state: State | None = None, received_at: datetime | None = None,
+        on_evidence_changed: Callable[[], None] | None = None,
+    ) -> bool:
         """Refresh capacity and report whether its retained load increased."""
         reservations = self._ev_grid_reservations()
         if reservations is None or not self.entry_id:
             return False
         reservation = reservations.get(self.entry_id)
-        if not isinstance(reservation, dict):
+        ownership = self.store.data.get("ownership", {})
+        if (reservation is None
+                and "ev_power_limit_entity" not in ownership.get("ev_smart_charging_state", {})):
             return False
-        previous_load_kw = _positive_float(reservation.get("load_kw"))
         topology = _external_ev_topology(reservation)
         # Missing original settings leave measured draw authoritative for an
         # external mapping. Legacy reservations without a mapping use live settings.
-        entry_data, power_options = self._provisional_ev_capacity or (self.entry_data, self.options)
+        provisional = self._provisional_ev_capacity
+        entry_data, power_options = (provisional.entry_data, provisional.options) if provisional else (
+            self.entry_data, self.options,
+        )
+        fixed_source = provisional is not None
         if topology is not None:
+            assert reservation is not None
             entry_data, power_options = topology, reservation.get(EV_RESERVATION_EXTERNAL_POWER_OPTIONS, {})
-        fixed_source = topology is not None or self._provisional_ev_capacity is not None
+            fixed_source = True
+        elif provisional is None:
+            saved_topology = ownership.get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
+            if isinstance(saved_topology, dict):
+                entry_data = saved_topology
+                power_options = ownership.get(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY, self.options)
+                fixed_source = True
+        power_id = entry_data.get("ev_power_entity")
+        if power_state is None or ((fixed_source or reservation is None) and power_state.entity_id != power_id):
+            power_state = self.hass.states.get(power_id) if self.hass and power_id else None
+            received_at = None
+        now = dt_util.utcnow()
+        clock = self._ev_meter_clock(power_state, received_at)
+        reported = current_sample_reported_at(power_state, now, received_at=received_at, signal_clock=clock)
+        fallback = None
+        if reported is None:
+            # A suspicious sample can increase reserved capacity without proving a reduction or stop.
+            fallback = unverified_positive_power(power_state, now, received_at)
+            observed = fallback[0] if fallback is not None else None
+        else:
+            observed = measured(power_state, now, "power")
+        if not isinstance(reservation, dict):
+            # A confirmed stop can retire capacity while the native cap is still owned.
+            draw_at = fallback[1] if fallback is not None else reported
+            if not observed or draw_at is None:
+                return False
+            reservation = reservations[self.entry_id] = {
+                "load_kw": 0.0, "reserved_at": draw_at.isoformat(), EV_RESERVATION_RETAIN_WHEN_UNLOADED: True,
+            }
+        previous_load_kw = _positive_float(reservation.get("load_kw"))
+        activity_changed = fallback is not None and _note_ev_activity(reservation, fallback[1])
         limit_id = entry_data.get("ev_power_limit_entity")
         current_limit = self.hass.states.get(limit_id) if self.hass and limit_id else None
         capability = power_capability(current_limit, power_options)
-        pending = reservation.get("pending_power_limit", {})
-        power_id = entry_data.get("ev_power_entity")
-        if power_state is None or (fixed_source and power_state.entity_id != power_id):
-            power_state = self.hass.states.get(power_id) if self.hass and power_id else None
-        observed, reported = measured(power_state, dt_util.utcnow(), "power"), reported_at(power_state)
-        confirmed_at = timestamp(reservation.get("confirmed_power_at"))
+        confirmed_at, clock_changed = check_ev_cap_feedback_clock(reservation, now)
+        proof_changed = _retain_ev_cap_readback(reservation, observed, reported, provisional)
         if confirmed_at is not None and reported is not None and reported < confirmed_at:
             # A queued event must retain physical peaks, but cannot undo a
             # reduction proven by a newer sample. Keep this boundary after a
             # subsequent increase so older events cannot revive retired peaks.
             observed = None
-        _note_ev_draw_report(reservation, observed, reported)
+        pending = reservation.get("pending_power_limit", {})
         command_at = timestamp(pending.get("at")) if isinstance(pending, dict) else None
-        if (capability is not None and command_at is not None and reported is not None and reported >= command_at
-                and pending.get("version") == 1 and pending.get("entity_id") == limit_id
-                and pending.get("unit") == capability.unit and finite(pending.get("value")) == capability.current
-                and finite(pending.get("physical_power_kw")) == capability.current * capability.kw_per_unit
-                and observed is not None and observed <= capability.current * capability.kw_per_unit + .01):
-            reservation["load_kw"] = capability.current * capability.kw_per_unit
-            reservation["observed_load_kw"] = reservation["load_kw"]
+        confirmed_limit = (
+            capability is not None and command_at is not None and reported is not None and reported >= command_at
+            and _ev_cap_report_is_current(reservation, capability.current * capability.kw_per_unit, reported)
+            and pending.get("version") == 1 and pending.get("entity_id") == limit_id
+            and pending.get("unit") == capability.unit and finite(pending.get("value")) == capability.current
+            and finite(pending.get("physical_power_kw")) == capability.current * capability.kw_per_unit
+            and observed is not None and observed <= capability.current * capability.kw_per_unit + .01
+        )
+        draw_changed = _note_ev_draw_report(reservation, observed, reported)
+        if confirmed_limit:
+            assert capability is not None and reported is not None
             confirmed_at = reported
-            reservation["confirmed_power_at"] = reported.isoformat()
-            reservation["confirmed_power_limit"] = True
-            reservation.pop("pending_power_limit", None)
-            reservation.pop("observed_limit_kw", None)
+            _record_ev_cap_confirmation(reservation, capability.current * capability.kw_per_unit, reported, provisional)
         observed_limit_kw = capability.current * capability.kw_per_unit if capability is not None else 0
         if (limit_state is not None and limit_state is not current_limit
                 and (not fixed_source or limit_state.entity_id == limit_id)):
@@ -3512,7 +4161,7 @@ class Executor:
                 observed_limit_kw = max(observed_limit_kw, event_capability.current * event_capability.kw_per_unit)
         if (
             topology is not None and observed_limit_kw
-            and not self._external_ev_limit_supported(topology, observed or 0)
+            and not _external_ev_limit_supported(self.hass, topology, observed or 0)
         ):
             observed_limit_kw = 0
         still_confirmed = bool(reservation.get("confirmed_power_limit") and capability is not None
@@ -3536,16 +4185,31 @@ class Executor:
                 observed or 0,
             )
         reservation["limit_kw"] = _positive_float(self.options.get(CONF_GRID_IMPORT_LIMIT_KW))
-        return _positive_float(reservation.get("load_kw")) > previous_load_kw
+        increased = _positive_float(reservation.get("load_kw")) > previous_load_kw
+        if (confirmed_limit or proof_changed or (clock_changed and not increased)) and on_evidence_changed is not None:
+            on_evidence_changed()
+        elif not increased and (activity_changed or clock_changed or draw_changed):
+            self._notify_ev_draw_changed(reservation)
+        return increased
+
+    def _notify_ev_draw_changed(self, reservation: dict[str, Any]) -> None:
+        if self.ev_grid_draw_observed is None:
+            return
+        saved = self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})
+        if ((isinstance(saved, dict) and "ev_power_limit_entity" in saved)
+                or reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True):
+            self.ev_grid_draw_observed()
 
     async def async_persist_ev_grid_reservation(self) -> None:
         """Persist this entry's current reservation high-watermark."""
         reservation: dict[str, Any] = {}
         reservations = self._ev_grid_reservations()
+        current = None
         if reservations is not None and self.entry_id:
             current = reservations.get(self.entry_id)
             if isinstance(current, dict):
                 reservation = {**dict(current), "active": True}
+        pending_handoff = reservation.pop(EV_RESERVATION_HANDOFF_PENDING, False)
         if not reservation:
             reservation = {"active": False}
         save_reservation = getattr(self.store, "async_save_ev_grid_reservation", None)
@@ -3553,8 +4217,17 @@ class Executor:
             await save_reservation(reservation)
         else:
             self.store.data["ev_grid_reservation"] = reservation
+        if pending_handoff and current is not None:
+            current.pop(EV_RESERVATION_HANDOFF_PENDING, None)
         if self.ev_grid_reservation_persisted is not None:
             self.ev_grid_reservation_persisted()
+
+    def retain_ev_grid_handoff(self) -> None:
+        """Keep feedback the replacement runtime must persist before planning."""
+        self._retain_ev_grid_reservation_when_unloaded()
+        reservations = self._ev_grid_reservations() or {}
+        if (reservation := reservations.get(self.entry_id or "")) is not None:
+            reservation[EV_RESERVATION_HANDOFF_PENDING] = True
 
     def _ev_grid_reservations(self) -> dict[str, dict[str, Any]] | None:
         """Return the in-memory reservation map shared by loaded planner entries."""
@@ -3577,6 +4250,439 @@ class Executor:
         reservations = self._ev_grid_reservations()
         reservation = reservations.get(self.entry_id) if self.entry_id and isinstance(reservations, dict) else None
         return _planner_controlled_ev_reservation(reservation)
+
+    def ev_grid_draw_at(self) -> datetime | None:
+        """Return the most recent metered draw retained for this reservation."""
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "", {})
+        return timestamp(reservation.get("observed_load_at"))
+
+    def ev_grid_activity_at(self) -> datetime | None:
+        """Return the reservation's latest metered draw or active control evidence."""
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "", {})
+        draw_at = timestamp(reservation.get("observed_load_at"))
+        active_at = timestamp(reservation.get("observed_activity_at"))
+        if draw_at is None:
+            return active_at
+        return max(draw_at, active_at or draw_at)
+
+    def native_ev_signal_sources(self) -> tuple[str | None, str | None, str | None]:
+        """Return the original stop and activity sources while the native cap is owned."""
+        binding = self._native_ev_signal_binding()
+        return binding[:3] if binding is not None else (None, None, None)
+
+    def _native_ev_signal_binding(self) -> tuple[str | None, str | None, str | None, str | None, str | None] | None:
+        ownership = self.store.data.get("ownership", {})
+        if "ev_power_limit_entity" not in ownership.get("ev_smart_charging_state", {}):
+            return None
+        topology = self._ev_restore_entry_data(ownership)
+        control, charging, power = _ev_stop_inputs(topology)
+        return control, charging, topology.get(CONF_EV_CONNECTED), topology.get("ev_power_limit_entity"), power
+
+    def _external_ev_signal_binding(self) -> tuple[str | None, str | None, str | None, str | None, str | None] | None:
+        reservations = self._ev_grid_reservations() or {}
+        topology = _external_ev_topology(reservations.get(self.entry_id or ""))
+        if topology is None:
+            return None
+        control, charging, power = _ev_stop_inputs(topology)
+        return control, charging, topology.get(CONF_EV_CONNECTED), topology.get("ev_power_limit_entity"), power
+
+    def _adopt_native_ev_signal_clocks(self) -> dict[str, EVImplicitSignalClock]:
+        """Reuse clocks for unchanged original reports in this Home Assistant process."""
+        if not isinstance(self.hass, HomeAssistant) or not self.entry_id:
+            return {}
+        handoffs = cast(
+            dict[str, _EVSignalClockHandoff], self.hass.data.get(DOMAIN, {}).get(EV_SIGNAL_CLOCK_HANDOFFS, {}),
+        )
+        handoff = handoffs.get(self.entry_id)
+        if handoff is None:
+            return {}
+        handoff.close()
+        if handoff.binding != (self._native_ev_signal_binding() or self._external_ev_signal_binding()):
+            handoffs.pop(self.entry_id)
+            return {}
+        retained: dict[str, tuple[EVImplicitSignalClock, State | None]] = {}
+        for entity_id, (recorded_clock, report) in handoff.signals.items():
+            state = self.hass.states.get(entity_id)
+            clock: EVImplicitSignalClock | None = recorded_clock
+            if state is None or state.last_changed != recorded_clock.last_changed:
+                clock = recorded_clock.without_raw_epoch()
+            elif state is not report:
+                # An unobserved report can keep its raw state while changing clock modes.
+                clock = replace(recorded_clock, started_at=None)
+            if clock is not None:
+                retained[entity_id] = (clock, state)
+        handoff.signals = retained
+        handoff.clocks.clear()
+        handoff.clocks.update({entity_id: clock for entity_id, (clock, _report) in retained.items()})
+        if not handoff.signals:
+            handoffs.pop(self.entry_id)
+        return handoff.clocks
+
+    def retain_ev_signal_clock_handoff(self) -> None:
+        """Observe the original native signals until ownership resolves or a replacement attaches."""
+        native_binding = self._native_ev_signal_binding()
+        if not isinstance(self.hass, HomeAssistant) or not self.entry_id:
+            return
+        domain_data = self._ev_grid_domain_data()
+        if domain_data is None:
+            return
+        binding = native_binding or self._external_ev_signal_binding()
+        if binding is None:
+            handoff = domain_data.get(EV_SIGNAL_CLOCK_HANDOFFS, {}).pop(self.entry_id, None)
+            if handoff is not None:
+                handoff.close()
+            return
+        reservations = self._ev_grid_reservations()
+        if reservations is None:
+            return
+        handoffs = domain_data.setdefault(EV_SIGNAL_CLOCK_HANDOFFS, {})
+        handoff = handoffs.get(self.entry_id)
+        if handoff is None or handoff.binding != binding:
+            if handoff is not None:
+                handoff.close()
+            handoff = handoffs[self.entry_id] = _EVSignalClockHandoff(binding, {}, self._native_ev_signal_clocks)
+        ownership = self.store.data.get("ownership", {})
+        cap_options = ownership.get(_EV_CAPACITY_INPUTS_OWNERSHIP_KEY, self.options)
+        if native_binding is None:
+            cap_options = reservations[self.entry_id].get(EV_RESERVATION_EXTERNAL_POWER_OPTIONS, {})
+        handoff.observe(
+            self.hass, reservations, self.entry_id, _positive_float(self.options.get(CONF_EV_CHARGE_RATE_KW)),
+            _positive_float(self.options.get(CONF_GRID_IMPORT_LIMIT_KW)),
+            cap_options if isinstance(cap_options, dict) else self.options, native=native_binding is not None,
+        )
+
+    def _remember_ev_signal_clock_handoff(self, entity_id: str, state: State | None) -> None:
+        domain_data = self._ev_grid_domain_data()
+        binding = self._native_ev_signal_binding() or self._external_ev_signal_binding()
+        if domain_data is None or not self.entry_id or binding is None or entity_id not in (*binding[:3], binding[4]):
+            return
+        handoffs = domain_data.setdefault(EV_SIGNAL_CLOCK_HANDOFFS, {})
+        handoff = handoffs.get(self.entry_id)
+        if handoff is None or handoff.binding != binding:
+            if handoff is not None:
+                handoff.close()
+            handoff = handoffs[self.entry_id] = _EVSignalClockHandoff(binding, {}, self._native_ev_signal_clocks)
+        clock = self._native_ev_signal_clocks.get(entity_id)
+        if clock is None:
+            handoff.signals.pop(entity_id, None)
+            if not handoff.signals:
+                handoff.close()
+                handoffs.pop(self.entry_id, None)
+            return
+        handoff.signals[entity_id] = (clock, state)
+
+    def note_native_ev_signal_report(self, entity_id: str, state: State | None, previous: State | None) -> bool | None:
+        """Retain native signal timing and active evidence during normal listener operation."""
+        binding = self._native_ev_signal_binding()
+        if binding is None or entity_id not in binding[:3]:
+            return None
+        now = dt_util.utcnow()
+        clock_invalidated = self._ev_feedback_clock_changed(now)
+        clock_changed = self._record_native_ev_signal_clock(
+            entity_id, state, previous, (*binding[:3], binding[4]),
+            received_at=state.last_updated if state is not None else None,
+        )
+        if state is None:
+            return False if clock_invalidated else None
+        control, charging = binding[:2]
+        previous_activity = None if clock_changed or "sampled_at_utc" in state.attributes else getattr(
+            previous, "state", None,
+        )
+        if ev_cap_may_become_active(
+            entity_id, previous_activity, state.state, control_ids=(control,), charging_id=charging,
+        ) and (at := self.native_ev_signal_reported_at(state, now)) is not None:
+            capacity_changed = self._retain_native_ev_activity(at)
+            if capacity_changed is not None:
+                return capacity_changed
+        return False if clock_invalidated else None
+
+    def note_native_ev_signal_heartbeat(self, state: State, received_at: datetime) -> bool:
+        """Invalidate stop evidence when an identical report reveals a backward clock."""
+        binding = self._native_ev_signal_binding()
+        if binding is None or state.entity_id not in binding[:3]:
+            return False
+        if received_at < state.last_updated:
+            self._record_native_ev_signal_clock(
+                state.entity_id, state, state, (*binding[:3], binding[4]), received_at=received_at,
+            )
+        return self._ev_feedback_clock_changed(dt_util.utcnow())
+
+    def note_external_ev_signal_clock(
+        self, entity_id: str, state: State | None, previous: State | None, received_at: datetime | None = None,
+    ) -> bool:
+        """Keep source timing and report newer activity on the original charger."""
+        binding = self._external_ev_signal_binding()
+        if binding is None or entity_id not in binding[:3]:
+            return False
+        now = dt_util.utcnow()
+        clock_invalidated = self._ev_feedback_clock_changed(now)
+        clock_changed = self._record_native_ev_signal_clock(
+            entity_id, state, previous, (*binding[:3], binding[4]), received_at=received_at,
+        )
+        if state is None:
+            return clock_invalidated
+        previous_activity = None if clock_changed or "sampled_at_utc" in state.attributes else getattr(
+            previous, "state", None,
+        )
+        if not ev_cap_may_become_active(
+            entity_id, previous_activity, state.state, control_ids=(binding[0],), charging_id=binding[1],
+        ):
+            return clock_invalidated
+        at = self.native_ev_signal_reported_at(state, now, received_at=received_at)
+        if at is None:
+            return clock_invalidated
+        reservations = self._ev_grid_reservations() or {}
+        return _note_ev_activity(reservations[self.entry_id or ""], at) or clock_invalidated
+
+    def _ev_feedback_clock_changed(self, now: datetime) -> bool:
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "")
+        return reservation is not None and check_ev_cap_feedback_clock(reservation, now)[1]
+
+    def _ev_meter_clock(
+        self, state: State | None, received_at: datetime | None = None,
+    ) -> EVImplicitSignalClock | None:
+        if state is not None and "sampled_at_utc" in state.attributes:
+            binding = self._native_ev_signal_binding() or self._external_ev_signal_binding()
+            if binding is not None and state.entity_id == binding[4]:
+                sources = (*binding[:3], binding[4])
+                self._record_native_ev_signal_clock(state.entity_id, state, None, sources, received_at=received_at)
+                return self._native_ev_signal_clocks.get(state.entity_id)
+        return None
+
+    def native_ev_signal_reported_at(
+        self, state: State, now: datetime, *, received_at: datetime | None = None,
+    ) -> datetime | None:
+        """Read an implicit report in the clock mode that was active at its receipt."""
+        return stop_signal_reported_at(
+            state, now, received_at=received_at, implicit_clock=self._native_ev_signal_clocks.get(state.entity_id),
+        )
+
+    def _record_native_ev_signal_clock(
+        self, entity_id: str, state: State | None, previous: State | None, sources: tuple[str | None, ...],
+        *, received_at: datetime | None = None,
+    ) -> bool:
+        clock_changed, clock = updated_ev_signal_clock(
+            state, previous, self._native_ev_signal_clocks.get(entity_id), received_at,
+        )
+        if clock is not None:
+            for old_source in self._native_ev_signal_clocks.keys() - set(sources):
+                self._native_ev_signal_clocks.pop(old_source)
+            self._native_ev_signal_clocks[entity_id] = clock
+            self._remember_ev_signal_clock_handoff(entity_id, state)
+        elif self._native_ev_signal_clocks.pop(entity_id, None) is not None:
+            self._remember_ev_signal_clock_handoff(entity_id, None)
+        return clock_changed
+
+    def _retain_native_ev_activity(self, at: datetime) -> bool | None:
+        """Preserve newer active control proof, reporting whether it also restored a capacity claim."""
+        ownership = self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})
+        reservations = self._ev_grid_reservations()
+        if "ev_power_limit_entity" not in ownership or reservations is None or not self.entry_id:
+            return None
+        reservation = reservations.get(self.entry_id)
+        new_claim = reservation is None
+        if reservation is None:
+            reservation = reservations[self.entry_id] = {
+                "load_kw": 0.0, "reserved_at": at.isoformat(), EV_RESERVATION_RETAIN_WHEN_UNLOADED: True,
+            }
+            self.sync_ev_grid_reservation()
+        return new_claim if _note_ev_activity(reservation, at) else None
+
+    def observe_ev_unload(
+        self, observations: ExitStack, on_feedback: Callable[[bool], None], *, preserve_control: bool,
+    ) -> None:
+        """Retain applicable EV feedback from listener shutdown through handoff."""
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "")
+        ownership = self.store.data.get("ownership", {})
+        if reservation is None and not any(key in ownership for key in _EV_OWNERSHIP_KEYS):
+            return
+        self._retain_ev_grid_reservation_when_unloaded()
+        entry_data = _external_ev_topology(reservation) or self._ev_restore_entry_data(ownership)
+        retained = self._observe_native_ev_stop(
+            observations, entry_data, on_feedback=on_feedback, preserve_control=preserve_control,
+        )
+        key = (*_ev_stop_inputs(entry_data), entry_data.get(CONF_EV_CONNECTED))
+        self._ev_unload_draw = (key, retained)
+        observations.callback(setattr, self, "_ev_unload_draw", None)
+
+    def observe_ev_setup(self, observations: ExitStack, on_feedback: Callable[[bool], None]) -> bool:
+        """Keep original charger evidence while setup prepares regular listeners."""
+        ownership = self.store.data.get("ownership", {})
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "")
+        topology = _external_ev_topology(reservation)
+        previous_load = _positive_float(reservation.get("load_kw")) if reservation is not None else 0.0
+        self._observe_native_ev_stop(
+            observations, topology if topology is not None else self._ev_restore_entry_data(ownership),
+            on_feedback=on_feedback, preserve_control=True,
+        )
+        if self.sync_ev_grid_reservation(on_evidence_changed=partial(on_feedback, False)):
+            on_feedback(True)
+        current = (self._ev_grid_reservations() or {}).get(self.entry_id or "", {})
+        return _positive_float(current.get("load_kw")) > previous_load
+
+    def _observe_native_ev_adapter(
+        self, observations: ExitStack, adapter: EVChargerAdapter, entry_data: dict[str, Any],
+    ) -> None:
+        adapter.stop_observations = self._observe_native_ev_stop(observations, entry_data)
+        adapter.retained_draw_at = self.ev_grid_draw_at
+
+    def _observe_native_ev_stop(
+        self, observations: ExitStack, entry_data: dict[str, Any], *,
+        on_feedback: Callable[[bool], None] | None = None, preserve_control: bool = False,
+    ) -> NativeEVStopObservations:
+        """Retain meter and control evidence through one restore or unload."""
+        control_id, charging_id, power_id = _ev_stop_inputs(entry_data)
+        connection_id = entry_data.get(CONF_EV_CONNECTED)
+        key = (control_id, charging_id, power_id, connection_id)
+        if self._ev_unload_draw is not None and self._ev_unload_draw[0] == key:
+            return self._ev_unload_draw[1]
+        reservations = self._ev_grid_reservations() or {}
+        reservation = reservations.get(self.entry_id or "", {})
+        retained = NativeEVStopObservations(
+            draw_at=timestamp(reservation.get("observed_load_at")),
+            active_at=timestamp(reservation.get("observed_activity_at")),
+            implicit_signal_clocks=self._native_ev_signal_clocks,
+        )
+        if not isinstance(self.hass, HomeAssistant):
+            return retained
+        limit_id = entry_data.get("ev_power_limit_entity") if preserve_control else None
+        source_ids = tuple(dict.fromkeys(entity for entity in (*key, limit_id) if entity))
+        on_evidence_changed = partial(on_feedback, False) if on_feedback is not None else None
+
+        def retain_feedback_clock() -> None:
+            if self._ev_feedback_clock_changed(dt_util.utcnow()) and on_evidence_changed is not None:
+                on_evidence_changed()
+
+        def retain_power(state: State | None, received_at: datetime | None = None) -> None:
+            if state is None:
+                return
+            now = dt_util.utcnow()
+            clock = self._ev_meter_clock(state, received_at)
+            at = current_sample_reported_at(state, now, received_at=received_at, signal_clock=clock)
+            draw: float | None
+            if at is None:
+                fallback = unverified_positive_power(state, now, received_at)
+                if fallback is None:
+                    retained.note_stop_receipt(state.entity_id, None, received_at or state.last_updated)
+                    self.note_ev_grid_power_report(
+                        state, on_evidence_changed=on_evidence_changed, received_at=received_at,
+                    )
+                    return
+                draw, at = fallback
+            else:
+                draw = measured(state, now, "power")
+            if draw == 0:
+                receipt = state.last_updated if "sampled_at_utc" in state.attributes else at
+                retained.note_stop_receipt(state.entity_id, at, receipt)
+            else:
+                retained.note_stop_receipt(state.entity_id, None, received_at or state.last_updated)
+            if draw is None:
+                return
+            retained.note_draw(at, draw)
+            if draw == 0 and on_feedback is None:
+                return
+            previous_activity = self.ev_grid_activity_at() if on_feedback is not None else None
+            current = reservations.get(self.entry_id or "", {})
+            previous_report_kw = current.get("observed_report_kw")
+            if draw and current.get(EV_RESERVATION_EXTERNAL_BASELINE) is True:
+                increased = self.sync_ev_grid_reservation(
+                    power_state=state, on_evidence_changed=on_evidence_changed, received_at=received_at,
+                )
+            else:
+                increased = self.note_ev_grid_power_report(
+                    state, on_evidence_changed=on_evidence_changed, received_at=received_at,
+                )
+            if on_feedback is not None and (
+                increased or self.ev_grid_activity_at() != previous_activity
+                or current.get("observed_report_kw") != previous_report_kw
+            ):
+                on_feedback(increased)
+
+        def retain_signal(state: State, previous: State | None, received_at: datetime | None = None) -> None:
+            entity_id = state.entity_id
+            now = dt_util.utcnow()
+            explicit_sample = "sampled_at_utc" in state.attributes
+            clock_changed = self._record_native_ev_signal_clock(
+                entity_id, state, previous, key, received_at=received_at,
+            )
+            at = self.native_ev_signal_reported_at(state, now, received_at=received_at)
+            stopped = (
+                (entity_id in (control_id, connection_id) and connection(state.state) is False)
+                or (entity_id == charging_id and ev_charging_state_for_stop(state.state) is False)
+            )
+            if stopped and at is not None:
+                receipt = state.last_updated if explicit_sample else at
+                retained.note_stop_receipt(entity_id, at, receipt)
+            else:
+                retained.note_stop_receipt(entity_id, None, received_at or state.last_updated)
+            if at is None:
+                return
+            previous_activity = None if explicit_sample or clock_changed else getattr(previous, "state", None)
+            active = ev_cap_may_become_active(
+                entity_id, previous_activity, state.state, control_ids=(control_id,), charging_id=charging_id,
+            )
+            if active or stopped:
+                retained.note_signal(at, active)
+            if active:
+                current = reservations.get(self.entry_id or "")
+                if current is not None and current.get(EV_RESERVATION_EXTERNAL_BASELINE) is True:
+                    capacity_changed = False if _note_ev_activity(current, at) else None
+                else:
+                    capacity_changed = self._retain_native_ev_activity(at)
+                if capacity_changed is not None and on_feedback is not None:
+                    on_feedback(capacity_changed)
+
+        @callback
+        def observe_change(event: Any) -> None:
+            entity_id = event.data["entity_id"]
+            state = event.data.get("new_state")
+            if entity_id != power_id or state is None:
+                retain_feedback_clock()
+            if state is None:
+                if entity_id != limit_id:
+                    self._record_native_ev_signal_clock(entity_id, None, None, key)
+                    retained.note_stop_receipt(entity_id, None, event.time_fired)
+                return
+            if entity_id == power_id:
+                retain_power(state, state.last_updated)
+                return
+            previous = event.data.get("old_state")
+            if entity_id != limit_id:
+                retain_signal(state, previous, state.last_updated)
+            if limit_id is not None and on_feedback is not None and (entity_id == limit_id or ev_cap_may_become_active(
+                entity_id, getattr(previous, "state", None), state.state,
+                control_ids=(control_id, connection_id), charging_id=charging_id,
+            )) and self.sync_ev_grid_reservation(
+                limit_state=state if entity_id == limit_id else None, on_evidence_changed=on_evidence_changed,
+            ):
+                on_feedback(True)
+
+        @callback
+        def observe_report(event: Any) -> None:
+            state = event.data["new_state"]
+            received_at = event.data["last_reported"]
+            if event.data["entity_id"] == power_id:
+                retain_power(state, received_at)
+            else:
+                retain_feedback_clock()
+                if received_at < state.last_updated:
+                    retain_signal(state, state, received_at)
+
+        if source_ids:
+            observations.callback(async_track_state_change_event(self.hass, source_ids, observe_change))
+        if reports := tuple(dict.fromkeys(entity for entity in key if entity)):
+            observations.callback(async_track_state_report_event(self.hass, reports, observe_report))
+        if power_id:
+            retain_power(self.hass.states.get(power_id))
+        for entity_id in source_ids:
+            if entity_id not in (power_id, limit_id) and (state := self.hass.states.get(entity_id)) is not None:
+                retain_signal(state, None)
+        return retained
 
     def _ev_stopped_power_limit_baseline(self, entry_data: dict[str, Any]) -> dict[str, Any] | None:
         """Use the lifecycle cap for a complete rollback on its original entity."""
@@ -4045,9 +5151,9 @@ class Executor:
     def _ev_entry_data_for_action(self, action: ControlAction) -> dict[str, Any]:
         """Use the owned actuator topology for any stop that can release it."""
         if _ev_action_is_safety_stop(action):
-            topology = self._owned_ev_control_topology()
-            if topology is not None:
-                return topology
+            ownership = self.store.data.get("ownership", {})
+            if isinstance(ownership, dict) and isinstance(ownership.get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY), dict):
+                return self._ev_restore_entry_data(ownership)
         return self.entry_data
 
     def _ev_grid_domain_data(self) -> dict[str, Any] | None:
@@ -4187,8 +5293,6 @@ def _normalized_ev_stop_result(
     require_safe: bool,
 ) -> EVCommandResult:
     """Normalize manual-stop success when a safe state is authoritative."""
-    if result.reason in {"ev_power_limit_restore_failed", "ev_power_limit_unit_changed"}:
-        return result
     safe_state_confirmed = _ev_result_proves_safe(result)
     raw_applied = result.applied
     applied = safe_state_confirmed if require_safe else raw_applied or safe_state_confirmed
@@ -4229,6 +5333,23 @@ def _external_ev_topology(reservation: Any) -> dict[str, str] | None:
     return None
 
 
+def _external_ev_limit_supported(
+    hass: HomeAssistant | None, topology: dict[str, Any], observed_load_kw: float,
+) -> bool:
+    """Require connection and evidence of activity before counting an external cap."""
+    from .ev import ev_charging_state_proves_active
+
+    if connection(state_value(hass, topology.get(CONF_EV_CONNECTED))) is False:
+        return False
+    if observed_load_kw > 0:
+        return True
+    charging = state_value(hass, topology.get(CONF_EV_CHARGING))
+    control = topology.get(CONF_EV_CHARGER) or topology.get(CONF_EV_SMART_CHARGING)
+    return ev_charging_state_proves_active(charging) or (
+        charging in STATE_UNKNOWN_VALUES and connection(state_value(hass, control)) is True
+    )
+
+
 def _ev_stop_inputs(topology: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     control = topology.get(CONF_EV_CHARGER) or topology.get(CONF_EV_SMART_CHARGING)
     if control and control.split(".", 1)[0] not in {"switch", "input_boolean"}:
@@ -4241,19 +5362,224 @@ def _planner_controlled_ev_reservation(value: Any) -> bool:
     return isinstance(value, dict) and value.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True
 
 
+def _note_ev_activity(reservation: dict[str, Any], at: datetime) -> bool:
+    previous = timestamp(reservation.get("observed_activity_at"))
+    if previous is not None and at <= previous:
+        return False
+    reservation["observed_activity_at"] = at.isoformat()
+    return True
+
+
+def _raise_ev_draw_reservation(reservation: dict[str, Any], draw: float) -> bool:
+    reservation["observed_load_kw"] = max(_positive_float(reservation.get("observed_load_kw")), draw)
+    if draw <= _positive_float(reservation.get("load_kw")):
+        return False
+    reservation["load_kw"] = draw
+    reservation.pop("confirmed_power_limit", None)
+    return True
+
+
 def _note_ev_draw_report(
     reservation: dict[str, Any], observed: float | None, reported: datetime | None,
+) -> bool:
+    if not observed or reported is None:
+        return False
+    observed_at = timestamp(reservation.get("observed_load_at"))
+    if observed_at is None or reported > observed_at:
+        reservation["observed_load_at"] = reported.isoformat()
+        reservation["observed_report_kw"] = observed
+        return True
+    if reported != observed_at:
+        return False
+    previous = reservation.get("observed_report_kw")
+    retained_kw = _positive_float(previous) or _positive_float(
+        reservation.get("observed_load_kw"),
+    ) or _positive_float(reservation.get("load_kw"))
+    report_kw = max(retained_kw, observed)
+    reservation["observed_report_kw"] = report_kw
+    return bool(report_kw != previous)
+
+
+def _ev_cap_report_is_current(reservation: dict[str, Any], limit_kw: float, reported: datetime) -> bool:
+    activity_at = timestamp(reservation.get("observed_activity_at"))
+    if activity_at is not None and reported <= activity_at:
+        return False
+    latest_draw = timestamp(reservation.get("observed_load_at"))
+    if latest_draw is None or reported > latest_draw:
+        return True
+    latest_kw = finite(reservation.get("observed_report_kw"))
+    return reported == latest_draw and latest_kw is not None and latest_kw <= limit_kw + .01
+
+
+def _record_ev_cap_confirmation(
+    reservation: dict[str, Any], limit_kw: float, reported: datetime, provisional: _ProvisionalEVCapacity | None = None,
 ) -> None:
-    if observed and reported is not None:
-        observed_at = timestamp(reservation.get("observed_load_at"))
-        if observed_at is None or reported > observed_at:
-            reservation["observed_load_at"] = reported.isoformat()
+    """Retain enough evidence to reopen a reduction disputed at the same source time."""
+    pending = reservation.pop("pending_power_limit", None)
+    previous = reservation.get("cap_reduction")
+    previous_clock_invalid = isinstance(previous, dict) and previous.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is True
+    if isinstance(pending, dict):
+        if (isinstance(previous, dict) and not previous_clock_invalid and previous["cap_kw"] == limit_kw
+                and timestamp(previous.get("confirmed_at")) == reported):
+            # The listener can consume the report while the adapter is still
+            # finishing a real write. Keep the peak that same report retired.
+            reservation["cap_reduction"] = {**previous, "pending_limit": dict(pending)}
+        else:
+            prior_load = _positive_float(reservation.get("load_kw"))
+            retained_load = prior_load if provisional is None else max(
+                provisional.retained_load_kw,
+                _positive_float(reservation.get("observed_load_kw")),
+                _positive_float(reservation.get("observed_limit_kw")),
+            )
+            reservation["cap_reduction"] = {
+                "prior_load_kw": prior_load,
+                "retained_load_kw": retained_load,
+                "cap_kw": limit_kw,
+                "confirmed_at": reported.isoformat(),
+                "prior_confirmation_at": None if previous_clock_invalid else reservation.get("confirmed_power_at") or (
+                    previous.get("confirmed_at") if isinstance(previous, dict) else None
+                ),
+                "prior_confirmed_cap_kw": None if previous_clock_invalid else reservation.get("confirmed_cap_kw") or (
+                    previous.get("cap_kw") if isinstance(previous, dict) else None
+                ),
+                "pending_limit": dict(pending),
+            }
+            if isinstance(previous, dict):
+                reservation["cap_reduction"]["history"] = _ev_cap_history(previous)
+    else:
+        reservation.pop("cap_reduction", None)
+    if provisional is not None:
+        provisional.retained_load_kw = limit_kw
+    reservation["load_kw"] = limit_kw
+    reservation["observed_load_kw"] = limit_kw
+    reservation["confirmed_power_at"] = reported.isoformat()
+    reservation["confirmed_cap_kw"] = limit_kw
+    reservation.pop(EV_RETIRED_CAP_KW, None)
+    reservation["confirmed_power_limit"] = True
+    reservation.pop("observed_limit_kw", None)
 
 
-def _fresh_ev_stop_report(state: State | None, now: datetime) -> datetime | None:
-    """Require current feedback from the source, including a valid vendor clock."""
-    reported = reported_at(state)
-    return reported if reported is not None and timedelta(0) <= now - reported <= timedelta(minutes=10) else None
+def _ev_cap_history(previous: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bound older reversible proofs and fold excess records into a safe floor."""
+    head = {key: value for key, value in previous.items() if key != "history"}
+    history = [head, *previous.get("history", ())]
+    if len(history) > MAX_EV_CAP_HISTORY:
+        dropped = history.pop()
+        history[-1] = {
+            **history[-1],
+            "prior_load_kw": max(
+                history[-1]["prior_load_kw"], dropped["prior_load_kw"], dropped.get("disputed_load_kw", 0),
+            ),
+            "retained_load_kw": max(
+                history[-1]["retained_load_kw"], dropped["retained_load_kw"], dropped.get("disputed_load_kw", 0),
+            ),
+            "prior_confirmation_at": None,
+            "prior_confirmed_cap_kw": None,
+        }
+    return history
+
+
+def _retained_ev_cap_proof(proof: dict[str, Any]) -> dict[str, Any]:
+    """Drop the rejected acquisition's speculative load from fallback evidence."""
+    retained = {**proof, "prior_load_kw": proof["retained_load_kw"]}
+    if history := proof.get("history"):
+        retained["history"] = [{**older, "prior_load_kw": older["retained_load_kw"]} for older in history]
+    return retained
+
+
+def _copy_retained_ev_cap_evidence(reservation: dict[str, Any], current: dict[str, Any]) -> None:
+    for key in (
+        "pending_power_limit", "confirmed_power_limit", "confirmed_power_at", "confirmed_cap_kw",
+        "observed_limit_kw", "cap_reduction", EV_RETIRED_CAP_KW,
+    ):
+        if key not in current:
+            reservation.pop(key, None)
+        elif key == "cap_reduction":
+            reservation[key] = _retained_ev_cap_proof(current[key])
+        else:
+            reservation[key] = current[key]
+
+
+def _ev_cap_readback_changes_proof(proof: dict[str, Any], observed: float, reported: datetime) -> bool:
+    confirmed_at = timestamp(proof.get("confirmed_at"))
+    if confirmed_at == reported:
+        return observed > max(
+            _positive_float(proof.get("cap_kw")) + .01, _positive_float(proof.get("disputed_load_kw")),
+        )
+    prior = timestamp(proof.get("prior_confirmation_at"))
+    return (confirmed_at is not None and reported < confirmed_at and (prior is None or reported > prior)
+            and observed > _positive_float(proof.get("retained_load_kw")))
+
+
+def _retain_ev_cap_readback(
+    reservation: dict[str, Any], observed: float | None, reported: datetime | None,
+    provisional: _ProvisionalEVCapacity | None = None,
+) -> bool:
+    reduction = reservation.get("cap_reduction")
+    if not isinstance(reduction, dict) or observed is None or reported is None:
+        return False
+    retained = _ev_cap_proof_with_readback(reduction, observed, reported)
+    history = reduction.get("history", ())
+    updated_history = None
+    for index, proof in enumerate(history):
+        updated = _ev_cap_proof_with_readback(proof, observed, reported)
+        if updated is not proof:
+            if updated_history is None:
+                updated_history = list(history)
+            updated_history[index] = updated
+    if updated_history is not None:
+        retained = {**retained, "history": updated_history}
+    if retained is reduction:
+        return False
+    if retained.get("disputed_load_kw"):
+        retained_load = _reopen_ev_cap_reduction(reservation, retained)
+        if provisional is not None:
+            provisional.retained_load_kw = max(provisional.retained_load_kw, retained_load)
+    else:
+        reservation["cap_reduction"] = retained
+    return True
+
+
+def _ev_cap_proof_with_readback(proof: dict[str, Any], observed: float, reported: datetime) -> dict[str, Any]:
+    if not _ev_cap_readback_changes_proof(proof, observed, reported):
+        return proof
+    if reported == timestamp(proof.get("confirmed_at")):
+        return {**proof, "disputed_load_kw": observed}
+    # A still-valid proof retired the earlier draw. Keep it for fallback.
+    return {**proof, "prior_load_kw": max(proof["prior_load_kw"], observed), "retained_load_kw": observed}
+
+
+def _reopen_ev_cap_reduction(reservation: dict[str, Any], reduction: dict[str, Any]) -> float:
+    clock_invalid = reduction.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is True
+    if not clock_invalid:
+        reservation.setdefault("pending_power_limit", reduction["pending_limit"])
+    reservation.pop("confirmed_power_limit", None)
+    disputed_load = _positive_float(reduction.get("disputed_load_kw"))
+    load = max(_positive_float(reservation.get("load_kw")), reduction["prior_load_kw"], disputed_load)
+    retained_load = max(_positive_float(reduction.get("retained_load_kw")), disputed_load)
+    history = reduction.get("history", ())
+    prior_confirmation = reduction.get("prior_confirmation_at")
+    prior_cap = reduction.get("prior_confirmed_cap_kw")
+    reservation.pop("cap_reduction", None)
+    for index, proof in enumerate(history):
+        if not (disputed_load := proof.get("disputed_load_kw")):
+            reservation["cap_reduction"] = {**proof, "history": history[index + 1:]}
+            break
+        load = max(load, disputed_load, proof["prior_load_kw"])
+        retained_load = max(
+            retained_load, _positive_float(disputed_load), _positive_float(proof.get("retained_load_kw")),
+        )
+        prior_confirmation = proof.get("prior_confirmation_at")
+        prior_cap = proof.get("prior_confirmed_cap_kw")
+    if prior_confirmation is None:
+        reservation.pop("confirmed_power_at", None)
+        if not clock_invalid:
+            reservation.pop("confirmed_cap_kw", None)
+    else:
+        reservation["confirmed_power_at"] = prior_confirmation
+        reservation["confirmed_cap_kw"] = prior_cap
+    reservation["load_kw"] = load
+    return retained_load
 
 
 def _restored_ev_baseline_is_active(saved_state: dict[str, Any]) -> bool:

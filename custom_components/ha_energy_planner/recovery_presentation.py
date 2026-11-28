@@ -87,6 +87,8 @@ def recovery_details(coordinator: EnergyPlannerCoordinator, now: datetime) -> di
         reason, summary = str(status), summaries[str(status)]
     elif status == "recovered" and coordinator.effective_control:
         reason, summary = "recovered", "Recovered; automatic control is active"
+    elif requested and status == "failed" and startup.get("last_reason") == "startup_recovery_save_failed":
+        reason, summary = "startup_recovery_save_failed", "Could not save startup recovery"
     plan = coordinator.data
     return {
         "summary": summary,

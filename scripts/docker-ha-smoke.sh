@@ -312,24 +312,33 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def assert_ev_power_control(call: ServiceCall) -> None:
         """Exercise a real HA number service, feedback, and safe limit restoration."""
+        from homeassistant.core import callback
+        from homeassistant.helpers.event import async_track_state_change_event
+
         from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
         from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, PlanAction
+        from custom_components.ha_energy_planner.storage import PlannerStore
 
+        control_id = "input_boolean.ev_power_smoke_charger"
         limit_id = "number.smoke_ev_limit"
         power_id = "sensor.smoke_ev_power"
         attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
         hass.states.async_set(limit_id, 6, attrs)
-        hass.states.async_set(power_id, 0, {"unit_of_measurement": "kW"})
+
+        @callback
+        def report_power(_event=None) -> None:
+            draw = hass.states.get(limit_id).state if hass.states.get(control_id).state == "on" else 0
+            hass.states.async_set(power_id, draw, {"unit_of_measurement": "kW"})
 
         async def set_limit(command: ServiceCall) -> None:
             assert command.data["entity_id"] == limit_id
             hass.states.async_set(limit_id, command.data["value"], attrs)
-            hass.states.async_set(power_id, command.data["value"], {"unit_of_measurement": "kW"})
+            report_power()
 
         hass.services.async_register("number", "set_value", set_limit)
         adapter = EVChargerAdapter(hass, {
-            "ev_charger_entity": "input_boolean.ev_power_smoke_charger",
-            "ev_charging_entity": "input_boolean.ev_power_smoke_charger",
+            "ev_charger_entity": control_id,
+            "ev_charging_entity": control_id,
             "ev_power_limit_entity": limit_id, "ev_power_entity": power_id,
         }, power_options={"ev_limit_min": 1, "ev_limit_max": 6}, confirmation_timeout_seconds=2)
         now = dt_util.utcnow()
@@ -337,18 +346,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             ActionAsset.EV, ActionKind.EV_SCHEDULE, {"charging_required_now": True,
             "power_limit": {"entity_id": limit_id, "unit": "kW", "value": 3, "physical_power_kw": 3}},
             [], [], 0, 1)
-        result = await adapter.async_execute(action)
-        assert result.applied and hass.states.get(limit_id).state in {"3", "3.0"}
-        from custom_components.ha_energy_planner.storage import PlannerStore
+        unsubscribe = async_track_state_change_event(hass, [control_id], report_power)
+        try:
+            report_power()
+            result = await adapter.async_execute(action)
+            assert result.applied and hass.states.get(limit_id).state in {"3", "3.0"}
+            assert hass.states.get(power_id).state in {"3", "3.0"}
 
-        store = PlannerStore(hass, "smoke_ev_power")
-        await store.async_save_ownership({"ev_smart_charging_state": result.pre_state})
-        await store.async_flush()
-        reloaded = PlannerStore(hass, "smoke_ev_power")
-        await reloaded.async_load()
-        restored = await adapter.async_restore(reloaded.data["ownership"]["ev_smart_charging_state"])
-        assert restored.applied and hass.states.get(limit_id).state in {"6", "6.0"}
-        assert hass.states.get("input_boolean.ev_power_smoke_charger").state == "off"
+            store = PlannerStore(hass, "smoke_ev_power")
+            await store.async_save_ownership({"ev_smart_charging_state": result.pre_state})
+            await store.async_flush()
+            reloaded = PlannerStore(hass, "smoke_ev_power")
+            await reloaded.async_load()
+            restored = await adapter.async_restore(reloaded.data["ownership"]["ev_smart_charging_state"])
+            assert restored.applied and hass.states.get(limit_id).state in {"6", "6.0"}
+            assert hass.states.get(control_id).state == "off"
+            assert hass.states.get(power_id).state in {"0", "0.0"}
+        finally:
+            unsubscribe()
         Path(hass.config.config_dir, ".ev_power_smoke_complete").touch()
 
     async def assert_export_limit_control(call: ServiceCall) -> None:

@@ -9,8 +9,13 @@ from unittest.mock import Mock
 import pytest
 
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
-from custom_components.ha_energy_planner.ev import EVChargeSchedule
-from custom_components.ha_energy_planner.ev_optimization import _battery_simulator, _charge_interval, optimise_ev
+from custom_components.ha_energy_planner.ev import ChargeEconomics, EVChargeSchedule
+from custom_components.ha_energy_planner.ev_optimization import (
+    _battery_simulator,
+    _charge_curve,
+    _charge_interval,
+    optimise_ev,
+)
 from custom_components.ha_energy_planner.ev_policy import finite, power_capability, strategy
 from custom_components.ha_energy_planner.ev_telemetry import measured, update_ev_telemetry
 from custom_components.ha_energy_planner.models import DecisionContext, DecisionSlot, InputHealth, OccupancyState
@@ -226,10 +231,11 @@ def test_band_rates_integrate_across_boundaries():
         "aggregate": {"minutes": 60, "soc_per_kwh": 10},
         "bands": {"80": {"sessions": 3, "minutes": 60, "soc_per_kwh": 5}},
     }
-    assert _charge_interval(ctx, 79, 100, 1, 1, 10, expected=True)[0] == pytest.approx(84.5)
-    assert _charge_interval(ctx, 99, 100, 10, 1, 10)[0] == 100
+    curve = _charge_curve(ctx, 10).bands
+    assert _charge_interval(curve, 79, 100, 1, 1, expected=True)[0] == pytest.approx(84.5)
+    assert _charge_interval(curve, 99, 100, 10, 1)[0] == 100
     ctx.ev_evidence["performance"]["bands"]["80"]["sessions"] = 2
-    assert _charge_interval(ctx, 80, 100, 1, 1, 10, expected=True)[0] == 90
+    assert _charge_interval(_charge_curve(ctx, 10).bands, 80, 100, 1, 1, expected=True)[0] == 90
 
 
 def test_forecast_gap_distinguished_from_capacity_shortfall():
@@ -398,8 +404,6 @@ def test_gap_coverage_and_expired_battery_slots():
 
 
 def test_measured_delivery_changes_duration_and_reports_zero_delivery():
-    from custom_components.ha_energy_planner.ev_optimization import _charge_interval
-
     ctx = context()
     ctx.ev_evidence["performance"] = {
         "aggregate": {
@@ -408,10 +412,30 @@ def test_measured_delivery_changes_duration_and_reports_zero_delivery():
             "delivery_fraction": 0.5,
         }
     }
-    soc, energy, hours = _charge_interval(ctx, 40, 45, 6, 1 / 12, 10, expected=True)
+    soc, energy, hours = _charge_interval(_charge_curve(ctx, 10).bands, 40, 45, 6, 1 / 12, expected=True)
     assert soc == 42.5 and energy == 0.25 and hours == pytest.approx(1 / 12)
     ctx.ev_evidence["performance"]["aggregate"]["delivery_fraction"] = 0
-    assert _charge_interval(ctx, 40, 45, 6, 1 / 12, 10) == (40, 0, 0)
+    assert _charge_interval(_charge_curve(ctx, 10).bands, 40, 45, 6, 1 / 12) == (40, 0, 0)
+
+
+def test_legacy_unordered_session_count_preserves_delivery_fraction():
+    ctx = context()
+    ctx.ev_evidence["performance"] = {
+        "bands": {"0": {"sessions": float("nan"), "minutes": 60, "delivery_fraction": 0.4}},
+    }
+    soc, energy, hours = _charge_interval(_charge_curve(ctx, 10).bands, 40, 45, 6, 1 / 12)
+    assert (soc, energy, hours) == pytest.approx((42, 0.2, 1 / 12))
+
+
+@pytest.mark.parametrize("legacy_band", [None, {"sessions": None, "minutes": 0}, {"sessions": 3, "minutes": None}])
+def test_malformed_unreached_charge_band_cannot_abort_schedule(legacy_band):
+    ctx = context()
+    bands = {"0": {"sessions": 3, "minutes": 60, "soc_per_kwh": 10, "delivery_fraction": 0.8}}
+    ctx.ev_evidence["performance"] = {"bands": bands}
+    expected = solve(ctx, ev_charging_strategy="split")
+    assert expected[1]["search_status"] == "valid_schedule"
+    bands["90"] = legacy_band
+    assert solve(ctx, ev_charging_strategy="split") == expected
 
 
 def test_variable_search_preserves_physics_across_diverse_cost_and_solar_shapes():
@@ -536,17 +560,20 @@ def test_adaptive_future_pauses_prefer_dwell_without_sacrificing_readiness():
 
 
 @pytest.mark.parametrize("variable", [False, True])
-def test_full_horizon_battery_economics_stays_within_execution_budget(variable):
+def test_full_horizon_battery_economics_stays_within_execution_budget(monkeypatch, variable):
     ctx = context(tuple(0.1 + (i % 24) / 100 for i in range(576)), pv=2)
     ctx.ev_target_soc_percent = 90
     ctx.current_battery_soc_percent = 60
     ctx.current_enphase_profile = ctx.enphase_self_consumption_profile = "self"
     if variable:
         ctx.ev_evidence["power_capability"] = power_capability(number(), {"ev_limit_min": 1, "ev_limit_max": 6})
+    prepare = Mock(wraps=ChargeEconomics.from_slot)
+    monkeypatch.setattr(ChargeEconomics, "from_slot", prepare)
     started = perf_counter()
     schedule, evidence = solve(ctx, ev_charging_strategy="adaptive", max_daily_ev_actions=0)
     assert perf_counter() - started < 5
     assert evidence["candidate_evaluations"] <= 2000
+    assert prepare.call_count == len(ctx.slots)
     assert not schedule.infeasible
 
 

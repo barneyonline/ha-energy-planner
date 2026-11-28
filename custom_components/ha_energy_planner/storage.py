@@ -52,6 +52,10 @@ _DICT_FIELDS = {
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
 _PENDING_PLAN_PUBLICATION = "_pending_plan_publication"
+_PENDING_EV_RELEASE = "_pending_ev_release"
+_PENDING_EV_RELEASE_RECOVERY = "_pending_ev_release_recovery"
+_EV_RELEASE_FIELDS = ("ownership", "ev_grid_reservation", "command_rate_limits", "ev_telemetry")
+_PUBLICATION_HISTORIES = ("forecast_snapshots", "dry_run_comparisons")
 _FORECAST_SNAPSHOT_BUCKET_MINUTES = 30
 _FORECAST_SNAPSHOT_HARD_CAP = 128
 _DRY_RUN_COMPARISON_BUCKET_MINUTES = 30
@@ -134,6 +138,7 @@ class PlannerStore:
         """Delete this entry's data only when raw recovery evidence is resolved."""
         loaded = await self._store.async_load()
         if loaded is not None:
+            loaded = _retained_ev_release_data(loaded)
             ownership = loaded.get("ownership", {})
             reservation = loaded.get("ev_grid_reservation", {})
             if not isinstance(ownership, dict) or ownership:
@@ -421,6 +426,51 @@ class PlannerStore:
         """Persist the conservative active EV grid reservation."""
         await self._async_set_if_changed("ev_grid_reservation", reservation)
 
+    async def async_publish_ev_release(
+        self, stage: Callable[[], dict[str, Any]], is_current: Callable[[], bool],
+    ) -> bool:
+        """Keep restart recovery authoritative until a stopped EV release is admitted."""
+        async with self._save_lock:
+            if not is_current():
+                return False
+            baseline = dict(self.data)
+            generation = self._mutation_generation
+            changes = stage()
+            if not changes:
+                return True
+            proposal = to_jsonable(changes)
+
+            def recoverable_release_is_current() -> bool:
+                return is_current() and all(self.data.get(key) is baseline.get(key) for key in changes)
+
+            await self._store.async_save({**baseline, _PENDING_EV_RELEASE: proposal})
+            self._saved_generation = generation
+            if not recoverable_release_is_current():
+                return False
+            promotion_generation = self._mutation_generation
+            # Keep the runtime reservation and ownership visible while the canonical write is in flight.
+            # If evidence changes or acknowledgement fails, restore the current conservative view.
+            admitted = False
+            try:
+                recovery = {key: baseline.get(key) for key in changes}
+                await self._store.async_save({**self.data, **proposal, _PENDING_EV_RELEASE_RECOVERY: recovery})
+                admitted = recoverable_release_is_current()
+            finally:
+                if not admitted:
+                    self._mutation_generation += 1
+                    recovery_generation = self._mutation_generation
+                    await self._store.async_save(dict(self.data))
+                    self._saved_generation = recovery_generation
+            if not admitted:
+                return False
+            self.data.update(proposal)
+            # The next ordinary flush retires the restart fallback after admission.
+            self._saved_generation = promotion_generation
+            self._mutation_generation += 1
+            if "ownership" in proposal:
+                self._notify_ownership_listeners()
+            return True
+
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         """Persist command rate-limit timestamps."""
         await self._async_set_if_changed("command_rate_limits", limits)
@@ -475,12 +525,19 @@ class PlannerStore:
                 return None
             generation = self._mutation_generation
             baseline = dict(previous)
+            proposal = dict(changes)
+            for key in _PUBLICATION_HISTORIES:
+                if key in changes:
+                    # Staging replaces the list and reuses unchanged record objects.
+                    # Encode those records by their canonical list index in the proposal.
+                    retained = {id(record): index for index, record in enumerate(baseline[key])}
+                    proposal[key] = [retained.get(id(record), record) for record in changes[key]]
             # A restart between this write and admission can still load the
             # previous plan and readiness credit from the canonical fields.
             if calendar is not previous_calendar:
                 self.pending_calendar_plan = calendar
             try:
-                await self._store.async_save({**baseline, _PENDING_PLAN_PUBLICATION: changes})
+                await self._store.async_save({**baseline, _PENDING_PLAN_PUBLICATION: proposal})
             finally:
                 self.pending_calendar_plan = None
             self._saved_generation = generation
@@ -547,12 +604,15 @@ class PlannerStore:
             return
         self.data[key] = jsonable
         if key == "ownership":
-            for listener in tuple(self._ownership_listeners):
-                try:
-                    listener()
-                except Exception:  # noqa: BLE001 - entity listeners must not interrupt durable recovery.
-                    _LOGGER.exception("Error publishing planner ownership state")
+            self._notify_ownership_listeners()
         await self._async_save()
+
+    def _notify_ownership_listeners(self) -> None:
+        for listener in tuple(self._ownership_listeners):
+            try:
+                listener()
+            except Exception:  # noqa: BLE001 - entity listeners must not interrupt durable recovery.
+                _LOGGER.exception("Error publishing planner ownership state")
 
 
 def _default_data() -> dict[str, Any]:
@@ -590,8 +650,10 @@ def _default_data() -> dict[str, Any]:
 
 def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data = _default_data()
-    data.update(loaded)
+    data.update(_retained_ev_release_data(loaded))
     data.pop(_PENDING_PLAN_PUBLICATION, None)
+    data.pop(_PENDING_EV_RELEASE, None)
+    data.pop(_PENDING_EV_RELEASE_RECOVERY, None)
     data.pop("haeo_runs", None)
     data.pop("trip_history", None)
     data["execution_audit"] = [_audit_entry(record) for record in audit_records(loaded)][-100:]
@@ -630,6 +692,22 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
             active_plan["actions"] = normalized_actions
             data["active_plan"] = active_plan
     return data
+
+
+def _retained_ev_release_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Use the pre-release evidence if the process stopped before promotion was confirmed."""
+    recovery = data.get(_PENDING_EV_RELEASE_RECOVERY)
+    if not isinstance(recovery, dict):
+        return data
+    retained = dict(data)
+    for key in _EV_RELEASE_FIELDS:
+        if key not in recovery:
+            continue
+        if recovery[key] is None:
+            retained.pop(key, None)
+        else:
+            retained[key] = recovery[key]
+    return retained
 
 
 def _climate_event_signature(event: dict[str, Any]) -> dict[str, Any]:

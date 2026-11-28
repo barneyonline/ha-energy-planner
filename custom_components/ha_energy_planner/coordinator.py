@@ -7,13 +7,14 @@ import hashlib
 import json
 import logging
 from collections import deque
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
-from functools import cached_property
+from functools import cached_property, partial
 from itertools import islice
 from math import isfinite
 from time import monotonic, perf_counter
@@ -150,10 +151,10 @@ from .enphase_export_limit import feedback as export_limit_feedback
 from .enphase_export_limit import feedback_entity_id as export_limit_feedback_entity_id
 from .enphase_export_limit import target_identity as export_target_identity
 from .entry_data import combined_entry_data
-from .ev import ev_charging_state, ev_charging_state_proves_active
+from .ev import ev_charging_state
 from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power
-from .ev_runtime import audit_evidence
+from .ev_runtime import EVRestoreFeedback, audit_evidence, ev_cap_may_become_active
 from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
 from .export_limit_cooldown import control_key, cooldown_status, normalized_record, same_control
@@ -175,6 +176,7 @@ from .forecasts import (
     TARIFF_VALUE_KEYS,
     TariffSnapshotBudget,
     _canonical_key,
+    cacheable_tariff_snapshot,
     tariff_mapping_items,
     tariff_snapshot_matches,
     tariff_source_attributes,
@@ -389,6 +391,17 @@ class _RefreshMode(Enum):
     IMMEDIATE = auto()  # Enter Core's serialized refresh directly.
 
 
+@dataclass(slots=True)
+class _EVCapacityWork:
+    save_needed: bool = False
+    save_pending: bool = False
+    invalidate_on_resume: bool = False
+    refresh_after_save: bool = False
+    refresh_needed: bool = False
+    refresh_pending: bool = False
+    refresh_request: object | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _DebounceRequest:
     deadline: float
@@ -443,6 +456,7 @@ class _PlanExecution:
     mapped_entry_data: dict[str, Any] | None = None
     tariffs_current: Callable[[], bool] | None = None
     entry_options: dict[str, Any] | None = None
+    ev_capacity_request: object | None = None
 
 
 @dataclass(slots=True)
@@ -555,6 +569,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.current_ev_allocation_deadline = lambda: self._ev_allocation_deadline
         self._ev_allocation_cancel: Callable[[], None] | None = None
         self._ev_allocation_deadline: Any = None
+        self._ev_capacity_work: _EVCapacityWork | None = None
+        self._ev_capacity_flush_needed = False
+        self._failed_startup_restore_running = False
+        self._failed_startup_restore_needed = False
+        self._failed_startup_restore_watch_cancel: Callable[[], None] | None = None
+        self._failed_startup_restore_flush_needed = False
+        self._failed_startup_restore_hvac_entities: frozenset[str] = frozenset()
+        self._failed_startup_restore_device_scopes: dict[str, set[str]] = {}
+        self._failed_startup_restore_ev_feedback = EVRestoreFeedback()
 
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
@@ -587,6 +610,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_non_manual_refresh_requested_at: float | None = None
         self._pending_refresh_trigger = "startup"
         self._last_decision_fingerprint: str | None = None
+        self._last_tariff_fingerprints: dict[str, _TariffFingerprint] = {}
         self._last_decision_context: DecisionContext | None = None
         self._last_decision_generation: int | None = None
         self._retained_forecast_snapshot: dict[str, Any] = {}
@@ -809,19 +833,37 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_config_entry_first_refresh(self) -> None:
         """Capture device feedback while the first plan awaits publication."""
+        async with self._async_capture_initial_device_feedback(release_hvac=True):
+            await super().async_config_entry_first_refresh()
+
+    def observe_initial_ev_feedback(self, observations: ExitStack) -> bool:
+        """Track retained charger feedback until the normal listeners attach."""
+        return self.executor.observe_ev_setup(observations, lambda increased: self._schedule_ev_capacity_feedback(
+            invalidate=increased, refresh=False,
+        ))
+
+    def _retain_native_ev_signal(self, entity_id: str, state: State | None, previous: State | None) -> None:
+        if (increased := self.executor.note_native_ev_signal_report(entity_id, state, previous)) is not None:
+            self._schedule_ev_capacity_feedback(invalidate=increased, refresh=increased)
+
+    @asynccontextmanager
+    async def _async_capture_initial_device_feedback(self, *, release_hvac: bool) -> AsyncIterator[None]:
+        """Preserve manual HVAC handoffs before runtime listeners are attached."""
         from .daikin_memory import owned_control_data
 
         entry_data = self.entry_data
         ownership = self.store.data.get("ownership", {})
-        control_data = owned_control_data(entry_data, ownership.get("hvac_control", {}))
+        control = ownership.get("hvac_control", {})
+        control_data = owned_control_data(entry_data, control)
         entities = {
             entity for data in (entry_data, control_data) for key in (CONF_EV_CHARGING, CONF_DAIKIN_CLIMATE)
             if (entity := data.get(key))
         }
         for data in (entry_data, control_data):
             entities.update(_split_entity_values(data.get(CONF_CLIMATE_ZONES)))
+        entities.update(control.get("zone_states", {}))
         if not entities:
-            await super().async_config_entry_first_refresh()
+            yield
             return
         unchanged_calendar_feedback: dict[ActionAsset, _UnchangedCalendarFeedback] = {}
         outages: _HvacOutages = self.__dict__.setdefault("_hvac_outages", _HvacOutages())
@@ -830,9 +872,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         @callback
         def capture_feedback(event: Any) -> None:
-            current = owned_control_data(
-                self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}),
-            )
+            current_ownership = self.store.data.get("ownership", {})
+            current_control = current_ownership.get("hvac_control", {})
+            current = owned_control_data(self.entry_data, current_control)
             entity_id = event.data["entity_id"]
             is_main = entity_id == current.get(CONF_DAIKIN_CLIMATE)
             now = dt_util.utcnow()
@@ -840,14 +882,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self.executor.hvac_mode_feedback.mode_feedback_at(
                     entity_id, event.data.get("new_state"), previous=event.data.get("old_state"),
                 )
-            if is_main or entity_id in _split_entity_values(current.get(CONF_CLIMATE_ZONES)):
+            if (is_main or entity_id in _split_entity_values(current.get(CONF_CLIMATE_ZONES))
+                    or entity_id in current_control.get("zone_states", {})):
                 can_supersede = (self.executor.pending_hvac_desired_state is not None
-                                 or has_hvac_ownership(self.store.data.get("ownership", {})))
+                                 or has_hvac_ownership(current_ownership))
                 outage = _track_hvac_outage(event, entity_id, outages, can_supersede=can_supersede)
                 if outage.manual_stage is not None:
                     self._record_hvac_outage_feedback(event, entity_id, outage, now)
-                direct_edit = can_supersede and _is_first_refresh_hvac_edit(
-                    event, outage.excluded_context_ids,
+                direct_edit = can_supersede and (
+                    _is_first_refresh_hvac_edit(event, outage.excluded_context_ids)
+                    or self._manual_edit_before_first_hvac_observation(
+                        event, entity_id, outage, outages, is_main=is_main,
+                    )
                 )
                 if outage.manual_stage is not None or direct_edit:
                     self._initial_hvac_manual_pending = True
@@ -861,21 +907,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._record_calendar_feedback(event, current, now, unchanged_calendar_feedback)
 
         unsubscribe = async_track_state_change_event(self.hass, entities, capture_feedback)
-        refreshed = False
+        completed = False
         try:
-            await super().async_config_entry_first_refresh()
-            refreshed = True
+            yield
+            completed = True
         finally:
             captured_handoff = handoff.main or bool(handoff.zones)
             try:
                 if captured_handoff:
-                    handoff.release = refreshed
+                    handoff.release = release_hvac and completed
                     await self._async_finish_initial_hvac_handoff(handoff)
             finally:
                 self._initial_hvac_manual_pending = False
                 self._initial_hvac_handoff = None
                 unsubscribe()
-        if captured_handoff:
+        if captured_handoff and release_hvac:
             self._refresh_after_initial_hvac_handoff = True
 
     async def _async_finish_initial_hvac_handoff(self, handoff: _HvacHandoff) -> None:
@@ -984,6 +1030,44 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 executor.mark_pending_hvac_manual_override()
             else:
                 executor.mark_pending_hvac_zone_manual_override(entity_id)
+
+    def _manual_edit_before_first_hvac_observation(
+        self, event: Any, entity_id: str, outage: _HvacOutageFeedback, outages: _HvacOutages, *, is_main: bool = False,
+    ) -> bool:
+        """Protect explicit controls on the first report from an unavailable owned actuator."""
+        if outage.baseline is not None:
+            return False
+        old, new = event.data.get("old_state"), event.data.get("new_state")
+        if hvac_feedback_is_observed(old) or not hvac_feedback_is_observed(new):
+            return False
+        old_context = getattr(getattr(old, "context", None), "id", None)
+        excluded = outage.excluded_context_ids.union(
+            outages.unavailable_attributed_contexts.get(entity_id, ()),
+            (old_context,) if old_context else (),
+        )
+        if (
+            not _fresh_hvac_user_context_ids(event, excluded)
+            or not startup_recovery._failed_startup_has_restore_targets(self)
+        ):
+            return False
+        control = self.store.data.get("ownership", {}).get("hvac_control", {})
+        target = control.get("main_state") if is_main else control.get("zone_states", {}).get(entity_id)
+        if isinstance(target, str):
+            return new.state in {"on", "off"} and new.state != target
+        if not isinstance(target, dict):
+            return False
+        if (mode := target.get("hvac_mode")) and new.state != mode:
+            return True
+        return any(
+            (saved := finite(target.get(saved_key))) is not None
+            and (observed := finite(new.attributes.get(observed_key))) is not None
+            and not _matching_hvac_target(saved, observed)
+            for saved_key, observed_key in (
+                ("target_temperature", "temperature"),
+                ("target_temp_low", "target_temp_low"),
+                ("target_temp_high", "target_temp_high"),
+            )
+        )
 
     @callback
     def _queue_manual_hvac_change(
@@ -1112,6 +1196,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     def async_start_listeners(self) -> None:
         """Start debounced state listeners for configured input entities."""
+        resuming = getattr(self, "_tearing_down", False)
         self._tearing_down = False
         training = self.__dict__.get("history_training")
         if training is not None and training.closed:
@@ -1120,16 +1205,28 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         entry_data = self.entry_data
         self._start_load_forecast_source_listener(entry_data)
         from .daikin_memory import owned_control_data
-        control_data = owned_control_data(
-            entry_data, getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {}))
-        entity_ids = list(dict.fromkeys([*_configured_entity_ids(entry_data), *_configured_entity_ids(control_data)]))
+        hvac_control = getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {})
+        entity_ids, retained_zones = _state_listener_targets(entry_data, hvac_control)
         export_feedback_entity = export_limit_feedback_entity_id(
             self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
         )
         if export_feedback_entity and export_feedback_entity not in entity_ids:
             entity_ids.append(export_feedback_entity)
         external_ev_reservation = getattr(getattr(self, "store", None), "data", {}).get("ev_grid_reservation", {})
-        if not entity_ids and external_ev_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True:
+        external_ev = external_ev_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+        remapped_ev = getattr(getattr(self, "executor", None), "remapped_owned_ev_feedback", None)
+        owned_ev = remapped_ev(entry_data) if callable(remapped_ev) else (None, None)
+        managed_ev = getattr(getattr(self, "executor", None), "managed_ev_feedback", None)
+        signal_sources = getattr(getattr(self, "executor", None), "native_ev_signal_sources", None)
+        empty_signals = (None, None, None)
+        initial_signal_ids = signal_sources() if callable(signal_sources) else empty_signals
+        native_signal_ids: tuple[str | None, str | None, str | None] = empty_signals
+        record_ev_evidence = partial(self._schedule_ev_capacity_feedback, invalidate=False)
+        persist_ev_evidence = partial(record_ev_evidence, refresh=False)
+        if not entity_ids and not external_ev and not any(owned_ev) and not any(initial_signal_ids):
+            startup_recovery._watch_failed_startup_restore(self)
+            if resuming:
+                self._resume_ev_capacity_feedback()
             return
         outages: _HvacOutages = self.__dict__.setdefault("_hvac_outages", _HvacOutages())
         unchanged_calendar_feedback: dict[ActionAsset, _UnchangedCalendarFeedback] = {}
@@ -1138,36 +1235,59 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         watched_ev_inputs: tuple[str | None, str | None, str | None, str | None, str | None] = (
             None, None, None, None, None,
         )
+        watched_ev_reports: tuple[str, ...] = ()
 
         @callback
-        def _unwatch_external_ev_reports() -> None:
-            nonlocal watched_ev_inputs
+        def _unwatch_retained_ev_reports() -> None:
+            nonlocal watched_ev_inputs, watched_ev_reports
             while unsubscribe_ev_reports:
                 unsubscribe_ev_reports.pop()()
             watched_ev_inputs = (None, None, None, None, None)
+            watched_ev_reports = ()
 
         @callback
-        def _sync_external_ev_watch() -> None:
-            nonlocal watched_ev_inputs
-            if self.store.data.get("ev_grid_reservation", {}).get(EV_RESERVATION_EXTERNAL_BASELINE) is not True:
-                _unwatch_external_ev_reports()
+        def _sync_retained_ev_watch() -> None:
+            nonlocal watched_ev_inputs, watched_ev_reports, native_signal_ids
+            previous_signal_ids = native_signal_ids
+            native_signal_ids = signal_sources() if callable(signal_sources) else empty_signals
+            external = self.store.data.get("ev_grid_reservation", {}).get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+            if external:
+                inputs = self.executor.external_ev_watch_inputs()
+                report_ids = tuple(entity for entity in inputs[:3] if entity)
+            else:
+                current = combined_entry_data(self.entry)
+                power_id, limit_id = remapped_ev(current) if callable(remapped_ev) else (None, None)
+                control, charging, connected = native_signal_ids
+                inputs = (control if control not in entity_ids else None,
+                          charging if charging not in entity_ids else None, power_id, limit_id,
+                          connected if connected not in entity_ids else None)
+                report_ids = tuple(dict.fromkeys(entity for entity in (*native_signal_ids, power_id) if entity))
+            for signal_id in native_signal_ids:
+                if signal_id and signal_id not in previous_signal_ids:
+                    self._retain_native_ev_signal(signal_id, self.hass.states.get(signal_id), None)
+            if not any(inputs) and not report_ids:
+                _unwatch_retained_ev_reports()
                 return
-            inputs = self.executor.external_ev_watch_inputs()
-            if inputs != watched_ev_inputs:
-                _unwatch_external_ev_reports()
+            if inputs != watched_ev_inputs or report_ids != watched_ev_reports:
+                sync_capacity = external or inputs[2:4] != watched_ev_inputs[2:4]
+                _unwatch_retained_ev_reports()
                 watched_ev_inputs = inputs
+                watched_ev_reports = report_ids
                 state_changes = tuple(entity for entity in inputs if entity)
                 # A newer sample can corroborate a stop even when its value is unchanged.
-                unsubscribe_ev_reports.extend((
-                    async_track_state_report_event(
-                        self.hass, tuple(entity for entity in inputs[:3] if entity), _handle_external_ev_report,
-                    ),
-                    async_track_state_change_event(self.hass, state_changes, _handle_external_ev_state_change),
-                ))
+                if report_ids:
+                    unsubscribe_ev_reports.append(async_track_state_report_event(
+                        self.hass, report_ids, _handle_retained_ev_report,
+                    ))
+                if state_changes:
+                    unsubscribe_ev_reports.append(
+                        async_track_state_change_event(self.hass, state_changes, _handle_retained_ev_state_change),
+                    )
                 # The original charger may have reported while this entry was
-                # unloaded or still attaching its saved reservation.
-                if self.executor.sync_ev_grid_reservation():
-                    _persist_increased_ev_capacity()
+                # unloaded. Attaching activity-only sources can also happen
+                # during start preparation, before the new cap is applied.
+                if sync_capacity and self.executor.sync_ev_grid_reservation(on_evidence_changed=record_ev_evidence):
+                    self._schedule_ev_capacity_feedback()
             _check_external_ev_stop()
 
         @callback
@@ -1180,9 +1300,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 nonlocal external_ev_stop_pending
                 try:
                     async with self._command_lock:
-                        if not self._tearing_down:
-                            # An intervening restart or acquisition can supersede the event.
-                            await self.executor.async_release_stopped_external_ev_grid_capacity()
+                        # An intervening restart or acquisition can supersede the event.
+                        if not self._tearing_down and self.executor.release_stopped_external_ev_grid_capacity():
+                            await self._async_flush_ev_capacity_feedback()
                 finally:
                     external_ev_stop_pending = False
 
@@ -1190,64 +1310,92 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._async_create_listener_task(_release())
 
         @callback
-        def _handle_external_ev_report(event: Any) -> None:
-            if (event.data.get("entity_id") == watched_ev_inputs[2]
-                    and self.executor.note_ev_grid_power_report(event.data["new_state"])):
-                _persist_increased_ev_capacity()
+        def _handle_ev_power_report(event: Any) -> None:
+            if self.executor.note_ev_grid_power_report(
+                event.data["new_state"], on_evidence_changed=record_ev_evidence,
+                received_at=event.data["last_reported"],
+            ):
+                self._schedule_ev_capacity_feedback()
+
+        @callback
+        def _handle_managed_ev_power_report(event: Any) -> None:
+            current = combined_entry_data(self.entry)
+            power_id, _limit_id = managed_ev(current) if callable(managed_ev) else (
+                current.get("ev_power_entity"), current.get("ev_power_limit_entity"),
+            )
+            # Retained watches receive their own reports. A queued callback
+            # for a released or replaced source no longer has authority.
+            if event.data["entity_id"] == power_id and power_id != watched_ev_inputs[2]:
+                _handle_ev_power_report(event)
+
+        @callback
+        def _handle_retained_ev_report(event: Any) -> None:
+            entity_id = event.data["entity_id"]
+            if entity_id == watched_ev_inputs[2]:
+                _handle_ev_power_report(event)
+            elif entity_id in native_signal_ids:
+                if self.executor.note_native_ev_signal_heartbeat(event.data["new_state"], event.data["last_reported"]):
+                    persist_ev_evidence()
+                return
+            else:
+                state = event.data["new_state"]
+                if self.executor.note_external_ev_signal_clock(entity_id, state, state, event.data["last_reported"]):
+                    persist_ev_evidence()
             _check_external_ev_stop()
 
         @callback
-        def _handle_external_ev_state_change(event: Any) -> None:
+        def _handle_retained_ev_state_change(event: Any) -> None:
             entity_id = event.data["entity_id"]
             new_state = event.data["new_state"]
             control_id, charging_id, power_id, limit_id, connected_id = watched_ev_inputs
-            power_state = (
-                new_state if entity_id == power_id and entity_id != entry_data.get("ev_power_entity")
-                else None
+            if entity_id in native_signal_ids and entity_id not in entity_ids:
+                self._retain_native_ev_signal(entity_id, new_state, event.data["old_state"])
+            current = combined_entry_data(self.entry)
+            regular_power, regular_limit = managed_ev(current) if callable(managed_ev) else (
+                current.get("ev_power_entity"), current.get("ev_power_limit_entity"),
             )
-            limit_state = (
-                new_state if entity_id == limit_id and entity_id != entry_data.get("ev_power_limit_entity")
-                else None
-            )
+            handled_by_regular_watch = entity_id in entity_ids and entity_id in (regular_power, regular_limit)
+            power_state = new_state if entity_id == power_id and not handled_by_regular_watch else None
+            limit_state = new_state if entity_id == limit_id and not handled_by_regular_watch else None
             feedback = getattr(new_state, "state", None)
-            cap_may_become_active = feedback != getattr(event.data["old_state"], "state", None) and (
-                (entity_id in (control_id, connected_id) and connection(feedback) is True)
-                or (entity_id == charging_id and ev_charging_state_proves_active(feedback))
+            external = self.store.data.get("ev_grid_reservation", {}).get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+            activity_changed = False
+            if external and entity_id in (control_id, charging_id, connected_id):
+                receipt = new_state.last_updated if new_state is not None else None
+                activity_changed = self.executor.note_external_ev_signal_clock(
+                    entity_id, new_state, event.data["old_state"], receipt,
+                )
+            cap_may_become_active = ev_cap_may_become_active(
+                entity_id, getattr(event.data["old_state"], "state", None), feedback,
+                control_ids=(control_id, connected_id if external else None), charging_id=charging_id,
             )
             # A cap first reported while idle can become usable without changing its setpoint.
             if (
                 (power_state is not None or limit_state is not None or cap_may_become_active)
-                and self.executor.sync_ev_grid_reservation(power_state=power_state, limit_state=limit_state)
+                and self.executor.sync_ev_grid_reservation(
+                    power_state=power_state, limit_state=limit_state, on_evidence_changed=record_ev_evidence,
+                )
             ):
-                _persist_increased_ev_capacity()
+                self._schedule_ev_capacity_feedback()
+            elif activity_changed:
+                persist_ev_evidence()
             _check_external_ev_stop()
 
-        @callback
-        def _persist_increased_ev_capacity() -> None:
-            # Reject any start still preparing under the command lock.
-            self._mark_replan_requested(force=True)
-
-            async def persist_and_refresh_ev_capacity() -> None:
-                # Read the current reservation under the lock, after any queued stop or reduction.
-                try:
-                    async with self._command_lock:
-                        if getattr(self, "_tearing_down", False):
-                            return
-                        await self.executor.async_persist_ev_grid_reservation()
-                except Exception as error:
-                    _LOGGER.warning(
-                        "EV capacity persistence failed (%s); requesting a safety refresh",
-                        type(error).__name__,
-                    )
-                if not getattr(self, "_tearing_down", False):
-                    self._attribute_forced_refresh("ev_capacity_increased")
-                    await self.async_request_refresh()
-
-            self._async_create_listener_task(persist_and_refresh_ev_capacity())
-
-        @callback
-        def _handle_state_change(event: Any) -> None:
+        def _process_state_change(event: Any) -> None:
             self._wake_startup_auto_recovery()
+            entity_id = str(event.data.get("entity_id") or "")
+            if entity_id in retained_zones:
+                zone_states = self.store.data.get("ownership", {}).get("hvac_control", {}).get("zone_states", {})
+                if entity_id in zone_states:
+                    outage = _track_hvac_outage(event, entity_id, outages, can_supersede=True)
+                    if (outage.manual_stage is not None
+                            or _is_first_refresh_hvac_edit(event, outage.excluded_context_ids)
+                            or self._manual_edit_before_first_hvac_observation(event, entity_id, outage, outages)):
+                        self._mark_explicit_hvac_change(entity_id, is_main=False)
+                        self._queue_manual_hvac_change(event, entity_id, outages, is_main=False)
+                else:
+                    _refresh_input_subscription()
+                return
             raw_data = combined_entry_data(self.entry)
             if (
                 VEHICLES in raw_data
@@ -1288,9 +1436,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             now = dt_util.utcnow()
             self._record_calendar_feedback(event, entry_data, now, unchanged_calendar_feedback)
             executor = getattr(self, "executor", None)
-            limit_entity = entry_data.get("ev_power_limit_entity")
-            if (event.data.get("entity_id") in {limit_entity, entry_data.get("ev_power_entity")}
-                    and executor is not None):
+            if entity_id in native_signal_ids:
+                self._retain_native_ev_signal(entity_id, event.data.get("new_state"), event.data.get("old_state"))
+            power_entity, limit_entity = managed_ev(entry_data) if callable(managed_ev) else (
+                entry_data.get("ev_power_entity"), entry_data.get("ev_power_limit_entity"),
+            )
+            if entity_id in (power_entity, limit_entity) and executor is not None:
                 expected_feedback = getattr(executor, "ev_start_limit_feedback", None)
                 old, new = event.data.get("old_state"), event.data.get("new_state")
                 if event.data.get("entity_id") == limit_entity and expected_feedback is not None:
@@ -1305,11 +1456,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     # generic replanning thresholds would ignore a small change.
                     self._mark_replan_requested()
                 if executor.sync_ev_grid_reservation(
-                    power_state=(event.data.get("new_state")
-                                 if event.data.get("entity_id") == entry_data.get("ev_power_entity") else None),
+                    power_state=new if entity_id == power_entity else None,
                     limit_state=new if event.data.get("entity_id") == limit_entity else None,
+                    on_evidence_changed=record_ev_evidence,
                 ):
-                    _persist_increased_ev_capacity()
+                    self._schedule_ev_capacity_feedback()
                     return
             charging_entity = entry_data.get(CONF_EV_CHARGING)
             if charging_entity and event.data.get("entity_id") == charging_entity:
@@ -1336,7 +1487,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 for command in feedback_commands
                 if (deadline := _parse_datetime_or_none(command.get("deadline"))) is not None and now < deadline
             ]
-            entity_id = str(event.data.get("entity_id") or "")
             if entity_id in {entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_feedback_entity}:
                 if entity_id != export_feedback_entity or not self._only_export_readback_advanced(
                     event.data.get("old_state"), event.data.get("new_state"), now,
@@ -1355,6 +1505,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     or has_hvac_ownership(self.store.data.get("ownership", {}))
                 )
                 outage = _track_hvac_outage(event, entity_id, outages, can_supersede=can_supersede)
+                if outage.manual_stage is None and self._manual_edit_before_first_hvac_observation(
+                    event, entity_id, outage, outages, is_main=is_main_climate,
+                ):
+                    outage = replace(outage, manual_stage="manual_recovery")
                 if (hvac_feedback_is_observed(old) and hvac_feedback_is_observed(new)
                         and (attributed := _hvac_attributed_context_ids(event))
                         and attributed <= outage.excluded_context_ids):
@@ -1524,36 +1678,55 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return
             self._schedule_debounced_refresh("state_change")
 
+        @callback
+        def _handle_state_change(event: Any) -> None:
+            # A terminal restore job can run eagerly. Record manual
+            # supersession before the same report can make a restore runnable.
+            _process_state_change(event)
+            startup_recovery._observe_failed_startup_availability(self, event)
+
         unsubscribe_states = async_track_state_change_event(self.hass, entity_ids, _handle_state_change)
 
         @callback
         def _unsubscribe_states() -> None:
+            self.__dict__.pop("_refresh_input_subscription", None)
             unsubscribe_states()
 
         self._unsub_listeners.append(_unsubscribe_states)
-        if (external_ev_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+        if (ev_power_entity := entry_data.get("ev_power_entity")) and entry_data.get("ev_power_limit_entity"):
+            # A command can be confirmed by a new sample with an unchanged value.
+            self._unsub_listeners.append(async_track_state_report_event(
+                self.hass, (ev_power_entity,), _handle_managed_ev_power_report,
+            ))
+        if (external_ev or any(owned_ev) or any(initial_signal_ids)
                 or any(entry_data.get(key) for key in (CONF_EV_CHARGER, CONF_EV_SMART_CHARGING,
                                                         CONF_EV_CHARGING, "ev_power_entity"))):
-            self.executor.ev_grid_reservation_persisted = _sync_external_ev_watch
+            self.executor.ev_grid_reservation_persisted = _sync_retained_ev_watch
+            self.executor.ev_grid_draw_observed = persist_ev_evidence
+            if add_ownership_listener := getattr(self.store, "async_add_ownership_listener", None):
+                self._unsub_listeners.append(add_ownership_listener(_sync_retained_ev_watch))
 
             @callback
-            def _unsubscribe_external_ev_stop() -> None:
+            def _unsubscribe_retained_ev() -> None:
                 self.executor.ev_grid_reservation_persisted = None
-                _unwatch_external_ev_reports()
+                self.executor.ev_grid_draw_observed = None
+                _unwatch_retained_ev_reports()
 
-            self._unsub_listeners.append(_unsubscribe_external_ev_stop)
-            _sync_external_ev_watch()
+            self._unsub_listeners.append(_unsubscribe_retained_ev)
+            _sync_retained_ev_watch()
 
         @callback
         def _refresh_input_subscription() -> None:
-            nonlocal unsubscribe_states
-            control_data = owned_control_data(
-                self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}))
-            watched = list(dict.fromkeys([*_configured_entity_ids(self.entry_data),
-                                          *_configured_entity_ids(control_data)]))
-            sensor = export_limit_feedback_entity_id(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY))
+            nonlocal entity_ids, retained_zones, unsubscribe_states
+            entry_data = self.entry_data
+            control = self.store.data.get("ownership", {}).get("hvac_control", {})
+            watched, retained_zones = _state_listener_targets(entry_data, control)
+            sensor = export_limit_feedback_entity_id(self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY))
             if sensor and sensor not in watched:
                 watched.append(sensor)
+            if watched == entity_ids:
+                return
+            entity_ids = watched
             unsubscribe_states()
             unsubscribe_states = async_track_state_change_event(self.hass, watched, _handle_state_change)
 
@@ -1563,21 +1736,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if export_entity and export_entity.startswith("select."):
             @callback
             def _handle_export_registry_change(_event: Any) -> None:
-                nonlocal export_feedback_entity, unsubscribe_states
+                nonlocal export_feedback_entity
                 if self._tearing_down:
                     return
                 sensor = export_limit_feedback_entity_id(self.hass, export_entity)
                 if sensor == export_feedback_entity:
                     return
                 export_feedback_entity = sensor
-                control_data = owned_control_data(
-                    self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}))
-                watched_entities = list(dict.fromkeys([*_configured_entity_ids(self.entry_data),
-                                                       *_configured_entity_ids(control_data)]))
-                if sensor and sensor not in watched_entities:
-                    watched_entities.append(sensor)
-                unsubscribe_states()
-                unsubscribe_states = async_track_state_change_event(self.hass, watched_entities, _handle_state_change)
+                _refresh_input_subscription()
                 self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
 
             self._unsub_listeners.append(self.hass.bus.async_listen(
@@ -1619,12 +1785,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._async_create_listener_task(self._async_handle_manual_override_helper(True))
         elif helper_value == "off" and helper_override_active:
             self._async_create_listener_task(self._async_handle_manual_override_helper(False))
+        if resuming:
+            # A retained charger can report while listeners are detached for unload.
+            if (not external_ev and (entry_data.get("ev_power_entity") or entry_data.get("ev_power_limit_entity"))
+                    and self.executor.sync_ev_grid_reservation(on_evidence_changed=record_ev_evidence)):
+                self._schedule_ev_capacity_feedback()
+            self._resume_ev_capacity_feedback()
         if self.__dict__.pop("_refresh_after_initial_hvac_handoff", False):
             self._async_create_listener_task(self.async_request_refresh())
+        startup_recovery._watch_failed_startup_restore(self)
 
     async_start_startup_auto_recovery = startup_recovery.async_start_startup_auto_recovery
 
     _wake_startup_auto_recovery = startup_recovery._wake_startup_auto_recovery
+    _async_fail_startup_recovery = startup_recovery._async_fail_startup_recovery
+    _async_restore_failed_startup = startup_recovery._async_restore_failed_startup
+    _queue_failed_startup_restore = startup_recovery._queue_failed_startup_restore
 
     def _start_load_forecast_source_listener(self, entry_data: dict[str, Any]) -> None:
         """Retry startup training once when the mapped load source appears."""
@@ -1666,6 +1842,103 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         _retry_if_available(self.hass.states.get(load_entity))
 
     _async_create_listener_task = task_lifecycle._async_create_listener_task
+
+    @callback
+    def _schedule_ev_capacity_feedback(
+        self, *, invalidate: bool = True, refresh: bool = True, retain_during_shutdown: bool = False,
+    ) -> None:
+        """Invalidate pending plans and coalesce durable reservation feedback."""
+        if self._tearing_down and not retain_during_shutdown:
+            return
+        if invalidate and not self._tearing_down:
+            self._mark_replan_requested(force=True)
+        # A failed or cancelled unload can reattach listeners while a save drains.
+        work = getattr(self, "_ev_capacity_work", None)
+        if work is None:
+            work = self._ev_capacity_work = _EVCapacityWork()
+        work.save_needed = True
+        work.refresh_after_save |= refresh
+        if self._tearing_down:
+            work.invalidate_on_resume |= invalidate
+            self._ev_capacity_flush_needed = True
+        elif not work.save_pending:
+            work.save_pending = True
+            self._async_create_listener_task(self._async_persist_ev_capacity_feedback(work))
+
+    async def _async_persist_ev_capacity_feedback(self, work: _EVCapacityWork) -> None:
+        try:
+            while work.save_needed:
+                async with self._command_lock:
+                    # A newer reading during the save leaves another pass pending.
+                    work.save_needed = False
+                    refresh = work.refresh_after_save
+                    work.refresh_after_save = False
+                    try:
+                        await self._async_flush_ev_capacity_feedback()
+                    except Exception as error:
+                        _LOGGER.warning(
+                            "EV capacity persistence failed (%s)", type(error).__name__,
+                        )
+                if refresh:
+                    self._queue_ev_capacity_refresh(work)
+        finally:
+            work.save_pending = False
+
+    def _queue_ev_capacity_refresh(self, work: _EVCapacityWork) -> None:
+        # Keep refresh intent through a failed unload, independently of Store writes.
+        work.refresh_needed = True
+        if not self._tearing_down and not work.refresh_pending:
+            work.refresh_pending = True
+            self._async_create_listener_task(self._async_refresh_ev_capacity(work))
+
+    def _resume_ev_capacity_feedback(self) -> None:
+        if (deadline := getattr(self, "_ev_allocation_deadline", None)) is not None:
+            self._schedule_ev_allocation_deadline(deadline)
+        work = getattr(self, "_ev_capacity_work", None)
+        if work is not None and work.invalidate_on_resume:
+            work.invalidate_on_resume = False
+            self._mark_replan_requested(force=True)
+            work.save_needed = True
+        if work is not None and work.save_needed:
+            self._schedule_ev_capacity_feedback(invalidate=False, refresh=False)
+        if work is not None and work.refresh_needed and not work.save_pending:
+            self._queue_ev_capacity_refresh(work)
+
+    def _acknowledge_ev_capacity_refresh(self, request: object | None) -> None:
+        work = getattr(self, "_ev_capacity_work", None)
+        if work is not None and work.refresh_request is request:
+            work.refresh_request = None
+
+    def _resume_ev_capacity_after_validation(self) -> None:
+        work = getattr(self, "_ev_capacity_work", None)
+        if work is not None and work.refresh_request is not None:
+            self._queue_ev_capacity_refresh(work)
+
+    async def _async_refresh_ev_capacity(self, work: _EVCapacityWork) -> None:
+        try:
+            while work.refresh_needed and not self._tearing_down:
+                work.refresh_needed = False
+                # Core can accept a debounced request without running it yet.
+                work.refresh_request = object()
+                self._attribute_forced_refresh("ev_capacity_feedback")
+                try:
+                    await self.async_request_refresh()
+                except Exception as error:
+                    _LOGGER.warning("EV capacity refresh request failed (%s)", type(error).__name__)
+        finally:
+            work.refresh_pending = False
+
+    async def _async_flush_ev_capacity_feedback(self) -> None:
+        """Persist the current EV reservation while the caller holds the command lock."""
+        self._ev_capacity_flush_needed = True
+        work = getattr(self, "_ev_capacity_work", None)
+        if self._tearing_down and work is not None:
+            work.save_needed = False
+        await self.executor.async_persist_ev_grid_reservation()
+        # A concurrent planner cycle can defer ordinary Store writes.
+        await self.store.async_flush()
+        work = getattr(self, "_ev_capacity_work", None)
+        self._ev_capacity_flush_needed = self._tearing_down and work is not None and work.save_needed
 
     async def _async_flush_calendar_feedback(self) -> None:
         """Retry unsaved feedback on the next observation or while draining for unload."""
@@ -1982,6 +2255,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             elif has_entry:
                 self._admit_export_reconciliation()
             retried_export_preflight = False
+            deferred_execution: _PlanExecution | None = None
+            ev_request: object | None = None
             while True:
                 prepared_weather = None
                 preflight_export = None
@@ -2029,6 +2304,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                             retried_export_preflight = True
                             continue
                     try:
+                        ev_work = getattr(self, "_ev_capacity_work", None)
+                        ev_request = ev_work.refresh_request if ev_work is not None else None
                         pending_arm = getattr(self, "_export_operator_arm", None)
                         if pending_arm is not None and pending_arm.rollback_pending:
                             await self._async_finish_operator_arm_rollback(pending_arm)
@@ -2082,7 +2359,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._schedule_debounced_refresh("refresh_superseded", mode=_RefreshMode.IMMEDIATE, force=True)
                 return self.data
             if deferred_execution is not None:
+                if ev_request is not None:
+                    deferred_execution = replace(deferred_execution, ev_capacity_request=ev_request)
                 self._schedule_plan_execution(deferred_execution)
+            elif not getattr(self, "_startup_auto_recovery_validation_active", False):
+                self._acknowledge_ev_capacity_refresh(ev_request)
             succeeded = True
             return result
         finally:
@@ -2406,6 +2687,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if seed is not None and not can_seed_current_mapping():
             await export_control.save({})
             await self.store.async_flush()
+        self._failed_startup_restore_flush_needed = False
+        startup_recovery._retire_failed_startup_restore_watch(self)
         self._schedule_export_retry()
 
     def _export_retry_control(self) -> ExportLimitControl | None:
@@ -2818,7 +3101,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             and not dry_control.get("required_evidence_lost")
         )
         self._log_dry_takeover_transition(dry_hvac is not None and HVAC_DRY_ZONE_TARGETS_ABSENT in dry_hvac.issues)
-        tariff_fingerprints: dict[str, str] = {}
+        tariff_fingerprints: dict[str, _TariffFingerprint] = {}
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
             entry_data,
@@ -2827,10 +3110,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             now=dt_util.utcnow(),
             weather_forecast=weather_forecast,
             tariff_fingerprints=tariff_fingerprints,
+            previous_tariff_fingerprints=getattr(self, "_last_tariff_fingerprints", {}),
             dry_hvac=dry_hvac,
             dry_takeover_revision=getattr(self, "_dry_takeover_revision", 0),
             dry_during_provisional_off_start=dry_during_provisional_off_start,
         )
+        self._last_tariff_fingerprints = tariff_fingerprints
         if (
             not force_refresh
             and not getattr(self, "_export_reconcile_pending", False)
@@ -3248,6 +3533,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_reconcile_production_evidence_contract(self) -> bool:
         """Prepare startup control without discarding prior active intent."""
+        operator_disarm = getattr(self, "_operator_disarm_request", None)
         production = parse_production_state(self.store.data.get("production"))
         pause = self.store.data.get("control_pause")
         now = dt_util.utcnow()
@@ -3263,6 +3549,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         recovery = production.raw.get("startup_auto_recovery")
         recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
+        if (not production.armed and recovery_status == "failed" and isinstance(recovery, dict)
+                and recovery.get("last_reason") == "startup_recovery_save_failed"):
+            if getattr(self, "_refresh_input_subscription", None) is not None:
+                await self._async_restore_failed_startup()
+            else:
+                async with self._async_capture_initial_device_feedback(release_hvac=False):
+                    await self._async_restore_failed_startup()
+            return True
         operator_disarmed = isinstance(recovery, dict) and (
             recovery_status == "cancelled" and recovery.get("last_reason") == "operator_disarmed"
         )
@@ -3306,41 +3600,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
+        recovery_reason = None
         if self.active_control and pause_blocks_all_control and required_control_areas != [EXPORT_ASSET]:
             # A temporary pause remains authoritative, but it must not erase a
             # previously armed installation's automatic-control lifecycle.
-            # Persist the restart-resumable handoff before disarming so a
-            # reload or process stop between these operations still retries
-            # once the pause clears.
-            self._startup_auto_recovery_authorized = True
-            self._export_retry_startup_blocked = True
-            self._startup_auto_recovery_deadline = None
-            await self._async_update_startup_auto_recovery(
-                "waiting_for_safe",
-                successful_runs=0,
-                reason="startup_control_paused",
-            )
-            await self.async_disarm_production_control("startup_control_paused")
-            await self.async_restore_safe_state("startup_control_paused", refresh=False)
-            return True
-
-        if self.active_control and production.dry_run_evidence_fingerprint != expected_fingerprint:
+            recovery_reason = "startup_control_paused"
+        elif self.active_control and production.dry_run_evidence_fingerprint != expected_fingerprint:
             # A software or entry migration can change the evidence contract
-            # before configured entities have finished restoring. Fail closed,
-            # but preserve the previously armed automatic-control lifecycle so
-            # the post-startup recovery task can revalidate the new contract
-            # with three fresh, non-commanding plans instead of leaving the
-            # installation permanently disarmed with no task able to recover.
+            # before configured entities have finished restoring. Preserve the
+            # recovery handoff so fresh plans can validate the new contract.
+            recovery_reason = "production_evidence_contract_changed"
+        if recovery_reason is not None:
             self._startup_auto_recovery_authorized = True
             self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
             await self._async_update_startup_auto_recovery(
-                "waiting_for_safe",
-                successful_runs=0,
-                reason="production_evidence_contract_changed",
+                "waiting_for_safe", successful_runs=0, reason=recovery_reason, disarm_reason=recovery_reason,
             )
-            await self.async_disarm_production_control("production_evidence_contract_changed")
-            await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+            if self._startup_auto_recovery_authorized:
+                await self.async_restore_safe_state(recovery_reason, refresh=False)
             return True
 
         if self.active_control and not pause_blocks_all_control:
@@ -3363,6 +3641,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._startup_auto_recovery_authorized = True
             self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
+            reason = recovery.get("last_reason") if isinstance(recovery, dict) else None
+            if (
+                recovery_status == "waiting_for_safe"
+                and reason in ("startup_control_paused", "production_evidence_contract_changed")
+            ):
+                # A failed or interrupted disarm save can leave restoration outstanding.
+                await self.store.async_flush()
+                if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+                    return True
+                await self.async_restore_safe_state(reason, refresh=False)
+                if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+                    return True
             await self._async_update_startup_auto_recovery(
                 "waiting_for_home_assistant",
                 successful_runs=0,
@@ -4136,9 +4426,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     ) -> ActionOutcome:
         """Restore safe state and refresh."""
         async with self._command_lock:
-            outcome = await self.executor.async_restore_safe_state(
-                reason, preserve_export_retry=preserve_export_retry,
-            )
+            try:
+                outcome = await self.executor.async_restore_safe_state(
+                    reason, preserve_export_retry=preserve_export_retry,
+                )
+            finally:
+                if getattr(self, "_failed_startup_restore_watch_cancel", None) is not None:
+                    await startup_recovery._async_flush_failed_startup_restore(self)
+                startup_recovery._retire_failed_startup_restore_watch(self)
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
@@ -4901,7 +5196,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             calendar_events = calendar_event_records(self, plan)
             # Resolving live vehicle input during presentation can invalidate
             # a result whose identity changed while the planner was running.
-            if not is_current():
+            # The Store rechecks the complete tariff snapshot after staging,
+            # before any write can occur.
+            if not self._plan_inputs_current(
+                started_generation, mapped_entry_data, None, entry_options=entry_options,
+            ):
                 return None
             self.store.record_plan(plan, calendar_events=calendar_events)
             if record_evidence is not None:
@@ -4988,7 +5287,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                             action for action in plan.actions if action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT
                         ])
                     try:
-                        await self._async_execute_plan_if_current(
+                        evaluated_current_plan = await self._async_execute_plan_if_current(
                             started_generation,
                             plan,
                             request.context,
@@ -4996,6 +5295,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                             mapped_entry_data=request.mapped_entry_data,
                             tariffs_current=request.tariffs_current,
                             entry_options=request.entry_options,
+                            verify_ev_capacity_completion=request.ev_capacity_request is not None,
                         )
                     except Exception:
                         # Isolate one malformed or failed execution transaction
@@ -5004,6 +5304,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                             "Unexpected failure executing committed plan %s",
                             plan.plan_id,
                         )
+                    else:
+                        if evaluated_current_plan and not getattr(self, "_tearing_down", False):
+                            self._acknowledge_ev_capacity_refresh(request.ev_capacity_request)
                     finally:
                         # Executor outcomes, ownership, reservations, pauses,
                         # and audit state are Store-backed rather than part of
@@ -5038,9 +5341,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         mapped_entry_data: dict[str, Any] | None = None,
         tariffs_current: Callable[[], bool] | None = None,
         entry_options: dict[str, Any] | None = None,
-    ) -> None:
-        """Execute one current plan, stopping between actions when it becomes stale."""
+        verify_ev_capacity_completion: bool = False,
+    ) -> bool:
+        """Execute a plan and report whether evaluation stayed current."""
         independent_of_export = all(action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT for action in plan.actions)
+        invalidated = False
 
         def has_current_generation() -> bool:
             return started_generation == self._refresh_generation or (
@@ -5069,14 +5374,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return True
 
         def plan_is_current() -> bool:
-            return not getattr(self, "_tearing_down", False) and is_current() and inputs_current()
+            nonlocal invalidated
+            current = not getattr(self, "_tearing_down", False) and is_current() and inputs_current()
+            invalidated = invalidated or not current
+            return current
 
         if getattr(self, "_tearing_down", False) or not is_current():
-            return
+            return False
         await self._async_reconcile_vehicle_ownership()
         entry_data = self.entry_data
         if getattr(self, "_tearing_down", False) or not is_current() or not inputs_current():
-            return
+            return False
         self._admit_export_after_restart(plan)
         if not self._automatic_hvac_command_allowed():
             # Evaluate other devices and implicit EV safety work while the
@@ -5122,7 +5430,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "Stopping coordinated execution for plan %s while the config entry is unloading",
                     plan.plan_id,
                 )
-                break
+                return False
             if not is_current():
                 _LOGGER.debug(
                     "Stopping coordinated execution for obsolete plan %s from generation %s; "
@@ -5133,12 +5441,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
                 if hasattr(self, "hass"):
                     self._async_create_listener_task(self.async_request_refresh())
-                break
+                return False
             if not inputs_current():
-                break
+                return False
             # The priority score orders presentation and the first command, but
             # every coordinated device action keeps its own execution gate.
             await evaluate(replace(plan, actions=[action]))
+        return not invalidated and (not verify_ev_capacity_completion or plan_is_current())
 
     _async_get_throttled_ai_advice = advice_runtime._async_get_throttled_ai_advice
 
@@ -5274,6 +5583,18 @@ def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     return sorted(entity_ids)
 
 
+def _state_listener_targets(
+    entry_data: dict[str, Any], hvac_control: dict[str, Any],
+) -> tuple[list[str], frozenset[str]]:
+    """Include owned zone actuators that still need manual supersession tracking."""
+    from .daikin_memory import owned_control_data
+
+    control_data = owned_control_data(entry_data, hvac_control)
+    configured = dict.fromkeys([*_configured_entity_ids(entry_data), *_configured_entity_ids(control_data)])
+    retained_zones = frozenset(hvac_control.get("zone_states", {})).difference(configured)
+    return [*configured, *sorted(retained_zones)], retained_zones
+
+
 def _decision_input_fingerprint(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
@@ -5282,7 +5603,8 @@ def _decision_input_fingerprint(
     *,
     now: datetime,
     weather_forecast: dict[str, Any] | None = None,
-    tariff_fingerprints: dict[str, str] | None = None,
+    tariff_fingerprints: dict[str, _TariffFingerprint] | None = None,
+    previous_tariff_fingerprints: dict[str, _TariffFingerprint] | None = None,
     dry_hvac: CapabilityEvidence | None = None,
     dry_takeover_revision: int = 0,
     dry_during_provisional_off_start: bool = False,
@@ -5300,12 +5622,13 @@ def _decision_input_fingerprint(
                 fingerprint = _tariff_state_fingerprint(
                     state, now=now, price_timeout=price_timeout,
                     export_options=options if entity_id == export_entity else None,
+                    previous=(previous_tariff_fingerprints or {}).get(entity_id),
                 )
                 if tariff_fingerprints is not None:
                     tariff_fingerprints[entity_id] = fingerprint
-                states[entity_id] = fingerprint
+                states[entity_id] = fingerprint.digest
             else:
-                states[entity_id] = _decision_entity_inputs(state, tariff=False)
+                states[entity_id] = _decision_entity_inputs(state)
     except _IncompleteTariffFingerprint:
         # The parser uses the complete source. A clipped tariff digest
         # cannot establish that a retained State still has the same rows.
@@ -5324,13 +5647,16 @@ def _decision_input_fingerprint(
     return _digest_decision_inputs(payload)
 
 
-def _decision_entity_inputs(state: Any, *, tariff: bool) -> dict[str, Any] | None:
+def _decision_entity_inputs(state: Any) -> dict[str, Any] | None:
     if state is None:
         return None
     return {
         "state": getattr(state, "state", None),
         "last_updated": getattr(state, "last_updated", None),
-        "attributes": _material_attributes(getattr(state, "attributes", {}) or {}, ordered=tariff),
+        "attributes": {
+            key: _bounded_material_value(value)
+            for key, value in _forecast_input_attributes(getattr(state, "attributes", {}) or {}).items()
+        },
     }
 
 
@@ -5344,34 +5670,79 @@ def _fingerprint_price_timeout(options: dict[str, Any]) -> timedelta:
     return timedelta(minutes=int(minutes))
 
 
+@dataclass(frozen=True, slots=True)
+class _TariffFingerprint:
+    evidence: dict[str, Any] | None
+    attributes: dict[str, Any] | None
+    digest: str
+
+    def matches(self, evidence: dict[str, Any] | None, attributes: dict[str, Any]) -> bool:
+        return (
+            self.evidence == evidence and self.attributes is not None
+            and tariff_snapshot_matches(attributes, self.attributes, acyclic_snapshot=True, strict=True)
+        )
+
+
+def _tariff_fingerprint_evidence(
+    state: Any, *, now: datetime, price_timeout: timedelta, export_options: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if state is None:
+        return None, {}
+    attributes = getattr(state, "attributes", {}) or {}
+    last_updated = getattr(state, "last_updated", None)
+    evidence = {"state": getattr(state, "state", None), "last_updated": to_jsonable(last_updated)}
+    if (updated_at := aware_time(last_updated)) is not None:
+        evidence["freshness"] = _tariff_age_band(now - updated_at, price_timeout)
+        if export_options is not None:
+            issued_at = export_tariff_issued_at(attributes, updated_at)
+            evidence["export_freshness"] = export_tariff_is_fresh(issued_at, now, export_options)
+    return evidence, tariff_source_attributes(attributes)
+
+
 def _tariff_state_fingerprint(
     state: Any, *, now: datetime, price_timeout: timedelta, export_options: dict[str, Any] | None,
-) -> str:
-    inputs = _decision_entity_inputs(state, tariff=True)
-    if inputs is not None and (updated_at := aware_time(inputs["last_updated"])) is not None:
-        inputs["freshness"] = _tariff_age_band(now - updated_at, price_timeout)
-        if export_options is not None:
-            issued_at = export_tariff_issued_at(state.attributes, inputs["last_updated"])
-            inputs["export_freshness"] = export_tariff_is_fresh(issued_at, now, export_options)
-    return _digest_decision_inputs(inputs)
+    previous: _TariffFingerprint | None = None,
+) -> _TariffFingerprint:
+    evidence, attributes = _tariff_fingerprint_evidence(
+        state, now=now, price_timeout=price_timeout, export_options=export_options,
+    )
+    if previous is not None and previous.matches(evidence, attributes):
+        return previous
+    digest = _digest_tariff_evidence(evidence, attributes)
+    return _TariffFingerprint(evidence, cacheable_tariff_snapshot(attributes), digest)
+
+
+def _digest_tariff_evidence(evidence: dict[str, Any] | None, attributes: dict[str, Any]) -> str:
+    if evidence is None:
+        return _digest_decision_inputs(None)
+    budget = TariffSnapshotBudget()
+    ordered_attributes = [
+        [_bounded_material_value(key, budget=budget), _bounded_material_value(value, budget=budget)]
+        for key, value in attributes.items()
+    ]
+    return _digest_decision_inputs({**evidence, "attributes": ordered_attributes})
 
 
 def _tariff_fingerprints_current(
-    hass: HomeAssistant, tariff_fingerprints: dict[str, str], *, now: datetime, options: dict[str, Any],
+    hass: HomeAssistant, tariff_fingerprints: dict[str, _TariffFingerprint], *, now: datetime, options: dict[str, Any],
     export_entity: str | None,
 ) -> bool:
     """Match the early digest to the tariff evidence just confirmed for publication."""
     price_timeout = _fingerprint_price_timeout(options)
-    try:
-        return all(
-            _tariff_state_fingerprint(
-                hass.states.get(entity_id), now=now, price_timeout=price_timeout,
-                export_options=options if entity_id == export_entity else None,
-            ) == fingerprint
-            for entity_id, fingerprint in tariff_fingerprints.items()
+    for entity_id, fingerprint in tariff_fingerprints.items():
+        evidence, attributes = _tariff_fingerprint_evidence(
+            hass.states.get(entity_id), now=now, price_timeout=price_timeout,
+            export_options=options if entity_id == export_entity else None,
         )
-    except _IncompleteTariffFingerprint:
-        return False
+        if fingerprint.matches(evidence, attributes):
+            continue
+        # The digest can represent provider containers that the detached cache rejects.
+        try:
+            if _digest_tariff_evidence(evidence, attributes) != fingerprint.digest:
+                return False
+        except _IncompleteTariffFingerprint:
+            return False
+    return True
 
 
 def _seconds_until_next_interval_boundary(now: Any, interval_minutes: int) -> float:
@@ -6670,16 +7041,6 @@ def _material_attributes_changed(old_state: Any, new_state: Any, *, tariff: bool
     if tariff:
         return not tariff_snapshot_matches(new_attributes, old_attributes)
     return old_attributes != new_attributes
-
-
-def _material_attributes(attributes: Any, *, ordered: bool = False) -> dict[str, Any] | list[list[Any]]:
-    """Return only bounded attributes that can affect planning decisions."""
-    selected = _forecast_input_attributes(attributes, tariff=ordered)
-    if ordered:
-        budget = TariffSnapshotBudget()
-        return [[_bounded_material_value(key, budget=budget), _bounded_material_value(value, budget=budget)]
-                for key, value in selected.items()]
-    return {key: _bounded_material_value(value) for key, value in selected.items()}
 
 
 class _IncompleteTariffFingerprint(Exception):
