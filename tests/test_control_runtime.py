@@ -4028,7 +4028,7 @@ def test_real_user_stop_after_outage_aborts_pending_hvac(tmp_path, monkeypatch, 
             main = entity == "climate.home"
             manual.assert_awaited_once_with(
                 "daikin_state_changed" if main else "climate_zone_changed",
-                preserve_main_state=main, preserve_zone_entity_id=None if main else entity,
+                **({"preserve_main_state": True} if main else {"preserve_zone_entity_id": entity}),
             )
             assert store.data["climate_audit"][-1]["stage"] == "manual_recovery"
             assert calls == []
@@ -4512,11 +4512,15 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
                         MAIN_CLIMATE, "cool", {"temperature": 20}, context=Context(user_id="operator"),
                     )
                     await hass.async_block_till_done()
+                    # The manual callback is mocked so this test can drive the
+                    # AirBase adapter release itself. Commit its accepted scope.
+                    await coordinator._async_persist_runtime_hvac_supersessions()
                 result = await coordinator.executor.async_release_hvac_control(
                     "period_ended", preserve_zone_entity_id=MAIN_CLIMATE if intervention == "release_zone" else None,
                 )
                 if intervention == "release_head":
                     assert injected and control["pow"] == "0" and float(control["stemp"]) == 17
+                    await coordinator._async_persist_runtime_hvac_supersessions()
                     confirmed = await coordinator.executor.async_release_hvac_control("confirm_owned_zones")
                     assert confirmed.result is OutcomeResult.RESTORED
                     assert control["pow"] == "0" and float(control["stemp"]) == 17

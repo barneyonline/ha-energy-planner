@@ -4300,10 +4300,11 @@ def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
     assert store.flush_count == (2 if manual_supersession else 1)
 
 
-@pytest.mark.parametrize("rollback_succeeded", [True, False])
+@pytest.mark.parametrize(("rollback_succeeded", "queued_handoff"), [(True, False), (False, False), (True, True)])
 def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
     monkeypatch: object,
     rollback_succeeded: bool,
+    queued_handoff: bool,
 ) -> None:
     class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -4321,6 +4322,8 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
         async def async_execute(self, action: PlanAction) -> object:
             assert executor.mark_pending_hvac_manual_override() is True
             assert executor.mark_pending_hvac_zone_manual_override("climate.manual_zone") is True
+            if queued_handoff:
+                executor.hvac_command_guard = lambda: False
             await self.persist_zone_supersession({"climate.manual_zone"})
             return SimpleNamespace(
                 applied=False,
@@ -4333,7 +4336,7 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
                 },
                 rollback_succeeded=rollback_succeeded,
                 saved_main_state={},
-                command_sent=False,
+                command_sent=queued_handoff,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -4350,6 +4353,7 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
             "target_temperature": 23.0,
             "enable_zones": True,
             "configured_zones_only": True,
+            **({"zone_control_blocked": True} if queued_handoff else {}),
         },
         [],
         [],
@@ -4874,6 +4878,77 @@ def test_blocked_owned_hvac_continuation_releases_before_competing_action(
     else:
         assert store.data["outcomes"] == []
         assert dry_transitions == [False]
+
+
+@pytest.mark.parametrize("prior_work", [
+    "ev_safety_stop", "ev_safety_before_export", "continuation_audit", "capability_check",
+])
+def test_manual_hvac_handoff_blocks_stale_plan_after_an_await(monkeypatch, prior_work):
+    now = datetime.now(UTC)
+    ev_safety = prior_work in {"ev_safety_stop", "ev_safety_before_export"}
+    kind = ActionKind.RELEASE_HVAC if ev_safety else ActionKind.SET_HVAC
+    desired = {"phase": "peak_coast"} if prior_work == "continuation_audit" else {"hvac_mode": "off"}
+    hvac = PlanAction("hvac", "plan", now, now + timedelta(minutes=1), ActionAsset.DAIKIN, kind,
+                      desired, [], [], None, 1.0)
+    safety = replace(hvac, action_id="ev-safety", asset=ActionAsset.EV, kind=ActionKind.EV_STOP)
+    plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                      "test", 1.0, None, [hvac], [])
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": {"main_state": {"hvac_mode": "heat"}}}
+    executor = Executor(store, hass=FakeHass({"climate.daikin": "off"}), options={"dry_run": False})
+    executor._rejection_reason = lambda _plan: None
+    executor._control_rejection_reason = lambda *_: (
+        "production_gate_not_armed" if prior_work == "continuation_audit" else None
+    )
+
+    async def accept_manual_edit(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        executor.hvac_command_guard = lambda: False
+
+    async def unexpected_release(*_args, **_kwargs):
+        pytest.fail("A stale plan must leave HVAC release to the manual handoff")
+
+    executor.async_release_hvac_control = unexpected_release
+    if ev_safety:
+        export = replace(hvac, action_id="export", asset=ActionAsset.ENPHASE_EXPORT_LIMIT)
+        export_actions = []
+
+        async def execute_export(action, *_args, **_kwargs):
+            export_actions.append(action)
+
+        executor.async_execute_export_limit = execute_export
+        if prior_work == "ev_safety_stop":
+            plan.actions.append(export)
+        else:
+            plan.actions.insert(0, export)
+        evaluate = executor.async_evaluate
+        executor._owned_ev_safety_stop = lambda *_: safety
+
+        async def evaluate_mixed_plan(candidate, context=None, **kwargs):
+            if candidate.next_action is safety:
+                await accept_manual_edit()
+                return None
+            return await evaluate(candidate, context, **kwargs)
+
+        executor.async_evaluate = evaluate_mixed_plan
+    elif prior_work == "continuation_audit":
+        executor._async_reject_live_dry_takeover = accept_manual_edit
+    else:
+        executor._async_notify_ev_infeasible = accept_manual_edit
+        monkeypatch.setattr(executor_module, "CapabilityDiscovery", lambda *args, **kwargs: SimpleNamespace(
+            dry_takeover_issues=lambda: [],
+            inspect=lambda: SimpleNamespace(for_asset=lambda _asset: SimpleNamespace(issues=[])),
+        ))
+
+        def unexpected_adapter(*_args, **_kwargs):
+            pytest.fail("A stale plan must leave HVAC dispatch to the manual handoff")
+
+        monkeypatch.setattr(executor_module, "DaikinHVACAdapter", unexpected_adapter)
+
+    asyncio.run(executor.async_evaluate(plan))
+    assert not executor.hvac_command_guard()
+    if ev_safety:
+        assert export_actions == ([export] if prior_work == "ev_safety_before_export" else [])
 
 
 def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypatch: object) -> None:
@@ -9329,8 +9404,9 @@ def test_ev_dispatched_target_loss_counts_toward_allowance_after_reload(monkeypa
 @pytest.mark.parametrize("legacy_control", [None, {}])
 def test_cancelled_climate_transaction_retires_earlier_feedback(legacy_control):
     """Cancellation must not leave old target expectations authorizing later changes."""
-    executor = Executor.__new__(Executor)
-    executor.store = SimpleNamespace(data={"ownership": {"hvac_control": legacy_control}})
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": legacy_control}
+    executor = Executor(store)
     executor.hvac_feedback_commands = [{"deadline": datetime.now(UTC) + timedelta(minutes=1)}]
     adapter = DaikinHVACAdapter(SimpleNamespace(states=SimpleNamespace(get=lambda entity: None)), {})
     executor._configure_pending_hvac_adapter(adapter, {})
@@ -9390,7 +9466,7 @@ def test_manual_supersession_atomically_retires_pending_command_and_baseline(mai
         "command_confirmation": {"entity_id": entity},
     }}
     executor = Executor(store, entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
-    asyncio.run(executor._async_persist_provisional_hvac_supersessions(main, set() if main else {entity}))
+    asyncio.run(executor.async_persist_hvac_manual_supersessions(main, set() if main else {entity}))
     control = store.data["ownership"]["hvac_control"]
     assert "command_confirmation" not in control
     assert ("main_state" in control) is not main

@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from homeassistant.core import CoreState
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import entity_registry
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -99,8 +99,10 @@ from custom_components.ha_energy_planner.coordinator import (
     _updated_load_source_outage,
     _weather_forecast_from_response,
 )
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter, EVCommandResult
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
+from custom_components.ha_energy_planner.hvac_cycle import HvacModeFeedback, record_cycle
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -986,6 +988,7 @@ class FakeExecutor:
         self.hvac_releases: list[str] = []
         self.hvac_release_preserved_zones: list[str | None] = []
         self.hvac_release_preserved_main: list[bool] = []
+        self.hvac_mode_feedback = HvacModeFeedback()
         self.pending_hvac_desired_state: dict[str, object] | None = None
         self.ev_start_feedback_expected_until: datetime | None = None
         self.pending_hvac_manual_overrides = 0
@@ -1019,6 +1022,9 @@ class FakeExecutor:
         self.hvac_releases.append(reason)
         self.hvac_release_preserved_zones.append(preserve_zone_entity_id)
         self.hvac_release_preserved_main.append(preserve_main_state)
+
+    async def async_persist_hvac_manual_supersessions(self, main: bool, zones: set[str]) -> None:
+        pass
 
     def mark_pending_hvac_manual_override(self) -> bool:
         """Mark a pending fake HVAC transaction as user-superseded."""
@@ -2277,7 +2283,10 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
 
     synced = []
     coordinator.entry.data["ev_power_limit_entity"] = "number.limit"
-    coordinator.executor = SimpleNamespace(sync_ev_grid_reservation=lambda **kwargs: synced.append(True))
+    coordinator.executor = SimpleNamespace(
+        hvac_mode_feedback=HvacModeFeedback(),
+        sync_ev_grid_reservation=lambda **kwargs: synced.append(True),
+    )
     coordinator.async_start_listeners()
     callback = callbacks[0]
     callback(FakeEvent("climate.daikin", "off", "heat"))
@@ -6629,8 +6638,16 @@ def test_manual_hvac_change_handler_uses_configured_duration() -> None:
     assert coordinator.refresh_requested == 1
 
 
-def test_manual_main_hvac_change_handler_preserves_user_state() -> None:
+@pytest.mark.parametrize("save_failed", [False, True])
+def test_manual_main_hvac_change_handler_preserves_user_state(save_failed: bool) -> None:
     coordinator = _coordinator_for_runtime_services(options={"manual_hvac_override_minutes": 45})
+    if save_failed:
+        coordinator.store.async_save_overrides = AsyncMock(side_effect=HomeAssistantError("save failed"))
+        with pytest.raises(HomeAssistantError, match="save failed"):
+            asyncio.run(coordinator._async_handle_manual_hvac_change("daikin_state_changed", preserve_main_state=True))
+        assert coordinator.store.async_save_overrides.await_count == 2
+        assert not coordinator.executor.hvac_releases
+        return
 
     asyncio.run(
         coordinator._async_handle_manual_hvac_change(
@@ -9949,8 +9966,7 @@ def test_startup_hvac_manual_detection(
     if explicit:
         coordinator._async_handle_manual_hvac_change.assert_called_once_with(
             "daikin_state_changed" if entity == "climate.daikin" else "climate_zone_changed",
-            preserve_main_state=entity == "climate.daikin",
-            preserve_zone_entity_id=None if entity == "climate.daikin" else entity,
+            **({"preserve_main_state": True} if entity == "climate.daikin" else {"preserve_zone_entity_id": entity}),
         )
     else:
         coordinator._async_handle_manual_hvac_change.assert_not_called()
@@ -10679,6 +10695,344 @@ def test_setup_observes_calendar_feedback_during_first_plan_save(monkeypatch, fa
         assert list(subscriptions.values()) == ([] if fail_first_refresh else [{"sensor.charging", "sensor.soc"}])
         assert len(saved["calendar_history"]["history"]) == 1
         assert saved["calendar_history"]["history"][0]["end"] == clock[0].isoformat()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("feedback_kind", ["attribute_poll", "optimistic_transition", "assumed_flap"])
+def test_hvac_listener_captures_observed_stop_before_later_attribute_poll(monkeypatch, startup, feedback_kind):
+    entity = "climate.daikin"
+    sent_at = datetime(2026, 11, 28, tzinfo=UTC)
+    optimistic_transition = feedback_kind == "optimistic_transition"
+    observed_at = sent_at + timedelta(minutes=22) if optimistic_transition else sent_at
+    now = observed_at + timedelta(minutes=1 if optimistic_transition else 21)
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    monkeypatch.setattr(dt_util, "utcnow", lambda: now)
+    coordinator = _coordinator_for_runtime_services(entry_data={CONF_DAIKIN_CLIMATE: entity})
+    coordinator._schedule_debounced_refresh = Mock()
+    coordinator.executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=coordinator.entry_data)
+    coordinator.store.data["hvac_cycle"] = record_cycle({}, {
+        "entity_id": entity, "stage": "intent", "service": "turn_off", "previous_mode": "heat",
+        "context_id": "stop", "issued_at": sent_at.isoformat(),
+        "deadline": (sent_at + timedelta(minutes=3)).isoformat(),
+    }, sent_at)
+
+    async def capture_and_reconcile(instance):
+        assumed = SimpleNamespace(state="off", attributes={"assumed_state": True}, last_changed=sent_at,
+                                  last_updated=sent_at)
+        observed = SimpleNamespace(state="off", attributes={}, last_changed=sent_at, last_updated=observed_at)
+        polled = SimpleNamespace(state="off", attributes={"current_temperature": 20}, last_changed=sent_at,
+                                 last_updated=now, last_reported=now)
+        feedback = []
+        if optimistic_transition:
+            feedback.append((assumed, observed))
+        elif feedback_kind == "assumed_flap":
+            feedback.append((observed, assumed))
+            observed = SimpleNamespace(state="off", attributes={}, last_changed=sent_at,
+                                       last_updated=now - timedelta(minutes=1))
+            feedback.append((assumed, observed))
+        for before, after in [*feedback, (observed, polled)]:
+            event = FakeEvent(entity, "off", "off")
+            event.data.update(old_state=before, new_state=after)
+            callbacks[0](event)
+        monkeypatch.setattr(instance.hass.states, "get", lambda entity_id: polled if entity_id == entity else None)
+        await instance.executor.async_reconcile_hvac_cycle()
+
+    async def save_cycle(cycle):
+        coordinator.store.data["hvac_cycle"] = cycle
+
+    coordinator.store.async_save_hvac_cycle = save_cycle
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_config_entry_first_refresh",
+                        capture_and_reconcile)
+    if startup:
+        asyncio.run(coordinator.async_config_entry_first_refresh())
+    else:
+        coordinator.async_start_listeners()
+        asyncio.run(capture_and_reconcile(coordinator))
+    assert coordinator.store.data["hvac_cycle"]["changed_at"] == observed_at.isoformat()
+    assert coordinator.executor._hvac_cycle_active("heat", now) is optimistic_transition
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone"])
+@pytest.mark.parametrize("during_first_refresh", [False, True])
+@pytest.mark.parametrize("control", ["outage_off", "direct_off", "concrete_target_first", "legacy_off"])
+def test_first_refresh_preserves_manual_off_during_hvac_outage(
+    monkeypatch, entity, during_first_refresh, control,
+):
+    subscriptions = {}
+    tasks = []
+
+    def listen(hass, entity_ids, callback):
+        subscriptions[callback] = set(entity_ids)
+        return lambda: subscriptions.pop(callback)
+
+    def emit(event):
+        for callback, entity_ids in list(subscriptions.items()):
+            if event.data["entity_id"] in entity_ids:
+                callback(event)
+
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event", listen)
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    legacy = control == "legacy_off"
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]},
+        store_data={"ownership": {"climate_automations": {"automation.climate": "on"}} if legacy else {
+            "hvac_control": {"phase": "preconditioning"},
+        }},
+    )
+    coordinator.hass.is_running = True
+    if not legacy:
+        coordinator.executor.pending_hvac_desired_state = {"target_temperature": 25}
+    coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+    coordinator._schedule_debounced_refresh = Mock()
+    request_refresh = coordinator.async_request_refresh
+
+    async def refresh_while_listening():
+        assert any(entity in watched for watched in subscriptions.values())
+        await request_refresh()
+
+    coordinator.async_request_refresh = refresh_while_listening
+
+    async def manual_off_and_recovery():
+        attrs = {"temperature": 21}
+        if control == "concrete_target_first":
+            emit(FakeEvent(entity, "unavailable", "unavailable", old_attributes=attrs,
+                           new_attributes={"temperature": 23}, context_id="off-command", context_user_id="operator"))
+            attrs = {"temperature": 23}
+            assert coordinator.executor.pending_hvac_manual_overrides == int(entity == "climate.daikin")
+            assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+                [entity] if entity == "climate.zone" else []
+            )
+        optimistic_attrs = {**attrs, "assumed_state": True}
+        emit(FakeEvent(entity, "heat" if control == "direct_off" else "unavailable", "off", old_attributes=attrs,
+                       new_attributes=optimistic_attrs, context_id="off-command", context_user_id="operator"))
+        assert coordinator.executor.pending_hvac_manual_overrides == int(not legacy and entity == "climate.daikin")
+        assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+            [entity] if not legacy and entity == "climate.zone" else []
+        )
+        await asyncio.gather(*tasks)
+        expected = int(not during_first_refresh)
+        assert len(coordinator.overrides) == len(coordinator.executor.hvac_releases) == expected
+        override = deepcopy(coordinator.overrides)
+        emit(FakeEvent(entity, "off", "off", old_attributes=optimistic_attrs, new_attributes=attrs,
+                       context_id="poll"))
+        await asyncio.gather(*tasks)
+        assert coordinator.overrides == override
+        assert len(coordinator.executor.hvac_releases) == expected
+
+    async def first_refresh(_instance):
+        emit(FakeEvent(entity, "heat", "heat", old_attributes={"temperature": 21},
+                       new_attributes={"current_temperature": 20}, context_id="incomplete-report",
+                       context_user_id="operator"))
+        inherited = FakeEvent(entity, "heat", "heat", new_attributes={"temperature": 22},
+                              context_id="existing-context", context_user_id="operator")
+        inherited.data["old_state"] = SimpleNamespace(state="heat", attributes={"temperature": 21},
+                                                      context=inherited.context)
+        emit(inherited)
+        assert not coordinator.executor.pending_hvac_manual_overrides
+        assert not coordinator.executor.pending_hvac_manual_zone_overrides
+        if control != "direct_off":
+            emit(FakeEvent(entity, "heat", "unavailable", old_attributes={"temperature": 21},
+                           new_attributes={"temperature": 21}, context_id="provider"))
+        assert not tasks
+        if during_first_refresh:
+            await manual_off_and_recovery()
+
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_config_entry_first_refresh", first_refresh)
+
+    async def run():
+        await coordinator.async_config_entry_first_refresh()
+        coordinator.async_start_listeners()
+        if not during_first_refresh:
+            await manual_off_and_recovery()
+        await asyncio.gather(*tasks)
+        assert len(coordinator.overrides) == len(coordinator.executor.hvac_releases) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("setup_outcome", [
+    "success", "success_with_ev", "refresh_error", "late_edit", "cancelled_save", "failed_save", "cancelled_helper",
+    "helper_error", "retry_save", "during_release_edit",
+])
+def test_first_refresh_persists_all_user_hvac_edits_before_release_or_cleanup(monkeypatch, setup_outcome):
+    head, zone = "climate.daikin", "climate.zone"
+    ownership = {"hvac_control": {
+        "main_state": {"hvac_mode": "heat", "target_temperature": 20},
+        "zone_states": {zone: {"hvac_mode": "heat", "target_temperature": 20}},
+    }}
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]}
+    if setup_outcome in {"cancelled_helper", "helper_error"}:
+        entry_data[CONF_CLIMATE_MANUAL_OVERRIDE] = "input_boolean.override"
+    coordinator = _coordinator_for_runtime_services(
+        entry_data=entry_data,
+        store_data={"ownership": ownership},
+    )
+    coordinator.executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=coordinator.entry_data)
+    coordinator.executor.async_evaluate = AsyncMock()
+    coordinator.executor.hvac_restore_guard = lambda: not coordinator.hvac_handoff_unresolved
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    monkeypatch.setattr("custom_components.ha_energy_planner.calendar.calendar_event_records", Mock(return_value=[]))
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: callbacks.pop()))
+
+    def assert_superseded():
+        control = coordinator.store.data["ownership"]["hvac_control"]
+        assert "main_state" not in control and zone not in control["zone_states"]
+
+    async def release(_reason):
+        if setup_outcome == "during_release_edit":
+            edit(zone)
+            coordinator.store.data["ownership"].pop("hvac_control")
+        else:
+            assert_superseded()
+
+    coordinator.executor.async_release_hvac_control = AsyncMock(side_effect=release)
+
+    def edit(entity_id):
+        callbacks[0](FakeEvent(entity_id, "heat", "unavailable", old_attributes={"temperature": 21},
+                               new_attributes={"temperature": 21}, context_id=f"gap-{entity_id}"))
+        callbacks[0](FakeEvent(entity_id, "unavailable", "off", old_attributes={"temperature": 21},
+                               new_attributes={"temperature": 21, "assumed_state": True},
+                               context_id=f"edit-{entity_id}", context_user_id="operator"))
+
+    async def run():
+        captured = asyncio.Event()
+        saving = asyncio.Event()
+        finish_save = asyncio.Event()
+        execution = None
+        blocked_save = setup_outcome in {"cancelled_save", "failed_save", "retry_save"}
+        cancelled = setup_outcome in {"cancelled_save", "cancelled_helper"}
+        persist = coordinator.executor.async_persist_hvac_manual_supersessions
+        queued_late_edit = False
+        main_save_attempts = 0
+
+        async def flush():
+            nonlocal queued_late_edit
+            if coordinator.overrides and not queued_late_edit:
+                queued_late_edit = True
+                asyncio.get_running_loop().call_soon(edit, zone)
+
+        if setup_outcome == "late_edit":
+            coordinator.store.async_flush = flush
+
+        async def save(main, zones):
+            nonlocal main_save_attempts
+            if main:
+                main_save_attempts += 1
+                saving.set()
+                await finish_save.wait()
+                if setup_outcome == "failed_save" or (setup_outcome == "retry_save" and main_save_attempts == 1):
+                    raise coordinator_module.HomeAssistantError(
+                        translation_domain=coordinator_module.DOMAIN, translation_key="storage_write_failed",
+                    )
+            await persist(main, zones)
+
+        async def set_helper(*args, **kwargs):
+            if setup_outcome == "helper_error":
+                raise RuntimeError("test helper update failed")
+            saving.set()
+            await finish_save.wait()
+
+        if blocked_save:
+            coordinator.executor.async_persist_hvac_manual_supersessions = save
+        elif setup_outcome in {"cancelled_helper", "helper_error"}:
+            monkeypatch.setattr(coordinator_module, "async_call_device_service", set_helper)
+
+        async def first_refresh(_instance):
+            nonlocal execution
+            edit(head)
+            if setup_outcome in {"success", "success_with_ev"}:
+                plan = _plan("first")
+                plan.actions = [_coordinated_action(plan, "hvac", ActionAsset.DAIKIN, ActionKind.SET_HVAC)]
+                if setup_outcome == "success_with_ev":
+                    plan.actions.append(_coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_STOP))
+                coordinator._pending_plan_execution = _PlanExecution(
+                    generation=coordinator._refresh_generation, plan=plan, context=object(),
+                    options=coordinator.options,
+                )
+                execution = asyncio.create_task(coordinator._async_drain_plan_execution())
+                await asyncio.sleep(0)  # Queue the plan ahead of the handoff under the command lock.
+            captured.set()
+            if setup_outcome in {"refresh_error", "late_edit"}:
+                raise RuntimeError("first refresh failed")
+
+        monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_config_entry_first_refresh", first_refresh)
+        async with coordinator._command_lock:
+            refresh = asyncio.create_task(coordinator.async_config_entry_first_refresh())
+            await captured.wait()
+            assert not refresh.done()
+            assert len(coordinator.overrides) == 0
+            if setup_outcome in {"success", "success_with_ev", "refresh_error", "helper_error"}:
+                edit(zone)
+        if blocked_save or cancelled:
+            await saving.wait()
+            edit(zone)
+            if cancelled:
+                refresh.cancel()
+                await asyncio.sleep(0)
+            finish_save.set()
+        if setup_outcome == "failed_save":
+            with pytest.raises(ConfigEntryNotReady, match="initial manual HVAC handoff"):
+                await refresh
+            await coordinator.async_wait_for_refresh_shutdown()
+            coordinator._async_save_production = AsyncMock()
+            await coordinator.async_disarm_production_control("setup_entry_failed")
+            coordinator.executor.async_release_hvac_control.assert_not_awaited()
+            coordinator.executor._async_restore_safe_state = AsyncMock()
+            await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
+            assert not coordinator.executor.hvac_restore_guard()
+            coordinator.executor._async_restore_safe_state.assert_awaited_once_with(
+                "setup_entry_failed", assets=None, preserve_export_retry=False,
+            )
+            assert not callbacks
+            replacement = _coordinator_for_runtime_services(
+                entry_data=entry_data, hass=coordinator.hass, store_data=coordinator.store.data,
+            )
+            replacement.executor = Executor(replacement.store, hass=replacement.hass, entry_data=replacement.entry_data)
+            persist_replacement = replacement.executor.async_persist_hvac_manual_supersessions
+            replacement.executor.async_persist_hvac_manual_supersessions = AsyncMock(
+                side_effect=asyncio.CancelledError,
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await replacement.async_retry_initial_hvac_handoff()
+            replacement.executor.async_persist_hvac_manual_supersessions = persist_replacement
+            await replacement.async_retry_initial_hvac_handoff()
+            assert "main_state" not in replacement.store.data["ownership"]["hvac_control"]
+            assert not replacement.store.data["ownership"]["hvac_control"]["zone_states"]
+            assert len(replacement.overrides) == 1
+            assert not replacement.hvac_handoff_unresolved
+            assert not replacement.hass.data[coordinator_module.DOMAIN]["initial_hvac_handoffs"]
+            return
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await refresh
+            coordinator.executor.async_release_hvac_control.assert_not_awaited()
+        elif setup_outcome in {"refresh_error", "late_edit"}:
+            with pytest.raises(RuntimeError, match="first refresh failed"):
+                await refresh
+            coordinator.executor.async_release_hvac_control.assert_not_awaited()
+        else:
+            await refresh
+            if execution is not None:
+                await execution
+                coordinator.executor.async_evaluate.assert_awaited_once()
+                evaluated = coordinator.executor.async_evaluate.await_args.args[0]
+                assert [action.asset for action in evaluated.actions] == (
+                    [ActionAsset.EV] if setup_outcome == "success_with_ev" else []
+                )
+            coordinator.executor.async_release_hvac_control.assert_awaited_once()
+        if setup_outcome == "during_release_edit":
+            assert "hvac_control" not in coordinator.store.data["ownership"]
+        else:
+            assert_superseded()
+        assert len(coordinator.overrides) == 1
+        assert not callbacks
 
     asyncio.run(run())
 
@@ -12270,7 +12624,8 @@ def test_explicit_override_during_hvac_outage_still_releases_control(monkeypatch
 @pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone"])
 @pytest.mark.parametrize("recovery", [
     "provider", "same_user", "fresh_user", "first_concrete_change", "intermediate_optimistic_change",
-    "already_optimistic_at_reload", "inherited_user",
+    "already_optimistic_at_reload", "inherited_user", "outage_manual_off",
+    "removed_manual_off", "outage_missing_setpoint", "outage_retained_setpoint", "outage_sparse_assumed_setpoint",
 ])
 def test_optimistic_user_intent_supersedes_pending_work_once(monkeypatch, entity, recovery):
     callbacks = []
@@ -12288,40 +12643,75 @@ def test_optimistic_user_intent_supersedes_pending_work_once(monkeypatch, entity
         coordinator.executor.pending_hvac_desired_state = {"target_temperature": 23}
         coordinator._schedule_debounced_refresh = Mock()
         tasks = []
-        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+
+        def schedule(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+
+        coordinator._async_create_listener_task = schedule
         coordinator.async_start_listeners()
         intermediate = recovery in {"intermediate_optimistic_change", "already_optimistic_at_reload"}
         first_event_is_availability = recovery == "first_concrete_change" or intermediate
-        has_optimistic_intent = not first_event_is_availability and recovery != "inherited_user"
-        if recovery == "inherited_user":
+        inherited_or_unchanged = recovery in {"inherited_user", "outage_retained_setpoint"}
+        has_optimistic_intent = not first_event_is_availability and not inherited_or_unchanged
+        manual_off = recovery in {"outage_manual_off", "removed_manual_off"}
+        sparse_setpoint = recovery == "outage_sparse_assumed_setpoint"
+        outage = manual_off or sparse_setpoint or recovery in {
+            "inherited_user", "outage_missing_setpoint", "outage_retained_setpoint",
+        }
+        if outage:
             loss = FakeEvent(
                 entity, "heat", "unavailable", old_attributes={"temperature": 21},
                 new_attributes={"temperature": 21}, context_id="provider",
             )
             loss.data["old_state"] = SimpleNamespace(
                 state="heat", attributes={"temperature": 21},
-                context=SimpleNamespace(id="fresh-user", user_id="operator"),
+                context=SimpleNamespace(id="fresh-user" if recovery == "inherited_user" else "previous-user",
+                                        user_id="operator"),
             )
+            if recovery == "removed_manual_off":
+                loss.data["new_state"] = None
+            elif recovery == "outage_missing_setpoint" or sparse_setpoint:
+                loss.data["new_state"].attributes = {}
+            elif recovery == "outage_retained_setpoint":
+                loss.data["new_state"].attributes = {"temperature": 23}
             callbacks[0](loss)
-        optimistic = {"temperature": 21 if first_event_is_availability else 23, "assumed_state": True}
+            if sparse_setpoint:
+                loss = FakeEvent(entity, "unavailable", "heat", new_attributes={"assumed_state": True},
+                                 context_id="another-provider-poll")
+                callbacks[0](loss)
+            assert not tasks and not coordinator.overrides
+        optimistic_mode = "off" if manual_off else "heat"
+        optimistic = {
+            "temperature": 21 if first_event_is_availability or manual_off else 23,
+            "assumed_state": True,
+        }
         old_attributes = {"temperature": 21}
         if recovery == "already_optimistic_at_reload":
             old_attributes.update(assumed_state=True, vendor_sequence=1)
         first_optimistic = FakeEvent(
-            entity, "unavailable" if recovery == "inherited_user" else "heat", "heat",
+            entity, "unavailable" if outage else "heat", optimistic_mode,
             old_attributes=old_attributes, new_attributes=optimistic,
             context_id="fresh-user", context_user_id="operator",
         )
+        if outage:
+            first_optimistic.data["old_state"] = loss.data["new_state"]
         callbacks[0](first_optimistic)
+        assert coordinator._automatic_hvac_command_allowed() is not has_optimistic_intent
         assert coordinator.executor.pending_hvac_manual_overrides == int(
             has_optimistic_intent and entity == "climate.daikin"
         )
         assert coordinator.executor.pending_hvac_manual_zone_overrides == (
             [entity] if has_optimistic_intent and entity == "climate.zone" else []
         )
+        if manual_off:
+            await asyncio.gather(*tasks)
+            assert len(coordinator.overrides) == len(coordinator.executor.hvac_releases) == 1
+            override = deepcopy(coordinator.overrides)
         coordinator._schedule_debounced_refresh.reset_mock()
         callbacks[0](FakeEvent(
-            entity, "heat", "heat", old_attributes=optimistic,
+            entity, optimistic_mode, optimistic_mode, old_attributes=optimistic,
             new_attributes={**optimistic, "vendor_sequence": 2}, context_id="provider-poll",
         ))
         coordinator._schedule_debounced_refresh.assert_not_called()
@@ -12339,16 +12729,309 @@ def test_optimistic_user_intent_supersedes_pending_work_once(monkeypatch, entity
             assert coordinator.executor.pending_hvac_manual_zone_overrides == (
                 [entity] if entity == "climate.zone" else []
             )
+        provider_recovery = recovery == "provider" or outage and recovery != "inherited_user"
         callbacks[0](FakeEvent(
-            entity, "heat", "heat", old_attributes=optimistic,
-            new_attributes={"temperature": 24 if recovery == "fresh_user" else 23},
-            context_id={"provider": "provider", "fresh_user": "different-user-command"}.get(recovery, "fresh-user"),
-            context_user_id=None if recovery == "provider" else "operator",
+            entity, optimistic_mode, optimistic_mode, old_attributes=optimistic,
+            new_attributes={"temperature": 21 if manual_off else 24 if recovery == "fresh_user" else 23},
+            context_id="provider" if provider_recovery else
+            "different-user-command" if recovery == "fresh_user" else "fresh-user",
+            context_user_id=None if provider_recovery else "operator",
         ))
         await asyncio.gather(*tasks)
-        expected = 2 if recovery == "fresh_user" else int(recovery != "inherited_user")
+        assert coordinator._automatic_hvac_command_allowed()
+        expected = 2 if recovery == "fresh_user" else int(not inherited_or_unchanged)
         assert len(coordinator.executor.hvac_releases) == expected
         assert len(coordinator.overrides) == bool(expected)
+        if manual_off:
+            assert coordinator.overrides == override
+            assert coordinator.executor.pending_hvac_manual_overrides == int(entity == "climate.daikin")
+            assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+                [entity] if entity == "climate.zone" else []
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("transition", [
+    "head", "zone", "save_failed", "retry", "service", "overlapping", "during_ev_restore", "stale_guard_no_baseline",
+    "first_refresh_restore", "transient_override", "resume_after_failed_override",
+])
+def test_shutdown_persists_queued_manual_hvac_handoff_before_restoration(monkeypatch, transition):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+
+    async def run():
+        head, zone = "climate.daikin", "climate.zone"
+        entity = zone if transition == "zone" else head
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
+            store_data={"ownership": {"hvac_control": {
+                "phase": "preconditioning", "main_state": {"hvac_mode": "heat"},
+                "zone_states": {zone: {"hvac_mode": "heat"}},
+            }}},
+        )
+        coordinator.hass.is_running = True
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._listener_tasks = set()
+        coordinator._schedule_debounced_refresh = Mock()
+        executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=coordinator.entry_data)
+        coordinator.executor = executor
+        coordinator.store.async_add_outcome = AsyncMock()
+        executor.hvac_restore_guard = lambda: not coordinator.hvac_handoff_unresolved
+        executor._async_notify_restore = AsyncMock()
+        if transition in {"transient_override", "resume_after_failed_override"}:
+            save_overrides = coordinator.store.async_save_overrides
+            failures = 2 if transition == "resume_after_failed_override" else 1
+
+            async def save_after_retry(overrides):
+                if coordinator.store.async_save_overrides.await_count <= failures:
+                    raise HomeAssistantError("temporary save failure")
+                await save_overrides(overrides)
+
+            coordinator.store.async_save_overrides = AsyncMock(side_effect=save_after_retry)
+            coordinator.hass.states.values[zone] = FakeState("heat", {"temperature": 21})
+        if transition in {"save_failed", "retry"}:
+            persist_supersessions = executor.async_persist_hvac_manual_supersessions
+
+            async def save_supersessions(main, zones):
+                if transition == "save_failed" or executor.async_persist_hvac_manual_supersessions.await_count <= 2:
+                    raise HomeAssistantError("save")
+                await persist_supersessions(main, zones)
+
+            executor.async_persist_hvac_manual_supersessions = AsyncMock(side_effect=save_supersessions)
+        if transition != "first_refresh_restore":
+            coordinator.async_start_listeners()
+
+        def manual_off(target, attributes, assumed):
+            callbacks[0](FakeEvent(target, "heat", "unavailable", old_attributes=attributes))
+            callbacks[0](FakeEvent(target, "unavailable", "off", new_attributes=assumed,
+                                   context_id=f"manual-off-{target}", context_user_id="operator"))
+            callbacks[0](FakeEvent(target, "off", "off", old_attributes=assumed, new_attributes=attributes))
+            coordinator.hass.states.values[target] = FakeState("off", attributes)
+
+        if transition == "stale_guard_no_baseline":
+            coordinator._hvac_handoff_failed = True
+            coordinator.store.data["ownership"] = {}
+            outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
+            assert outcome.result == OutcomeResult.RESTORED
+            return
+        if transition in {"during_ev_restore", "first_refresh_restore"}:
+            async def restore_ev(*args, **kwargs):
+                manual_off(head, {"temperature": 21}, {"temperature": 21, "assumed_state": True})
+                return EVCommandResult(True, "ev_restored", {}, {})
+
+            coordinator.store.data["ownership"]["ev_smart_charging_state"] = {"switch.ev": "off"}
+            coordinator.hass.states.values[zone] = FakeState("heat", {"temperature": 21})
+            monkeypatch.setattr(EVChargerAdapter, "async_restore", restore_ev)
+
+            async def assert_guarded_restore(_instance):
+                outcome = await coordinator.async_restore_safe_state("manual_restore", refresh=False)
+                assert outcome.result == OutcomeResult.FAILED
+                assert "ev_smart_charging_state" not in coordinator.store.data["ownership"]
+
+            if transition == "first_refresh_restore":
+                monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_config_entry_first_refresh",
+                                    assert_guarded_restore)
+                await coordinator.async_config_entry_first_refresh()
+            else:
+                await assert_guarded_restore(coordinator)
+            await coordinator.async_wait_for_plan_execution()
+            assert not any(call[0] == "climate" for call in coordinator.hass.services.calls)
+            assert len(coordinator.overrides) == 1
+            return
+
+        async with coordinator._command_lock:
+            attributes = {"temperature": 21}
+            assumed = {**attributes, "assumed_state": True}
+            if transition == "service":
+                coordinator._async_create_listener_task(coordinator.async_set_manual_hvac_override(30, "service"))
+            else:
+                for target in ((zone, head) if transition == "overlapping" else (entity,)):
+                    manual_off(target, attributes, assumed)
+                assert not coordinator._automatic_hvac_command_allowed()
+            assert len(coordinator._listener_tasks) == (2 if transition == "overlapping" else 1)
+            await asyncio.sleep(0)
+            if transition not in {"overlapping", "transient_override", "resume_after_failed_override"}:
+                coordinator._begin_shutdown()
+
+        await coordinator.async_wait_for_plan_execution()
+        if transition == "overlapping":
+            assert "hvac_control" not in coordinator.store.data["ownership"]
+            assert not any(call[0] == "climate" for call in coordinator.hass.services.calls)
+            assert coordinator.store.async_add_outcome.await_count == 2
+            return
+        if transition == "transient_override":
+            assert coordinator.store.async_save_overrides.await_count == 2
+            assert coordinator._automatic_hvac_command_allowed()
+            assert len(coordinator.overrides) == coordinator.store.async_add_outcome.await_count == 1
+            return
+        if transition == "resume_after_failed_override":
+            assert coordinator.hvac_handoff_unresolved
+            assert "main_state" in coordinator.store.data["ownership"]["hvac_control"]
+            await coordinator.async_resume_climate_planning()
+            assert coordinator._automatic_hvac_command_allowed()
+            assert "main_state" not in coordinator.store.data["ownership"]["hvac_control"]
+            assert not coordinator.overrides
+            assert not coordinator.hass.services.calls
+            return
+        await coordinator.async_wait_for_refresh_shutdown()
+        control = coordinator.store.data["ownership"]["hvac_control"]
+        if transition in {"head", "zone", "retry"}:
+            assert ("main_state" in control) is (transition == "zone")
+            assert (zone in control["zone_states"]) is (transition != "zone")
+            assert len(coordinator.overrides) == 1
+            assert coordinator.store.data["overrides"] == coordinator.overrides
+        else:
+            assert "main_state" in control and zone in control["zone_states"]
+            assert len(coordinator.overrides) == (0 if transition == "service" else 1)
+        assert not coordinator.hass.services.calls
+        assert coordinator.refresh_requested == 0
+        if transition == "save_failed":
+            assert executor.async_persist_hvac_manual_supersessions.await_count == 4
+            outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
+            assert outcome.result == OutcomeResult.FAILED
+            assert "manual_hvac_handoff_pending" in outcome.reason
+            scoped = await executor.async_restore_device_control("daikin", "configuration_changed")
+            assert scoped.result == OutcomeResult.FAILED
+            release = await executor.async_release_hvac_control("hvac_configuration_changed")
+            assert release.result == OutcomeResult.FAILED
+            assert not coordinator.hass.services.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone"])
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("later_report", [
+    "assumed_off", "unavailable_edit", "inherited_edit", "post_recovery_echo", "post_recovery_inherited_echo",
+    "post_recovery_twice_inherited_echo", "post_recovery_observed_echo", "loss_context_echo", "loss_context_observed",
+    "later_sentinel_echo", "later_sentinel_edit", "linked_sentinel_edit", "linked_unavailable_edit",
+    "post_recovery_linked_inherited_echo",
+])
+def test_outage_feedback_does_not_reuse_old_user_context(monkeypatch, entity, pending, later_report):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]},
+            hass=FakeHass({entity: "heat"}),
+            store_data={"ownership": {"hvac_control": {"phase": "preconditioning"}}},
+        )
+        coordinator.hass.is_running = True
+        if pending:
+            coordinator.executor.pending_hvac_desired_state = {"target_temperature": 20}
+        coordinator._schedule_debounced_refresh = Mock()
+        tasks = []
+        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+        coordinator.async_start_listeners()
+        loss = FakeEvent(entity, "heat", "unavailable", old_attributes={"temperature": 21},
+                         new_attributes={"temperature": 21}, context_id="provider")
+        if later_report in {
+            "loss_context_echo", "loss_context_observed", "later_sentinel_echo", "later_sentinel_edit",
+            "linked_sentinel_edit",
+        }:
+            attributes = {"temperature": 21}
+            assumed = {**attributes, "assumed_state": True}
+            previous_mode = "unavailable"
+            if later_report in {"later_sentinel_echo", "later_sentinel_edit", "linked_sentinel_edit"}:
+                callbacks[0](loss)
+                loss = FakeEvent(entity, "unavailable", "unknown", old_attributes=attributes, new_attributes=attributes)
+                previous_mode = "unknown"
+            linked = later_report == "linked_sentinel_edit"
+            loss.context.id = "user-command"
+            loss.context.user_id = None if linked else "operator"
+            loss.context.parent_id = "parent" if linked else None
+            callbacks[0](loss)
+            if later_report in {"later_sentinel_edit", "linked_sentinel_edit"}:
+                callbacks[0](FakeEvent(entity, "unknown", "unavailable", old_attributes=attributes,
+                                       new_attributes={"temperature": 19}, context_id="user-command",
+                                       context_user_id=loss.context.user_id, parent_context_id=loss.context.parent_id))
+                assert not tasks and not coordinator.overrides
+                return
+            callbacks[0](FakeEvent(entity, previous_mode, "off", old_attributes=attributes, new_attributes=assumed,
+                                   context_id="user-command", context_user_id="operator"))
+            assert not tasks and not coordinator.overrides
+            attributed = later_report == "loss_context_observed"
+            callbacks[0](FakeEvent(entity, "off", "off", old_attributes=assumed, new_attributes=attributes,
+                                   context_id="user-command" if attributed else "poll",
+                                   context_user_id="operator" if attributed else None))
+            await asyncio.gather(*tasks)
+            assert len(coordinator.overrides) == len(coordinator.executor.hvac_releases) == int(attributed)
+            return
+        linked_old = later_report == "post_recovery_linked_inherited_echo"
+        inherited_echo = linked_old or later_report in {
+            "post_recovery_inherited_echo", "post_recovery_twice_inherited_echo",
+        }
+        inherited = later_report == "inherited_edit" or inherited_echo
+        if inherited:
+            loss.data["old_state"] = SimpleNamespace(
+                state="heat", attributes={"temperature": 21},
+                context=SimpleNamespace(id="user-command", user_id=None if linked_old else "operator",
+                                        parent_id="parent" if linked_old else None),
+            )
+        callbacks[0](loss)
+        if inherited_echo:
+            attrs = {"temperature": 21}
+            recovered = FakeEvent(entity, "unavailable", "heat", old_attributes=attrs,
+                                  new_attributes=attrs, context_id="provider-recovery")
+            second_loss = FakeEvent(entity, "heat", "unavailable", old_attributes=attrs,
+                                    new_attributes=attrs, context_id="provider-again")
+            if later_report == "post_recovery_twice_inherited_echo":
+                recovered.data["new_state"] = second_loss.data["old_state"] = loss.data["old_state"]
+            callbacks[0](recovered)
+            callbacks[0](second_loss)
+            callbacks[0](FakeEvent(
+                entity, "unavailable", "unknown" if linked_old else "off", old_attributes=attrs,
+                new_attributes={"temperature": 19} if linked_old else {**attrs, "assumed_state": True},
+                context_id="user-command", context_user_id=None if linked_old else "operator",
+                parent_context_id="parent" if linked_old else None,
+            ))
+            assert not tasks and not coordinator.overrides
+            return
+        linked = later_report == "linked_unavailable_edit"
+        callbacks[0](FakeEvent(entity, "unavailable", "unavailable", old_attributes={"temperature": 21},
+                               new_attributes={"temperature": 23}, context_id="user-command",
+                               context_user_id=None if linked else "operator",
+                               parent_context_id="parent" if linked else None))
+        if inherited:
+            assert not tasks and not coordinator.overrides
+            return
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+        assert len(coordinator.overrides) == len(coordinator.executor.hvac_releases) == 1
+        override = deepcopy(coordinator.overrides)
+        recovered = later_report in {"post_recovery_echo", "post_recovery_observed_echo"}
+        old_mode = "unavailable"
+        attrs = {"temperature": 23}
+        if recovered:
+            callbacks[0](FakeEvent(entity, "unavailable", "off", old_attributes=attrs,
+                                   new_attributes={"temperature": 19}, context_id="provider-recovery"))
+            old_mode, attrs = "off", {"temperature": 19}
+        if later_report == "post_recovery_observed_echo":
+            coordinator._schedule_debounced_refresh.reset_mock()
+            callbacks[0](FakeEvent(entity, "off", "off", old_attributes=attrs,
+                                   new_attributes={**attrs, "vendor_sequence": 1}, context_id="user-command",
+                                   context_user_id="operator"))
+            coordinator._schedule_debounced_refresh.assert_not_called()
+        assumed_off = later_report in {"assumed_off", "post_recovery_echo"}
+        callbacks[0](FakeEvent(
+            entity, old_mode, "off" if assumed_off or recovered else "unavailable", old_attributes=attrs,
+            new_attributes={"temperature": 23, "assumed_state": True} if assumed_off else {"temperature": 24},
+            context_id="user-command", context_user_id=None if linked else "operator",
+            parent_context_id="parent" if linked else None,
+        ))
+        await asyncio.gather(*tasks)
+        assert len(coordinator.executor.hvac_releases) == 1
+        assert coordinator.overrides == override
+        assert coordinator.executor.pending_hvac_manual_overrides == int(pending and entity == "climate.daikin")
+        assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+            [entity] if pending and entity == "climate.zone" else []
+        )
 
     asyncio.run(run())
 

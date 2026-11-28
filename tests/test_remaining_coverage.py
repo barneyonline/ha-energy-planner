@@ -776,6 +776,9 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
         def __init__(self, hass: Any, entry: Any, store: Any) -> None:
             self.entry = entry
 
+        async def async_retry_initial_hvac_handoff(self) -> None:
+            pass
+
         async def async_config_entry_first_refresh(self) -> None:
             pass
 

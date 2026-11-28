@@ -416,47 +416,80 @@ def test_release_retires_unsent_stop_when_target_becomes_assumed_unavailable():
     assert store.data["ownership"]["hvac_control"]["main_state"] == {"hvac_mode": "off"}
 
 
-@pytest.mark.parametrize("feedback", ["mode_transition", "assumed_then_observed", "adapter_confirmation"])
+@pytest.mark.parametrize("feedback", [
+    "mode_transition", "assumed_then_observed", "adapter_confirmation", "attribute_poll", "adapter_attribute_poll",
+    "unresolved_reload",
+])
 def test_late_stop_feedback_starts_rest_from_the_observed_stop(monkeypatch, feedback):
     from types import SimpleNamespace
 
-    late_stop = STOP + timedelta(minutes=22)
-    now = STOP + timedelta(minutes=23)
+    attribute_poll = feedback in {"attribute_poll", "adapter_attribute_poll"}
+    assumed = feedback in {"assumed_then_observed", "adapter_confirmation"}
+    unresolved_reload = feedback == "unresolved_reload"
+    adapter_confirmation = feedback in {"adapter_confirmation", "adapter_attribute_poll"}
+    late_stop = STOP if attribute_poll else STOP + timedelta(minutes=22)
+    now = STOP + timedelta(minutes=21 if attribute_poll else 23)
     monkeypatch.setattr(adapter_module.dt_util, "utcnow", lambda: now)
     cycle = record_cycle({}, mode_record(), STOP)
     hass = FakeHass({})
     state = SimpleNamespace(
         state="off", attributes={"temperature": 20},
-        last_changed=late_stop if feedback == "mode_transition" else STOP, last_reported=now,
+        last_changed=STOP if assumed or unresolved_reload else late_stop, last_reported=now,
     )
-    if feedback != "mode_transition":
-        state.last_updated = STOP
+    if unresolved_reload:
+        # The restarted executor has only the pending record and the first
+        # observed snapshot. Its mode timestamp may date an assumed report.
+        state.last_updated = late_stop
     hass.states.values[HEAD] = state
     # FakeStates deliberately accepts its typed FakeState only; return native-like feedback directly.
     monkeypatch.setattr(hass.states, "get", lambda entity: hass.states.values.get(entity))
     store = FakeStore()
     store.data["hvac_cycle"] = cycle
     executor = Executor(store, hass=hass, entry_data={"daikin_climate_entity": HEAD}, options=OPTIONS)
-    hass.states.values[HEAD].attributes["assumed_state"] = True
-    asyncio.run(executor.async_reconcile_hvac_cycle())
-    assert store.data["hvac_cycle"] == cycle
-    hass.states.values[HEAD].attributes.pop("assumed_state")
-    if feedback != "mode_transition":
+    if attribute_poll:
+        state.last_updated = STOP
+        executor.hvac_mode_feedback.mode_feedback_at(HEAD, state)
+        state.attributes["current_temperature"] = 19.5
+        state.last_updated = now
+    if assumed:
+        state.last_updated = STOP
+        state.attributes["assumed_state"] = True
+        asyncio.run(executor.async_reconcile_hvac_cycle())
+        assert store.data["hvac_cycle"] == cycle
+        assert executor._hvac_cycle_active("heat", now)
+        state.attributes.pop("assumed_state")
         state.last_updated = late_stop
-    if feedback == "adapter_confirmation":
+    if adapter_confirmation:
         adapter = DaikinHVACAdapter(hass, executor.entry_data)
         wire(executor, adapter, {"restore_main": {"hvac_mode": "off"}})
         adapter._last_commands[HEAD] = mode_record()
         asyncio.run(adapter._record_confirmation(HEAD, True))
-    action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat", "target_temperature": 24})
-    asyncio.run(executor.async_evaluate(_plan(now, action)))
-    assert store.data["outcomes"][-1].reason == "hvac_min_cycle_active"
+    if attribute_poll:
+        asyncio.run(executor.async_reconcile_hvac_cycle())
+        assert not executor._hvac_cycle_active("heat", now)
+    else:
+        action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat", "target_temperature": 24})
+        asyncio.run(executor.async_evaluate(_plan(now, action)))
+        assert store.data["outcomes"][-1].reason == "hvac_min_cycle_active"
     assert instant(store.data["hvac_cycle"]["changed_at"]) == late_stop
     assert not hass.services.calls
     assert executor._hvac_cycle_active("heat", late_stop + timedelta(minutes=20) - timedelta(microseconds=1))
     assert not executor._hvac_cycle_active("heat", late_stop + timedelta(minutes=20))
-    if feedback != "adapter_confirmation":
+    if not adapter_confirmation:
         assert store.flush_count > 0
+    confirmed = deepcopy(store.data["hvac_cycle"])
+    state.attributes["current_temperature"] = 19
+    state.last_updated = state.last_reported = now
+    asyncio.run(executor.async_reconcile_hvac_cycle())
+    assert store.data["hvac_cycle"] == confirmed
+    monkeypatch.setattr(storage_module, "Store", DiskStore)
+    monkeypatch.setattr(DiskStore, "loaded_by_key", None)
+    monkeypatch.setattr(DiskStore, "loaded", {"hvac_cycle": deepcopy(confirmed)})
+    reloaded = PlannerStore(object())
+    asyncio.run(reloaded.async_load())
+    restarted = Executor(reloaded, hass=hass, entry_data=executor.entry_data, options=OPTIONS)
+    asyncio.run(restarted.async_reconcile_hvac_cycle())
+    assert reloaded.data["hvac_cycle"] == confirmed
 
 
 def test_reconciliation_requires_fresh_matching_feedback_even_after_deadline():

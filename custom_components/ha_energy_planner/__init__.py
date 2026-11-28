@@ -451,6 +451,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
                 and isinstance(external_ev.get(EV_RESERVATION_EXTERNAL_TOPOLOGY), dict)
                 and coordinator.executor.sync_ev_grid_reservation()):
             await coordinator.executor.async_persist_ev_grid_reservation()
+        await coordinator.async_retry_initial_hvac_handoff()
         await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
@@ -560,7 +561,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     unload_completed = False
     try:
         if preserve_automatic_state:
-            unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+            handoff_pending = configuration_reload_handoff and getattr(coordinator, "hvac_handoff_unresolved", False)
+            unload_ok = False if handoff_pending else await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
             if unload_ok:
                 object.__delattr__(entry, "runtime_data")
                 unload_completed = True

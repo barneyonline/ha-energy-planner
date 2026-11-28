@@ -7,6 +7,7 @@ from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 
 from .notifications import cancel_deferred_notifications_for_entry
 
@@ -16,14 +17,17 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 @callback
-def _async_create_listener_task(self: EnergyPlannerCoordinator, coroutine: Coroutine[Any, Any, Any]) -> None:
+def _async_create_listener_task(
+    self: EnergyPlannerCoordinator, coroutine: Coroutine[Any, Any, Any],
+) -> asyncio.Task[Any] | None:
     """Own listener jobs until they reach a safe teardown boundary."""
     if getattr(self, "_tearing_down", False):
         coroutine.close()
-        return
+        return None
     task = self.hass.async_create_task(coroutine)
     self._listener_tasks.add(task)
     task.add_done_callback(self._listener_tasks.discard)
+    return task
 
 
 def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
@@ -114,9 +118,19 @@ async def async_wait_for_plan_execution(self: EnergyPlannerCoordinator) -> None:
 
 async def async_wait_for_refresh_shutdown(self: EnergyPlannerCoordinator) -> None:
     """Drain export reconciliation and planning before final unload restoration."""
+    if self.hvac_handoff_unresolved:
+        try:
+            await self.async_retry_initial_hvac_handoff()
+        except (OSError, HomeAssistantError):
+            _LOGGER.exception("Could not save manual HVAC supersession from setup")
     # Refresh reconciliation runs outside the planner lock. Drain its durable
     # writes as well, using the same command-then-planner order as operator work.
     async with self._command_lock:
         async with self._planner_lock:
+            if self.hvac_handoff_unresolved:
+                try:
+                    await self._async_persist_runtime_hvac_supersessions()
+                except (OSError, HomeAssistantError):
+                    _LOGGER.exception("Could not save manual HVAC supersession before unload")
             if getattr(self, "_calendar_feedback_flush_needed", False):
                 await self._async_flush_calendar_feedback()

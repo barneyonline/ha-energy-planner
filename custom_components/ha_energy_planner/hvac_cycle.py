@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .climate_inputs import hvac_feedback_is_observed
+
+if TYPE_CHECKING:
+    from homeassistant.core import State
 
 
 def instant(value: Any) -> datetime | None:
@@ -39,9 +44,35 @@ def mode_feedback_matches(record: dict[str, Any], mode: str | None) -> bool:
     return service == "set_hvac_mode" and mode == record.get("requested", {}).get("hvac_mode")
 
 
-def mode_feedback_at(state: Any) -> datetime | None:
-    """Date the observed snapshot even when an optimistic mode was unchanged."""
-    return instant(getattr(state, "last_updated", None)) or instant(getattr(state, "last_changed", None))
+class HvacModeFeedback:
+    """Remember when the current head mode first became observed."""
+
+    def __init__(self) -> None:
+        self._transition: tuple[str, str, datetime | None] | None = None
+        self._observed_at: datetime | None = None
+
+    def mode_feedback_at(
+        self, entity_id: str, state: State | None, *, previous: State | None = None,
+    ) -> datetime | None:
+        """Retain the earliest observed snapshot of this mode transition."""
+        if state is None:
+            return None
+        changed = instant(getattr(state, "last_changed", None))
+        observed = hvac_feedback_is_observed(state)
+        # The mode may initially have been assumed. Without the transition
+        # event, only the timestamp of this observed snapshot is evidence.
+        observations = [instant(getattr(state, "last_updated", None)) or changed] if observed else []
+        if (changed is not None and hvac_feedback_is_observed(previous) and previous.state == state.state
+                and instant(getattr(previous, "last_changed", None)) == changed):
+            observations.append(instant(getattr(previous, "last_updated", None)) or changed)
+        if not observations:
+            return None
+        transition = (entity_id, state.state, changed)
+        if transition == self._transition:
+            observations.append(self._observed_at)
+        self._transition = transition
+        self._observed_at = min((when for when in observations if when is not None), default=None)
+        return self._observed_at if observed else None
 
 
 def cycle_active(cycle: dict[str, Any], now: datetime, minutes: int,
