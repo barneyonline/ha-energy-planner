@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- Require observed HVAC feedback for automatic control and restoration. Devices that report assumed state, including Daikin Infrared, can no longer confirm a mode or setpoint change for Energy Planner.
+- None
 
 ### 🔧 Improvements
 
@@ -21,6 +21,30 @@
 ### 🔄 Other changes
 
 - None
+
+## 1.7.0 - 2026-11-28
+
+### 🚧 Breaking changes
+
+- Automatic HVAC control and restoration require observed device feedback. Climate entities that report assumed state, including Daikin Infrared, can no longer confirm mode or setpoint changes for Energy Planner. ([#199](https://github.com/barneyonline/ha-energy-planner/pull/199))
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Preserve manual HVAC Off and other user changes through feedback outages and reloads. Start the minimum cycle and rest intervals from observed mode feedback, including when it matches an earlier assumed report. ([#200](https://github.com/barneyonline/ha-energy-planner/pull/200))
+- Preserve EV charging capacity reservations through startup, reload, delayed feedback and clock corrections. Recheck fresh charger feedback before releasing capacity or lowering a reserved limit. ([#201](https://github.com/barneyonline/ha-energy-planner/pull/201))
+
+### 🔧 Improvements
+
+- Reduce Decision Summary work by sharing thermal history filtering within each read and reusing parsed load timestamps. ([#198](https://github.com/barneyonline/ha-energy-planner/pull/198))
+- Reduce planner overhead by coalescing bursts of EV feedback, reusing tariff digests, staging smaller history payloads and preparing EV scheduling inputs once per search. ([#201](https://github.com/barneyonline/ha-energy-planner/pull/201))
+
+### 🔄 Other changes
+
+- Prepare for Home Assistant 2026.12 while retaining the 2026.11.0 minimum. If your custom Recorder database name or SQLite path contains a literal percent escape, check the URL encoding and verify that Planner can still read its history after upgrading. [Recorder upgrade guidance](https://github.com/barneyonline/ha-energy-planner/blob/2710b18/docs/ha-2026.12-compatibility.md#custom-recorder-urls-may-open-a-different-database)
 
 ## 1.6.0 - 2026-11-22
 
