@@ -35,7 +35,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_HOUSEHOLD_LOAD,
     CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     DEFAULT_OPTIONS,
+    DOMAIN,
     EV_RESERVATION_EXTERNAL_BASELINE,
+    EV_RESERVATION_HANDOFF_PENDING,
 )
 from custom_components.ha_energy_planner.coordinator import InitialHvacHandoffFailed
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -282,6 +284,7 @@ class FakeCoordinator:
         self.replan_count = 0
         self.disarm_calls: list[str] = []
         self.auto_recovery_start_count = 0
+        self.auto_recovery_failure_count = 0
         self.auto_recovery_cancel_reasons: list[str] = []
         self.auto_recovery_preserve_flags: list[bool] = []
         self.automatic_control_requested = False
@@ -299,15 +302,21 @@ class FakeCoordinator:
     def async_start_startup_auto_recovery(self) -> None:
         self.auto_recovery_start_count += 1
 
+    async def _async_fail_startup_recovery(self) -> None:
+        self.auto_recovery_failure_count += 1
+
     async def async_cancel_startup_auto_recovery(
         self,
         reason: str,
         *,
         preserve_control: bool = False,
         restore_owned_state: bool = True,
+        disarm_reason: str | None = None,
     ) -> None:
         self.auto_recovery_cancel_reasons.append(reason)
         self.auto_recovery_preserve_flags.append(preserve_control)
+        if disarm_reason is not None:
+            await self.async_disarm_production_control(disarm_reason)
 
     def async_start_listeners(self) -> None:
         self.start_count += 1
@@ -374,7 +383,8 @@ def test_unload_restores_safe_state_without_refresh() -> None:
     assert coordinator.final_shutdown_count == 0
     assert coordinator.execution_wait_count == 1
     assert coordinator.refresh_wait_count == 1
-    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
+    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload", "entry_unload"]
+    assert coordinator.auto_recovery_preserve_flags == [True, False]
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.disarm_calls == ["entry_unload"]
     assert coordinator.lifecycle_calls == [
@@ -410,6 +420,70 @@ def test_whole_system_shutdown_preserves_automatic_ownership_and_arming() -> Non
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.store.data["ownership"]
     assert coordinator.store.data["ev_grid_reservation"]["active"] is True
+
+
+@pytest.mark.parametrize("failed_reload", [
+    None, "ordinary_recovery", "recoverable", "reconcile_retry", "reconcile_failed",
+])
+def test_failed_durability_drain_keeps_entry_and_restores_listeners(monkeypatch, failed_reload) -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator._configuration_reload_handoff = failed_reload not in {None, "ordinary_recovery"}
+    coordinator._startup_auto_recovery_authorized = failed_reload == "ordinary_recovery"
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries())
+
+    async def fail_drain() -> None:
+        raise OSError("reservation store unavailable")
+
+    reconcile = coordinator.async_reconcile_production_evidence_contract
+
+    async def reconcile_after_listener_restart() -> bool:
+        assert coordinator.start_count == 1
+        result = await reconcile()
+        if failed_reload == "reconcile_failed" or (
+            failed_reload == "reconcile_retry" and coordinator.reconcile_count == 1
+        ):
+            raise RuntimeError("recovery evidence store unavailable")
+        return result
+
+    monkeypatch.setattr(coordinator, "async_wait_for_refresh_shutdown", fail_drain)
+    monkeypatch.setattr(coordinator, "async_reconcile_production_evidence_contract", reconcile_after_listener_restart)
+    with pytest.raises(OSError, match="reservation store unavailable"):
+        asyncio.run(async_unload_entry(hass, entry))
+
+    assert entry.runtime_data is coordinator
+    assert coordinator.start_count == 1
+    assert coordinator._configuration_reload_handoff is False
+    assert coordinator.reconcile_count == {None: 0, "ordinary_recovery": 1, "recoverable": 1}.get(failed_reload, 2)
+    assert coordinator.auto_recovery_start_count == int(failed_reload in {
+        "ordinary_recovery", "recoverable", "reconcile_retry",
+    })
+    assert coordinator.auto_recovery_failure_count == int(failed_reload == "reconcile_failed")
+    assert coordinator.restore_calls == []
+    assert hass.config_entries.unloaded == []
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError, OSError])
+@pytest.mark.parametrize("reload_handoff", [False, True])
+def test_interrupted_unload_before_shutdown_recovers_without_reattaching(monkeypatch, error, reload_handoff) -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator._configuration_reload_handoff = reload_handoff
+    coordinator._startup_auto_recovery_authorized = True
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries())
+
+    async def interrupt_cancel(*_args, **_kwargs) -> None:
+        raise error
+
+    monkeypatch.setattr(coordinator, "async_cancel_startup_auto_recovery", interrupt_cancel)
+    with pytest.raises(error):
+        asyncio.run(async_unload_entry(hass, entry))
+
+    assert entry.runtime_data is coordinator
+    assert coordinator._configuration_reload_handoff is False
+    assert coordinator.shutdown_count == coordinator.start_count == 0
+    assert coordinator.reconcile_count == coordinator.auto_recovery_start_count == 1
+    assert hass.config_entries.unloaded == []
 
 
 def test_configuration_reload_handoff_is_not_cancelled_during_unload() -> None:
@@ -458,6 +532,23 @@ def test_failed_configuration_reload_handoff_restarts_safe_recovery(failed_manua
     assert entry.runtime_data is coordinator
 
 
+def test_rejected_reload_does_not_resume_a_superseded_runtime(monkeypatch) -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator._configuration_reload_handoff = True
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries(unload_ok=False))
+    replacement = object()
+
+    async def reconcile_then_replace() -> bool:
+        entry.runtime_data = replacement
+        return True
+
+    monkeypatch.setattr(coordinator, "async_reconcile_production_evidence_contract", reconcile_then_replace)
+    assert asyncio.run(async_unload_entry(hass, entry)) is False
+    assert entry.runtime_data is replacement
+    assert coordinator.auto_recovery_start_count == coordinator.auto_recovery_failure_count == 0
+
+
 @pytest.mark.parametrize("result", [OutcomeResult.FAILED, OutcomeResult.PENDING])
 def test_unload_stops_when_safe_state_restore_fails(result) -> None:
     coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
@@ -477,7 +568,7 @@ def test_unload_stops_when_safe_state_restore_fails(result) -> None:
     assert coordinator.execution_wait_count == 1
     assert coordinator.refresh_wait_count == 1
     assert coordinator.start_count == 1
-    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
+    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload", "entry_unload"]
     assert coordinator.lifecycle_calls == [
         "shutdown",
         "wait_execution",
@@ -702,9 +793,23 @@ def test_rehydrate_reservation_defensive_branches() -> None:
     assert _non_negative_finite_float("invalid") == 0.0
 
 
-def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("handoff_observer_fails", [False, True])
+def test_setup_failure_restores_safe_state_without_refresh(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, handoff_observer_fails: bool,
+) -> None:
+    class SetupFailureCoordinator(FakeCoordinator):
+        def __init__(self, hass, entry, store):
+            super().__init__(hass, entry, store)
+            if handoff_observer_fails:
+                self.executor = SimpleNamespace(retain_ev_signal_clock_handoff=self.retain_feedback)
+
+        def retain_feedback(self):
+            raise RuntimeError("simulated listener failure")
+
     monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", FakeStore)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", FakeCoordinator)
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", SetupFailureCoordinator,
+    )
     monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda hass, entry: None)
     FakeCoordinator.last_instance = None
     entry = FakeEntry()
@@ -713,6 +818,7 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     with pytest.raises(RuntimeError, match="platform setup failed"):
         asyncio.run(async_setup_entry(hass, entry))
 
+    assert ("Could not observe retained EV feedback" in caplog.text) is handoff_observer_fails
     coordinator = FakeCoordinator.last_instance
     assert coordinator is not None
     assert coordinator.first_refresh_count == 1
@@ -906,6 +1012,44 @@ def test_setup_entry_does_not_offer_global_store_to_new_named_entry(monkeypatch:
     assert result is True
     assert FakeCoordinator.last_instance is not None
     assert FakeCoordinator.last_instance.store.legacy_fallback is False
+
+
+@pytest.mark.parametrize("transient_failure", [False, True])
+def test_setup_persists_retained_ev_handoff_before_planning(monkeypatch: pytest.MonkeyPatch, transient_failure) -> None:
+    from homeassistant.exceptions import ConfigEntryNotReady
+
+    entry = FakeEntry()
+    reservation = {"load_kw": 11, EV_RESERVATION_HANDOFF_PENDING: True}
+    hass = FakeHass(FakeConfigEntries(entries=[entry]), {
+        DOMAIN: {"ev_grid_reservations": {entry.entry_id: reservation}},
+    })
+    events = []
+
+    class HandoffCoordinator(FakeCoordinator):
+        def __init__(self, hass, entry, store):
+            super().__init__(hass, entry, store)
+            self._command_lock = asyncio.Lock()
+            self.executor = SimpleNamespace(async_persist_ev_grid_reservation=self.persist_handoff)
+
+        async def persist_handoff(self):
+            assert self.store.loaded and reservation[EV_RESERVATION_HANDOFF_PENDING]
+            events.append("persist")
+            if transient_failure and len(events) == 1:
+                raise OSError("Simulated transient handoff write failure")
+
+        async def async_config_entry_first_refresh(self):
+            events.append("refresh")
+            await super().async_config_entry_first_refresh()
+
+    monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", FakeStore)
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", HandoffCoordinator)
+    monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda hass, entry: None)
+    if transient_failure:
+        with pytest.raises(ConfigEntryNotReady, match="retained EV reservation"):
+            asyncio.run(async_setup_entry(hass, entry))
+        assert not getattr(entry, "runtime_data", None) and reservation[EV_RESERVATION_HANDOFF_PENDING]
+    assert asyncio.run(async_setup_entry(hass, entry))
+    assert events == ["persist"] * (2 if transient_failure else 1) + ["refresh"]
 
 
 def test_migrate_duplicate_entity_ids_renames_only_available_planner_entities() -> None:

@@ -1334,6 +1334,125 @@ def test_failed_plan_stage_leaves_candidate_unpublished(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("invalidation", [
+    None, "before_save", "stop_changed", "exposure_changed", "promotion_changed", "promotion_failed",
+])
+def test_staged_ev_release_keeps_canonical_recovery_until_admission(monkeypatch, invalidation):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+
+    async def run():
+        store = PlannerStore(object(), "staged-ev-release")
+        owned = {"ev_smart_charging_state": {"ev_power_limit_entity": "9"}}
+        reservation = {"active": True, "load_kw": 7}
+        store.data.update(ownership=owned, ev_grid_reservation=reservation)
+        release = {"ownership": {}, "ev_grid_reservation": {"active": False}, "ev_telemetry": {}}
+        current = invalidation != "before_save"
+        writes = []
+        notified = []
+
+        def ownership_changed():
+            notified.append(store.data["ownership"])
+
+        async def save(data):
+            nonlocal current
+            writes.append(data)
+            assert store.data["ownership"] == owned and store.data["ev_grid_reservation"] == reservation
+            if invalidation == "stop_changed" or (invalidation == "promotion_changed" and len(writes) == 2):
+                current = False
+            if invalidation == "promotion_failed" and len(writes) == 2:
+                raise OSError("canonical write failed")
+            if invalidation == "exposure_changed":
+                with store.defer_save():
+                    await store.async_save_ev_telemetry({"command_exposure": {"reserved_kw": 8}})
+
+        store._store.async_save = save
+        store.async_add_ownership_listener(ownership_changed)
+        if invalidation == "promotion_failed":
+            with pytest.raises(OSError, match="canonical write failed"):
+                await store.async_publish_ev_release(lambda: release, lambda: current)
+            admitted = False
+        else:
+            admitted = await store.async_publish_ev_release(lambda: release, lambda: current)
+        assert admitted is (invalidation is None)
+        assert notified == ([{}] if admitted else [])
+        if invalidation == "before_save":
+            assert writes == []
+        else:
+            assert writes[0]["_pending_ev_release"] == release
+            monkeypatch.setattr(FakeStore, "loaded", writes[0])
+            recovered = PlannerStore(object(), "staged-ev-release")
+            await recovered.async_load()
+            assert recovered.data["ownership"] == owned and recovered.data["ev_grid_reservation"] == reservation
+            assert "_pending_ev_release" not in recovered.data
+        if admitted:
+            assert len(writes) == 2 and all(writes[-1][key] == value for key, value in release.items())
+            monkeypatch.setattr(FakeStore, "loaded", writes[-1])
+            interrupted = PlannerStore(object(), "staged-ev-release")
+            assert not await interrupted.async_remove_if_safe()
+            await interrupted.async_load()
+            assert interrupted.data["ownership"] == owned and interrupted.data["ev_grid_reservation"] == reservation
+            assert "_pending_ev_release_recovery" not in interrupted.data
+
+            async def finish(data):
+                writes.append(data)
+
+            store._store.async_save = finish
+            await store.async_flush()
+            assert len(writes) == 3 and "_pending_ev_release_recovery" not in writes[-1]
+            assert not store._is_dirty
+        elif invalidation in {"promotion_changed", "promotion_failed"}:
+            assert len(writes) == 3 and writes[-1]["ownership"] == owned
+            assert writes[-1]["ev_grid_reservation"] == reservation and not store._is_dirty
+        assert store.data["ownership"] == ({} if admitted else owned)
+        if invalidation == "exposure_changed":
+            assert store.data["ev_telemetry"]["command_exposure"] == {"reserved_kw": 8}
+
+    asyncio.run(run())
+
+
+def test_staged_publication_references_retained_history_without_copying_it(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+
+    async def run():
+        store = PlannerStore(object(), "staged-history")
+        now = datetime(2026, 11, 28, tzinfo=UTC)
+        keys = ("forecast_snapshots", "dry_run_comparisons")
+        # Include an expired row and an interval bucket that the proposal replaces.
+        retained = [
+            {"created_at": (now - age).isoformat(), "plan_id": str(age), "planned_action_count": 0}
+            for age in (timedelta(days=8), timedelta(hours=1), timedelta(0))
+        ]
+        for key in keys:
+            store.data[key] = list(retained)
+        candidate = {"created_at": (now + timedelta(minutes=1)).isoformat(),
+                     "plan_id": "candidate", "planned_action_count": 1}
+        writes = []
+
+        async def save(data):
+            writes.append(data)
+
+        def stage():
+            store.record_forecast_snapshot(candidate)
+            store.record_dry_run_comparison(candidate)
+            return True
+
+        store._store.async_save = save
+        assert await store.async_publish_plan(stage, lambda: True)
+        await store.async_flush_deferred()
+        proposed, promoted = writes
+        for key in keys:
+            expected = dict(candidate)
+            if key == "forecast_snapshots":
+                expected["bucket_plan_ids"] = [retained[-1]["plan_id"]]
+            assert proposed[key] == retained
+            assert proposed["_pending_plan_publication"][key] == [1, expected]
+            assert promoted[key] == [retained[1], expected]
+        assert "_pending_plan_publication" not in promoted
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("outcome", ["accepted", "obsolete", "conflict", "cancelled", "failed"])
 def test_candidate_save_recovers_only_canonical_plan(monkeypatch, tmp_path, outcome):
     import json

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from itertools import zip_longest
-from math import isfinite
+from math import copysign, isfinite, isnan
 from operator import itemgetter
 from sys import float_info
 from typing import Any
@@ -252,15 +252,17 @@ def _copy_tariff_value(value: Any, depth: int, budget: TariffSnapshotBudget) -> 
 
 def tariff_snapshot_matches(
     attributes: Mapping[str, Any], snapshot: dict[str, Any], *, acyclic_snapshot: bool = False,
+    strict: bool = False,
 ) -> bool:
     """Compare a detached tariff payload without conflating types or alias order."""
     # Bounded cache snapshots cannot contain cycles. Comparing against one
     # needs no tracking set even when the current input contains a cycle.
-    return _tariff_mappings_match(attributes, snapshot, None if acyclic_snapshot else set(), 1)
+    return _tariff_mappings_match(attributes, snapshot, None if acyclic_snapshot else set(), 1, strict=strict)
 
 
 def _tariff_mappings_match(
     current: Mapping[str, Any], captured: Mapping[str, Any], compared: set[tuple[int, int]] | None, depth: int,
+    *, strict: bool,
 ) -> bool:
     for field, captured_field in zip_longest(
         tariff_mapping_items(current, nested=depth > 1), tariff_mapping_items(captured, nested=depth > 1),
@@ -269,26 +271,35 @@ def _tariff_mappings_match(
             return False
         key, value = field
         captured_key, captured_value = captured_field
-        if not (_tariff_values_match(key, captured_key, compared, depth)
-                and _tariff_values_match(value, captured_value, compared, depth)):
+        if not (_tariff_values_match(key, captured_key, compared, depth, strict=strict)
+                and _tariff_values_match(value, captured_value, compared, depth, strict=strict)):
             return False
     return True
 
 
 def _tariff_values_match(
     current: Any, captured: Any, compared: set[tuple[int, int]] | None, depth: int,
+    *, strict: bool = False,
 ) -> bool:
     if current is captured:
         return True
     if isinstance(captured, _UnreadableTariffValue):
         return type(current) is captured.source_type and id(current) == captured.source_id
-    if type(current) is not type(captured) and _tariff_value_type(current) is not _tariff_value_type(captured):
+    if type(current) is not type(captured) and (
+        strict or _tariff_value_type(current) is not _tariff_value_type(captured)
+    ):
         return False
     if not isinstance(current, (dict, list, tuple)):
         try:
             if isinstance(current, datetime):
                 # A fall-back hour can compare equal despite having a different UTC offset.
                 return bool(current.isoformat() == captured.isoformat())
+            if strict and type(current) is float:
+                if current == captured == 0.0:
+                    return copysign(1.0, current) == copysign(1.0, captured)
+                # JSON distinguishes signed zeros but encodes all NaNs alike.
+                if isnan(current):
+                    return isnan(captured)
             return bool(current == captured)
         except Exception:  # Provider equality and offset hooks can reject malformed values.
             return False
@@ -300,11 +311,11 @@ def _tariff_values_match(
             return True
         compared.add(pair)
     if isinstance(current, dict):
-        return _tariff_mappings_match(current, captured, compared, depth + 1)
+        return _tariff_mappings_match(current, captured, compared, depth + 1, strict=strict)
     if len(current) != len(captured):
         return False
     for value, item in zip(current, captured, strict=True):
-        if not _tariff_values_match(value, item, compared, depth + 1):
+        if not _tariff_values_match(value, item, compared, depth + 1, strict=strict):
             return False
     return True
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
 from .ev import ev_charging_state_proves_active, ev_vehicle_suspended
 from .ev_policy import EV_INPUTS, finite, power_capability
-from .ev_runtime import settle_spending, timestamp
+from .ev_runtime import MAX_NATIVE_STOP_SAMPLES, EVImplicitSignalClock, settle_spending, timestamp
 
 VERSION = 1
 
@@ -26,12 +27,124 @@ def reported_at(state: Any) -> datetime | None:
     return stamp if isinstance(stamp, datetime) and stamp.tzinfo is not None else None
 
 
+def current_sample_reported_at(
+    state: Any, now: datetime, *, received_at: datetime | None = None,
+    signal_clock: EVImplicitSignalClock | None = None,
+) -> datetime | None:
+    """Require a recent sample whose source clock was valid when HA received it."""
+    if state is None:
+        return None
+    explicit = "sampled_at_utc" in state.attributes
+    # Consecutive reports can reuse a State object whose last_reported has already advanced.
+    stamp = received_at if received_at is not None and not explicit else reported_at(state)
+    if stamp is None or not 0 <= (now - stamp).total_seconds() <= 600:
+        return None
+    updated_at = timestamp(getattr(state, "last_updated", None))
+    if not explicit:
+        changed_at = timestamp(getattr(state, "last_changed", None))
+        if stamp < max(updated_at or stamp, changed_at or stamp):
+            return None
+        return stamp
+    if updated_at is None or stamp > updated_at or (received_at is not None and stamp > received_at):
+        return None
+    if signal_clock is not None:
+        omitted = signal_clock.omitted_explicit_samples
+        if (
+            stamp in signal_clock.invalid_explicit_samples
+            or (omitted is not None and omitted[0] <= stamp <= omitted[1])
+        ):
+            return None
+    return stamp
+
+
+def stop_signal_reported_at(
+    state: Any, now: datetime, *, received_by: datetime | None = None, received_at: datetime | None = None,
+    implicit_clock: EVImplicitSignalClock | None = None,
+) -> datetime | None:
+    """Order explicit stop samples without treating repeated HA state as a new stop."""
+    updated_at = timestamp(state.last_updated)
+    if updated_at is None:
+        return None
+    receipt = min(updated_at, received_at or timestamp(getattr(state, "last_reported", None)) or updated_at)
+    if "sampled_at_utc" in state.attributes:
+        if received_by is not None and receipt > received_by:
+            return None
+        source = current_sample_reported_at(state, now, signal_clock=implicit_clock)
+        return source if source is not None and source <= receipt else None
+    stamp = timestamp(getattr(state, "last_changed", updated_at))
+    if stamp is None or stamp > receipt:
+        return None
+    if implicit_clock is not None and implicit_clock.last_changed == stamp:
+        started_at = implicit_clock.started_at
+        if started_at is None or started_at > receipt:
+            return None
+        stamp = max(stamp, started_at)
+    return stamp if stamp <= now and (received_by is None or stamp <= received_by) else None
+
+
+def updated_ev_signal_clock(
+    state: Any, previous: Any, clock: EVImplicitSignalClock | None, received_at: datetime | None,
+) -> tuple[bool, EVImplicitSignalClock | None]:
+    """Carry a raw signal's clock provenance across replacement reports."""
+    if state is None:
+        return False, clock.without_raw_epoch() if clock is not None else None
+    receipt = min(state.last_updated, received_at or state.last_reported)
+    if clock is not None and clock.last_changed is not None and clock.last_changed != state.last_changed:
+        clock = clock.without_raw_epoch()
+    if "sampled_at_utc" in state.attributes:
+        explicit = timestamp(state.attributes["sampled_at_utc"])
+        clock = clock or EVImplicitSignalClock(state.last_changed, None)
+        invalid = clock.invalid_explicit_samples
+        omitted = clock.omitted_explicit_samples
+        if explicit is not None and explicit > receipt:
+            invalid = invalid | {explicit}
+            if len(invalid) > MAX_NATIVE_STOP_SAMPLES:
+                oldest = min(invalid)
+                invalid = invalid - {oldest}
+                omitted = (oldest, oldest) if omitted is None else (min(omitted[0], oldest), max(omitted[1], oldest))
+        return False, EVImplicitSignalClock(state.last_changed, None, invalid, omitted)
+    if state.last_changed > receipt or (
+        clock is not None and clock.started_at is not None and clock.started_at > receipt
+    ):
+        # A later attribute update cannot repair a backwards clock for this raw state.
+        clock = clock or EVImplicitSignalClock(state.last_changed, None)
+        return False, replace(clock, last_changed=state.last_changed, started_at=None)
+    if previous is not None and "sampled_at_utc" in previous.attributes:
+        clock = clock or EVImplicitSignalClock(state.last_changed, None)
+        return True, replace(clock, last_changed=state.last_changed, started_at=state.last_updated)
+    return False, clock
+
+
 def measured(state: Any, now: datetime, kind: str) -> float | None:
     if state is None:
         return None
     stamp = reported_at(state)
     if stamp is None or not 0 <= (now - stamp).total_seconds() <= 600:
         return None
+    return _measurement_value(state, kind)
+
+
+def unverified_positive_power(
+    state: Any, now: datetime, received_at: datetime | None = None,
+) -> tuple[float, datetime] | None:
+    """Use receipt time to preserve positive draw when the source clock is unusable."""
+    if state is None:
+        return None
+    source = timestamp(state.attributes.get("sampled_at_utc"))
+    if source is not None and (now - source).total_seconds() > 600:
+        return None
+    updated_at = timestamp(getattr(state, "last_updated", None))
+    reported = received_at or timestamp(getattr(state, "last_reported", None)) or updated_at
+    if reported is None:
+        return None
+    receipt = min(updated_at or reported, reported)
+    if not 0 <= (now - receipt).total_seconds() <= 600:
+        return None
+    draw = _measurement_value(state, "power")
+    return (draw, receipt) if draw else None
+
+
+def _measurement_value(state: Any, kind: str) -> float | None:
     value = finite(state.state)
     factor = ({"W": 0.001, "kW": 1} if kind == "power" else {"Wh": 0.001, "kWh": 1}).get(
         state.attributes.get("unit_of_measurement")

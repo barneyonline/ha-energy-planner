@@ -200,6 +200,8 @@ use throughout; the Docker and pull-request gates enforce that result.
 - Preconditioning acquisition survives the next planning cycle when heating from at or below the lower comfort boundary or cooling from at or above the upper boundary. Opposite-boundary handoffs remain active, and scheduled coasting boundaries override stale persisted phases. Home/away, mirrored heating/cooling, manual override, missing evidence, and unsafe-input regressions are covered in `tests/test_planner.py`.
 
 - EV battery economics prepares forecast validation, terminal value and slot inputs once per synchronous search; each candidate starts from the observed battery storage independently. Self-consumption and backup reference cases cover partial/elapsed slots, reserve, negative prices, solar and HVAC; the full-horizon five-second performance gate remains unchanged (`tests/test_ev_optimization.py`).
+- The EV search prepares slot prices, solar surplus, carbon intensity and learned charge bands before evaluating candidates. Capacity increases still invalidate in-flight decisions immediately. One worker persists the latest reservation independently of the coalesced planner refresh and drains observations already accepted when unload begins and retries a failed reservation write at handoff. Tariff digest reuse requires matching detached tariff content and freshness evidence. Payloads that cannot be cached keep the bounded digest check. Plan staging references unchanged replay and dry-run history by canonical index, preserving the previous accepted plan on an interrupted save. Regressions cover these paths in `tests/test_ev_optimization.py`, `tests/test_coordinator.py`, and `tests/test_storage.py`. `tests/test_control_runtime.py` reopens the real Store while a Core refresh remains blocked and after shutdown begins. It also verifies a single persistence worker across cancelled unload.
+- Recovery tests preserve operator disarm during interrupted writes and retry startup restoration when devices still under planner ownership report readiness. A delayed native cap readback can complete restoration without repeating the write. Ownership, capacity, premium exposure and the allocation deadline remain live while a release is being saved. Manual stops, scheduled stops and recovery compare meter and control timestamps before releasing ownership. Setup and unload retain evidence from the original native charger, including a positive reading followed by unavailability. Below-reservation draw timestamps use the coalesced Store worker without requesting a replan. Confirmed stop evidence can settle premium exposure while cap restoration is pending. If delayed activity falls inside an interval omitted from bounded stop history, settlement uses a later retained stop. The Recovery sensor reports a terminal save failure (`tests/test_control_runtime.py`, `tests/test_ev_runtime.py`, `tests/test_storage.py`, and `tests/test_recovery_presentation.py`).
 - Device service calls reject unavailable targets before dispatch, including during compensation; pending restoration is retained for retry. An Enphase pre-dispatch rejection consumes no command attempt and restores prior ownership without sending compensation. Never-pressed buttons remain usable, and expired manual-helper cleanup waits silently for availability (`tests/test_adapter_helpers.py`, `tests/test_ev_adapter.py`, `tests/test_enphase_adapter.py`, `tests/test_coordinator.py`).
 - Weather service calls wait until the configured entity is present and available; unknown current weather conditions still allow fetching forecasts; unavailable entities use only freshness-bounded cached forecasts and recover on the next fetch (`tests/test_coordinator.py`).
 - Startup input warnings have a bounded 30-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
@@ -470,9 +472,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   cap restoration. The original cap remains available for recovery. The listener for
   unchanged reports starts when external capacity is persisted and stops when
   the reservation clears. An unchanged positive power report advances the
-  stop-evidence timestamp without a refresh or Store write. A disconnect
+  stop-evidence timestamp through the coalesced Store worker without requesting a refresh. A disconnect
   invalidates cap-only evidence, while measured draw retains capacity until
-  independent feedback confirms the stop.
+  independent feedback confirms the stop. Setup and reload continue observing
+  the original charger and preserve supported cap increases. A recent positive
+  reading with an invalid source timestamp can increase reserved capacity and
+  invalidate earlier stop evidence using its Home Assistant receipt time.
+  Stops and cap reductions require verified sample timing. A Home Assistant
+  clock rollback preserves historical load for dispute recovery. Setup saves
+  the invalidation before planning, and a disputed proof cannot renew a cap
+  command from the invalid clock epoch.
   New external reservations persist their original charger controls and stop
   inputs across a reload. A replacement charger cannot consume that capacity
   or retire it by stopping. Fresh reports from the original charger still

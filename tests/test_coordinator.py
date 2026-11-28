@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -1680,7 +1681,8 @@ def test_tariff_fingerprint_and_listener_track_validation_inputs(monkeypatch, be
     old = FakeState("0.2", before, last_updated=now)
     new = FakeState("0.2", after, last_updated=now)
     hass = FakeHass({"sensor.price": old})
-    baseline = _decision_input_fingerprint(hass, data, {}, [], now=now)
+    cached_tariffs = {}
+    baseline = _decision_input_fingerprint(hass, data, {}, [], now=now, tariff_fingerprints=cached_tariffs)
     coordinator = _coordinator_for_runtime_services(entry_data=data, hass=hass)
     coordinator._schedule_next_boundary_refresh = Mock()
     coordinator._schedule_debounced_refresh = Mock()
@@ -1696,7 +1698,68 @@ def test_tariff_fingerprint_and_listener_track_validation_inputs(monkeypatch, be
         coordinator._schedule_debounced_refresh.assert_called_once_with("state_change")
     else:
         coordinator._schedule_debounced_refresh.assert_not_called()
-    assert (_decision_input_fingerprint(hass, data, {}, [], now=now) != baseline) is material
+    updated_tariffs = {}
+    updated = _decision_input_fingerprint(
+        hass, data, {}, [], now=now, tariff_fingerprints=updated_tariffs, previous_tariff_fingerprints=cached_tariffs,
+    )
+    assert (updated != baseline) is material
+    assert (updated_tariffs["sensor.price"] is cached_tariffs["sensor.price"]) is not material
+
+
+@pytest.mark.parametrize(
+    "mutation", ["same_zero", "signed_zero", "same_nan", "changed_to_nan", "list_subclass", "dict_subclass"],
+)
+def test_cached_tariff_fingerprint_preserves_digest_distinctions(mutation):
+    class ProviderList(list):
+        pass
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.price"
+    row = {"per_kwh": float("nan" if mutation == "same_nan" else "0")}
+    attributes = {"forecasts": [row]}
+    hass = FakeHass({entity: FakeState("0", attributes, last_updated=now)})
+    data = {CONF_AMBER_IMPORT_PRICE: entity}
+    initial = {}
+    baseline = _decision_input_fingerprint(hass, data, {}, [], now=now, tariff_fingerprints=initial)
+    if mutation == "signed_zero":
+        row["per_kwh"] = -0.0
+    elif mutation == "list_subclass":
+        attributes["forecasts"] = ProviderList([row])
+    elif mutation == "dict_subclass":
+        attributes["forecasts"] = [OrderedDict(row)]
+    elif mutation in {"same_nan", "changed_to_nan"}:
+        row["per_kwh"] = float("nan")
+    else:
+        row["per_kwh"] = float("0")
+
+    refreshed = _decision_input_fingerprint(hass, data, {}, [], now=now, previous_tariff_fingerprints=initial)
+    assert refreshed == _decision_input_fingerprint(hass, data, {}, [], now=now)
+    unchanged = mutation in {"same_zero", "same_nan", "dict_subclass"}
+    assert (refreshed == baseline) is unchanged
+    assert coordinator_module._tariff_fingerprints_current(
+        hass, initial, now=now, options={}, export_entity=None,
+    ) is unchanged
+
+
+@pytest.mark.parametrize("mutation", ["unchanged", "changed", "oversized"])
+def test_tariff_publication_rehashes_digestible_uncacheable_provider_payload(mutation):
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    entity = "sensor.price"
+    row = OrderedDict(per_kwh=0.2)
+    hass = FakeHass({entity: FakeState("0.2", {"forecasts": [row]}, last_updated=now)})
+    initial = {}
+    assert _decision_input_fingerprint(
+        hass, {CONF_AMBER_IMPORT_PRICE: entity}, {}, [], now=now, tariff_fingerprints=initial,
+    ) is not None
+    assert initial[entity].attributes is None
+    if mutation == "changed":
+        row["per_kwh"] = 0.3
+    elif mutation == "oversized":
+        row["per_kwh"] = "0" * 1_000
+
+    assert coordinator_module._tariff_fingerprints_current(
+        hass, initial, now=now, options={}, export_entity=None,
+    ) is (mutation == "unchanged")
 
 
 def test_overrides_restored_only_when_active() -> None:
@@ -1871,7 +1934,9 @@ def test_startup_auto_recovery_begins_only_after_home_assistant_started(monkeypa
     assert coordinator.entry.created == 1
     assert coordinator.entry.hass is coordinator.hass
     assert coordinator.entry.task_name == "ha_energy_planner startup automatic-control recovery"
-    coordinator._async_update_startup_auto_recovery.assert_awaited_once()
+    coordinator._async_update_startup_auto_recovery.assert_awaited_once_with(
+        "grace", successful_runs=0, required_runs=1, reason="startup_grace_in_progress", started=True,
+    )
 
     coordinator._wake_startup_auto_recovery()
     assert coordinator._startup_auto_recovery_wakeup.is_set()
@@ -7686,6 +7751,34 @@ def test_paused_startup_disarms_and_preserves_auto_recovery() -> None:
     assert restarted.store.data["production"]["armed"] is False
 
 
+@pytest.mark.parametrize("during", ["flush", "restore"])
+def test_operator_disarm_supersedes_resumed_startup_restoration(monkeypatch, during):
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        store_data={
+            "production": {"armed": False, "startup_auto_recovery": {
+                "status": "waiting_for_safe", "last_reason": "startup_control_paused",
+            }},
+            "ownership": {"ev_smart_charging_state": {"state": "on"}},
+        },
+    )
+
+    async def supersede(*_args, **_kwargs):
+        coordinator._operator_disarm_request = object()
+        coordinator._startup_auto_recovery_authorized = False
+
+    flush = AsyncMock(side_effect=supersede if during == "flush" else None)
+    restore = AsyncMock(side_effect=supersede if during == "restore" else None)
+    monkeypatch.setattr(coordinator.store, "async_flush", flush)
+    monkeypatch.setattr(coordinator, "async_restore_safe_state", restore)
+    monkeypatch.setattr(coordinator, "_async_update_startup_auto_recovery", AsyncMock())
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+    flush.assert_awaited_once()
+    assert restore.await_count == int(during == "restore")
+    coordinator._async_update_startup_auto_recovery.assert_not_awaited()
+
+
 def test_scoped_pause_preserves_unaffected_control_area_at_startup() -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={
@@ -8435,6 +8528,71 @@ def test_startup_recovery_start_callback_and_shutdown_edge_paths(monkeypatch: ob
     coordinator._unsub_listeners = []
     coordinator._begin_shutdown()
     assert unsubscribed
+
+
+def test_startup_recovery_ignores_queued_callback_from_retired_subscription(monkeypatch):
+    callbacks = []
+
+    def at_started(_hass, action):
+        callbacks.append(action)
+        return lambda: None
+
+    monkeypatch.setattr(startup_recovery_module, "async_at_started", at_started)
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator._async_update_startup_auto_recovery = AsyncMock()
+
+    async def run():
+        coordinator.async_start_startup_auto_recovery()
+        await coordinator.async_cancel_startup_auto_recovery("entry_unload", preserve_control=True)
+        coordinator._startup_auto_recovery_authorized = True
+        coordinator.async_start_startup_auto_recovery()
+        await callbacks[0](coordinator.hass)
+        coordinator._async_update_startup_auto_recovery.assert_not_awaited()
+        await callbacks[1](coordinator.hass)
+        coordinator._async_update_startup_auto_recovery.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("armed", "failed_writes", "disarm_fails"), [
+    (False, 1, False), (False, 2, False), (True, 1, False), (True, 2, False), (True, 2, True),
+])
+def test_startup_recovery_retries_first_save_or_fails_closed(monkeypatch, armed, failed_writes, disarm_fails):
+    callbacks = []
+
+    def at_started(_hass, action):
+        callbacks.append(action)
+        return lambda: None
+
+    monkeypatch.setattr(startup_recovery_module, "async_at_started", at_started)
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["armed"] = armed
+    update_recovery = coordinator._async_update_startup_auto_recovery
+    coordinator._schedule_export_retry = Mock()
+    coordinator._async_run_startup_auto_recovery = AsyncMock()
+    coordinator.async_disarm_production_control = AsyncMock(side_effect=OSError if disarm_fails else None)
+    monkeypatch.setattr(coordinator.hass, "async_create_task", asyncio.create_task)
+
+    async def save_progress(status, **kwargs):
+        if status == "failed":
+            await update_recovery(status, **kwargs)
+        elif coordinator._async_update_startup_auto_recovery.await_count <= failed_writes:
+            raise OSError("progress store unavailable")
+
+    coordinator._async_update_startup_auto_recovery = AsyncMock(side_effect=save_progress)
+
+    async def run():
+        coordinator.async_start_startup_auto_recovery()
+        await callbacks[0](coordinator.hass)
+        if (task := coordinator._startup_auto_recovery_task) is not None:
+            await task
+
+    asyncio.run(run())
+    terminal_attempts = int(failed_writes == 2) + int(disarm_fails)
+    assert coordinator._async_update_startup_auto_recovery.await_count == 2 + terminal_attempts
+    assert coordinator._startup_auto_recovery_authorized is (failed_writes == 1)
+    assert coordinator._async_run_startup_auto_recovery.await_count == int(failed_writes == 1)
+    assert coordinator.async_disarm_production_control.await_count == (terminal_attempts if armed else 0)
 
 
 def test_startup_recovery_cancellation_covers_task_and_restore_failure() -> None:
@@ -12145,7 +12303,8 @@ def test_newer_mode_intent_retires_retained_zone_activation(monkeypatch, scenari
 @pytest.mark.parametrize(
     "scenario",
     ["increase", "stale", "lower", "persist_failure", "stopped_while_queued",
-     "shutdown_while_queued", "shutdown_during_persist"],
+     "shutdown_before_report", "shutdown_while_queued", "shutdown_during_persist", "burst", "increase_during_persist",
+     "increase_during_refresh", "shutdown_during_refresh", "sustained_persistence"],
 )
 def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monkeypatch, scenario):
     """A small physical increase can cross a hard limit and must bypass the percentage debounce."""
@@ -12170,6 +12329,7 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
                 "unit_of_measurement": "W",
                 "sampled_at_utc": (now - timedelta(minutes=11) if scenario == "stale" else now).isoformat(),
             },
+            last_updated=now,
             last_reported=now,
         )
         coordinator.hass.states = SimpleNamespace(get=lambda entity: state if entity == "sensor.ev_power" else None)
@@ -12181,14 +12341,36 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
         reservations = executor._ev_grid_reservations()
         reservations[executor.entry_id] = {"load_kw": 7, "limit_kw": 14.05}
         saved = []
+        refresh_started = asyncio.Event()
+        latest_saved = asyncio.Event()
+        overlap_observed = False
+        while_refreshing = scenario in {"increase_during_refresh", "shutdown_during_refresh"}
+        while_persisting = scenario in {"increase_during_persist", "sustained_persistence"}
+
+        def report_power(watts: int) -> None:
+            old = state.state
+            state.state = str(watts)
+            event = FakeEvent("sensor.ev_power", old, state.state, old_attributes=dict(state.attributes))
+            event.data["new_state"] = state
+            callbacks[0](event)
 
         async def save(reservation):
+            nonlocal overlap_observed
             assert coordinator._command_lock.locked()
             assert not coordinator._planner_lock.locked()
             saved.append(dict(reservation))
             if scenario == "persist_failure":
                 raise OSError("transient reservation save failure")
             coordinator.store.data["ev_grid_reservation"] = dict(reservation)
+            if while_persisting and len(saved) == 1:
+                await asyncio.sleep(0)
+                report_power(7200)
+                assert len(coordinator._listener_tasks) == 1
+            if len(saved) == 2:
+                if scenario == "sustained_persistence":
+                    await asyncio.wait_for(refresh_started.wait(), timeout=3)
+                    overlap_observed = True
+                latest_saved.set()
             if scenario == "shutdown_during_persist":
                 coordinator._tearing_down = True
 
@@ -12200,9 +12382,21 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
         )])
 
         async def refresh():
-            assert not coordinator._command_lock.locked()
+            nonlocal overlap_observed
             assert saved
             issues.append(executor._ev_reservation_safety_issue(context))
+            if scenario == "sustained_persistence":
+                refresh_started.set()
+            else:
+                assert not coordinator._command_lock.locked()
+            if while_refreshing and len(issues) == 1:
+                report_power(7200)
+                await asyncio.wait_for(latest_saved.wait(), timeout=3)
+                overlap_observed = True
+                if scenario == "shutdown_during_refresh":
+                    coordinator._tearing_down = True
+                    return
+                raise RuntimeError("transient coordinator refresh request failure")
 
         coordinator.async_request_refresh = refresh
         coordinator._schedule_debounced_refresh = Mock()
@@ -12212,8 +12406,17 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
         assert not _is_material_state_change(event, coordinator.options)
         await coordinator._command_lock.acquire()
         generation = coordinator._refresh_generation
+        if scenario == "shutdown_before_report":
+            coordinator._tearing_down = True
         callbacks[0](event)
-        assert coordinator._refresh_generation == generation + int(scenario not in {"stale", "lower"})
+        ignored = scenario in {"stale", "lower", "shutdown_before_report"}
+        increases = int(not ignored)
+        if scenario == "burst":
+            for watts in range(7101, 7221):
+                report_power(watts)
+            increases += 120
+            assert len(coordinator._listener_tasks) == 1
+        assert coordinator._refresh_generation == generation + increases
         await asyncio.sleep(0)
         assert saved == []
         if scenario == "stopped_while_queued":
@@ -12221,19 +12424,29 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
         elif scenario == "shutdown_while_queued":
             coordinator._tearing_down = True
         coordinator._command_lock.release()
-        await asyncio.gather(*coordinator._listener_tasks)
-        assert coordinator._refresh_generation == generation + int(scenario not in {"stale", "lower"})
+        while coordinator._listener_tasks:
+            await asyncio.gather(*coordinator._listener_tasks)
+        during_worker = while_persisting or while_refreshing
+        assert coordinator._refresh_generation == generation + increases + int(during_worker)
         coordinator._schedule_debounced_refresh.assert_not_called()
-        if scenario in {"stale", "lower", "shutdown_while_queued"}:
+        if ignored:
             assert saved == []
             assert issues == []
         elif scenario == "stopped_while_queued":
             assert saved == [{"active": False}]
             assert issues == [None]
+        elif scenario == "burst" or during_worker:
+            expected = [7.22] if scenario == "burst" else [7.1, 7.2]
+            assert [record["load_kw"] for record in saved] == pytest.approx(expected)
+            refreshes = 2 if scenario in {"increase_during_refresh", "sustained_persistence"} else 1
+            assert issues == ["grid_import_limit_exceeded"] * refreshes
+            if while_refreshing or scenario == "sustained_persistence":
+                assert overlap_observed
+            assert not coordinator._listener_tasks
         else:
             assert saved[0]["load_kw"] == pytest.approx(7.1)
             assert saved[0]["active"] is True
-            if scenario == "shutdown_during_persist":
+            if scenario in {"shutdown_during_persist", "shutdown_while_queued"}:
                 assert issues == []
             else:
                 assert coordinator._force_next_refresh is True

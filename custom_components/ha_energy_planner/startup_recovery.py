@@ -3,22 +3,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, async_noop, callback
+from homeassistant.helpers.event import async_track_state_change_event, async_track_state_report_event
 from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
+from .climate_inputs import hvac_feedback_is_observed
 from .const import (
     CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
+    CONF_ENPHASE_PROFILE,
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
+    EV_RESERVATION_EXTERNAL_BASELINE,
     HVAC_DRY_ZONE_TARGETS_ABSENT,
     STARTUP_WARMUP_SECONDS,
+    STATE_UNKNOWN_VALUES,
 )
-from .export_limit_policy import area_safe
+from .enphase_export_limit import feedback_entity_id
+from .ev import ev_charging_state_for_stop
+from .ev_policy import native_limit_value_matches
+from .ev_runtime import EVRestoreFeedback
+from .ev_telemetry import current_sample_reported_at, measured
+from .export_limit_policy import EXPORT_ASSET, area_safe
 from .models import (
     EnergyPlan,
     InputHealth,
@@ -31,11 +43,20 @@ from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     parse_production_state,
 )
+from .task_lifecycle import async_finish_runtime_cleanup
+from .vehicles import connection
 
 if TYPE_CHECKING:
+    from homeassistant.core import State
+
     from .coordinator import EnergyPlannerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+_RESTORE_CLIMATE_ATTRIBUTES = (
+    "temperature", "target_temp_low", "target_temp_high", "min_temp", "max_temp", "target_temp_step",
+)
+_RESTORE_EV_LIMIT_ATTRIBUTES = ("unit_of_measurement", "min", "max")
 
 STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = STARTUP_WARMUP_SECONDS
 
@@ -65,45 +86,371 @@ def async_start_startup_auto_recovery(self: EnergyPlannerCoordinator) -> None:
     if getattr(self, "_startup_auto_recovery_start_unsub", None) is not None:
         return
 
+    unsubscribe = async_noop
+
+    def cancel_start() -> None:
+        unsubscribe()
+
     async def _async_start_recovery(_hass: HomeAssistant) -> None:
+        # Core may already have queued this job when its subscription is retired.
+        if self._startup_auto_recovery_start_unsub is not cancel_start:
+            return
         self._startup_auto_recovery_start_unsub = None
         if not self._startup_auto_recovery_authorized:
             return
+        # Unload must be able to drain startup even while its first save is in flight.
+        starting_task = asyncio.current_task()
+        self._startup_auto_recovery_task = starting_task
+        try:
+            if await _async_prepare_startup_recovery(self) and self._startup_auto_recovery_authorized:
+                self._startup_auto_recovery_task = self.entry.async_create_background_task(
+                    self.hass,
+                    self._async_run_startup_auto_recovery(),
+                    f"{DOMAIN} startup automatic-control recovery",
+                )
+        finally:
+            if self._startup_auto_recovery_task is starting_task:
+                self._startup_auto_recovery_task = None
+
+    self._startup_auto_recovery_start_unsub = cancel_start
+    unsubscribe = async_at_started(self.hass, _async_start_recovery)
+
+
+async def _async_prepare_startup_recovery(self: EnergyPlannerCoordinator) -> bool:
+    """Make initial recovery progress durable before starting supervision."""
+    failure: Exception | None
+    for _ in range(2):
         store_data = getattr(getattr(self, "store", None), "data", {})
         production = parse_production_state(
             store_data.get("production") if isinstance(store_data, dict) else None
         )
-        if production.armed:
-            self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-            self.executor.notification_grace_until = dt_util.utcnow() + timedelta(
-                seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-            )
-            await self._async_update_startup_auto_recovery(
-                "grace",
-                successful_runs=0,
-                required_runs=1,
-                reason="startup_grace_in_progress",
-                started=True,
-            )
+        try:
+            if production.armed:
+                self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+                self.executor.notification_grace_until = dt_util.utcnow() + timedelta(
+                    seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+                )
+                await self._async_update_startup_auto_recovery(
+                    "grace", successful_runs=0, required_runs=1, reason="startup_grace_in_progress", started=True,
+                )
+            else:
+                self._startup_auto_recovery_deadline = None
+                await self._async_update_startup_auto_recovery(
+                    "waiting_for_safe", successful_runs=0, reason="startup_safe_recovery_resumed",
+                )
+            await self.store.async_flush()
+        except Exception as error:
+            failure = error
         else:
-            self._startup_auto_recovery_deadline = None
-            await self._async_update_startup_auto_recovery(
-                "waiting_for_safe",
-                successful_runs=0,
-                reason="startup_safe_recovery_resumed",
-            )
-            self._export_retry_startup_blocked = False
-            self._schedule_export_retry()
-        self._startup_auto_recovery_task = self.entry.async_create_background_task(
-            self.hass,
-            self._async_run_startup_auto_recovery(),
-            f"{DOMAIN} startup automatic-control recovery",
-        )
+            failure = None
+        if not self._startup_auto_recovery_authorized:
+            return False
+        if failure is None:
+            if not production.armed:
+                self._export_retry_startup_blocked = False
+                self._schedule_export_retry()
+            return True
+    _LOGGER.warning("Could not save Energy Planner startup recovery (%s)", type(failure).__name__)
+    await self._async_fail_startup_recovery()
+    return False
 
-    self._startup_auto_recovery_start_unsub = async_at_started(
-        self.hass,
-        _async_start_recovery,
+
+async def _async_fail_startup_recovery(self: EnergyPlannerCoordinator) -> None:
+    """Revoke unsupervised authority and release temporary startup guards."""
+    self._startup_auto_recovery_authorized = False
+    self._startup_auto_recovery_deadline = None
+    self._export_retry_startup_blocked = False
+    self.executor.notification_grace_until = None
+    operator_disarm = getattr(self, "_operator_disarm_request", None)
+    cleanup = asyncio.create_task(_async_finish_failed_startup_recovery(self, operator_disarm))
+    self._listener_tasks.add(cleanup)
+    cleanup.add_done_callback(self._listener_tasks.discard)
+    if await async_finish_runtime_cleanup(cleanup):
+        raise asyncio.CancelledError
+
+
+async def _async_finish_failed_startup_recovery(
+    self: EnergyPlannerCoordinator, operator_disarm: object | None,
+) -> None:
+    """Finish a terminal failure and any dispatched restoration during unload."""
+    for attempt in range(2):
+        if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+            return
+        armed = parse_production_state(self.store.data.get("production")).armed
+        try:
+            await self._async_update_startup_auto_recovery(
+                "failed", successful_runs=0, reason="startup_recovery_save_failed", completed=True,
+                disarm_reason="startup_recovery_save_failed" if armed else None,
+            )
+            await self.store.async_flush()
+        except Exception as error:
+            self._failed_startup_restore_flush_needed = True
+            if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+                return
+            if attempt:
+                _LOGGER.warning("Could not save Energy Planner recovery failure (%s)", type(error).__name__)
+        else:
+            self._failed_startup_restore_flush_needed = False
+            break
+    if operator_disarm is getattr(self, "_operator_disarm_request", None) and not getattr(self, "_tearing_down", False):
+        await self._async_restore_failed_startup()
+        _watch_failed_startup_restore(self)
+
+
+async def _async_restore_failed_startup(self: EnergyPlannerCoordinator) -> None:
+    """Release retained device authority after a terminal startup save failure."""
+    async with self._command_lock:
+        if not _failed_startup_needs_restore(self) or getattr(self, "_tearing_down", False):
+            return
+        if _failed_startup_has_restore_targets(self):
+            try:
+                await self.executor.async_restore_safe_state("startup_recovery_save_failed")
+            except Exception as error:
+                _LOGGER.warning("Could not restore Energy Planner devices after startup failed (%s)",
+                                type(error).__name__)
+        await _async_flush_failed_startup_restore(self)
+
+
+def _failed_startup_needs_restore(self: EnergyPlannerCoordinator) -> bool:
+    return getattr(self, "_failed_startup_restore_flush_needed", False) or _failed_startup_has_restore_targets(self)
+
+
+async def _async_flush_failed_startup_restore(self: EnergyPlannerCoordinator) -> None:
+    """Keep retry ownership until all completed restore changes are durable."""
+    self._failed_startup_restore_flush_needed = True
+    try:
+        await self.store.async_flush()
+    except Exception as error:
+        _LOGGER.warning("Could not save Energy Planner's startup restoration (%s)", type(error).__name__)
+    else:
+        self._failed_startup_restore_flush_needed = False
+
+
+def _failed_startup_has_restore_targets(self: EnergyPlannerCoordinator) -> bool:
+    data = getattr(getattr(self, "store", None), "data", {})
+    production = parse_production_state(data.get("production"))
+    recovery = production.raw.get("startup_auto_recovery")
+    if (production.armed or not isinstance(recovery, dict) or recovery.get("status") != "failed"
+            or recovery.get("last_reason") != "startup_recovery_save_failed"):
+        return False
+    ownership = data.get("ownership", {})
+    if any(ownership.get(key) for key in (
+        "ev_smart_charging_state", "hvac_control", "climate_automations", "enphase_profile",
+        "enphase_profile_changed_at",
+    )) or ownership.get(EXPORT_ASSET, {}).get("baseline"):
+        return True
+    reservation = data.get("ev_grid_reservation", {})
+    return bool(
+        reservation.get("active") is True and reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True
     )
+
+
+def _queue_failed_startup_restore(self: EnergyPlannerCoordinator) -> None:
+    if getattr(self, "_tearing_down", False) or not _failed_startup_needs_restore(self):
+        _retire_failed_startup_restore_watch(self)
+        return
+    if getattr(self, "_failed_startup_restore_running", False):
+        self._failed_startup_restore_needed = True
+        return
+
+    async def restore() -> None:
+        try:
+            while self._failed_startup_restore_needed and not self._tearing_down:
+                self._failed_startup_restore_needed = False
+                await self._async_restore_failed_startup()
+        finally:
+            self._failed_startup_restore_running = False
+            _retire_failed_startup_restore_watch(self)
+
+    self._failed_startup_restore_needed = True
+    self._failed_startup_restore_running = True
+    self._async_create_listener_task(restore())
+
+
+def _retire_failed_startup_restore_watch(self: EnergyPlannerCoordinator) -> None:
+    unsubscribe = getattr(self, "_failed_startup_restore_watch_cancel", None)
+    if unsubscribe is not None and not _failed_startup_needs_restore(self):
+        unsubscribe()
+        if refresh_inputs := getattr(self, "_refresh_input_subscription", None):
+            refresh_inputs()
+
+
+def _watch_failed_startup_restore(self: EnergyPlannerCoordinator) -> None:
+    if (getattr(self, "_tearing_down", False) or not _failed_startup_needs_restore(self)
+            or getattr(self, "_failed_startup_restore_watch_cancel", None)):
+        return
+    from .coordinator import _state_listener_targets
+
+    if refresh_inputs := getattr(self, "_refresh_input_subscription", None):
+        refresh_inputs()
+
+    @callback
+    def after_start(_hass: HomeAssistant) -> None:
+        self._queue_failed_startup_restore()
+
+    @callback
+    def retained_target_changed(event: Any) -> None:
+        _observe_failed_startup_availability(self, event)
+
+    entry_data = self.entry_data
+    ownership = self.store.data.get("ownership", {})
+    control = ownership.get("hvac_control", {})
+    watched, _retained_zones = _state_listener_targets(entry_data, control)
+    monitored = set(watched)
+    hvac_entities = self.executor.hvac_restore_entity_ids()
+    ev_feedback = self.executor.ev_restore_feedback()
+    device_scopes = {entity: {"ev"} for entity in ev_feedback.entity_ids}
+    if ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"):
+        profile = entry_data.get(CONF_ENPHASE_PROFILE)
+        if isinstance(profile, str) and profile:
+            device_scopes.setdefault(profile, set()).add("enphase")
+    if ownership.get(EXPORT_ASSET, {}).get("baseline"):
+        export_target = entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        if isinstance(export_target, str) and export_target:
+            device_scopes.setdefault(export_target, set()).add(EXPORT_ASSET)
+            if (export_target.startswith("select.")
+                    and (export_feedback := feedback_entity_id(self.hass, export_target))):
+                monitored.add(export_feedback)
+                device_scopes.setdefault(export_feedback, set()).add(EXPORT_ASSET)
+    restore_entities = (*device_scopes, *hvac_entities)
+    retained = tuple(dict.fromkeys(entity for entity in restore_entities if entity not in monitored))
+    subscriptions: list[Callable[[], None]] = []
+
+    def cancel() -> None:
+        self._failed_startup_restore_watch_cancel = None
+        self._failed_startup_restore_hvac_entities = frozenset()
+        self._failed_startup_restore_device_scopes = {}
+        self._failed_startup_restore_ev_feedback = EVRestoreFeedback()
+        if cancel in self._unsub_listeners:
+            self._unsub_listeners.remove(cancel)
+        while subscriptions:
+            subscriptions.pop()()
+
+    self._failed_startup_restore_watch_cancel = cancel
+    self._failed_startup_restore_hvac_entities = frozenset(hvac_entities)
+    self._failed_startup_restore_device_scopes = device_scopes
+    self._failed_startup_restore_ev_feedback = ev_feedback
+    self._unsub_listeners.append(cancel)
+    if retained:
+        subscriptions.append(async_track_state_change_event(self.hass, retained, retained_target_changed))
+    if ev_feedback.power_entity_id:
+        @callback
+        def power_reported(event: Any) -> None:
+            _observe_failed_startup_power_report(self, event)
+
+        subscriptions.append(async_track_state_report_event(self.hass, [ev_feedback.power_entity_id], power_reported))
+    subscriptions.append(async_at_started(self.hass, after_start))
+
+
+def _observe_failed_startup_availability(self: EnergyPlannerCoordinator, event: Any) -> None:
+    if getattr(self, "_failed_startup_restore_watch_cancel", None) is None:
+        return
+    old, new = event.data.get("old_state"), event.data.get("new_state")
+    if new is None or new.state in STATE_UNKNOWN_VALUES:
+        return
+    if new.entity_id in self._failed_startup_restore_hvac_entities:
+        if _hvac_restore_feedback_advanced(old, new) and _retained_restore_scope(self, "daikin"):
+            self._queue_failed_startup_restore()
+    elif (scopes := self._failed_startup_restore_device_scopes.get(new.entity_id)) and (
+        old is None or old.state in STATE_UNKNOWN_VALUES
+        or _ev_restore_feedback_advanced(self, self._failed_startup_restore_ev_feedback, old, new)
+    ) and any(_retained_restore_scope(self, scope) for scope in scopes):
+        self._queue_failed_startup_restore()
+
+
+def _retained_restore_scope(self: EnergyPlannerCoordinator, scope: str) -> bool:
+    ownership = self.store.data.get("ownership", {})
+    if scope == "ev":
+        reservation = self.store.data.get("ev_grid_reservation", {})
+        return bool(ownership.get("ev_smart_charging_state") or (
+            reservation.get("active") is True and reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True
+        ))
+    if scope == "daikin":
+        return bool(ownership.get("hvac_control") or ownership.get("climate_automations"))
+    if scope == "enphase":
+        return bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
+    return bool(ownership.get(EXPORT_ASSET, {}).get("baseline"))
+
+
+def _observe_failed_startup_power_report(self: EnergyPlannerCoordinator, event: Any) -> None:
+    state = event.data["new_state"]
+    if self._failed_startup_restore_watch_cancel is None or "sampled_at_utc" in state.attributes:
+        return
+    now = dt_util.utcnow()
+    if measured(state, now, "power") != 0 or (activity_at := self.executor.ev_grid_activity_at()) is None:
+        return
+    reported = current_sample_reported_at(state, now, received_at=event.data["last_reported"])
+    if (reported is not None and event.data["old_last_reported"] <= activity_at < reported
+            and _retained_restore_scope(self, "ev")):
+        self._queue_failed_startup_restore()
+
+
+def _ev_restore_feedback_advanced(
+    self: EnergyPlannerCoordinator, feedback: EVRestoreFeedback, old: State, new: State,
+) -> bool:
+    if new.entity_id == feedback.native_limit_entity_id:
+        if (feedback.native_limit_unit is not None
+                and new.attributes.get("unit_of_measurement") != feedback.native_limit_unit):
+            return False
+        return (
+            feedback.native_limit_value is not None
+            and native_limit_value_matches(new, feedback.native_limit_value)
+            and not native_limit_value_matches(old, feedback.native_limit_value)
+        ) or any(
+            new.attributes.get(key) is not None and old.attributes.get(key) != new.attributes[key]
+            for key in _RESTORE_EV_LIMIT_ATTRIBUTES
+        )
+    if new.entity_id == feedback.power_entity_id:
+        now = dt_util.utcnow()
+        new_at = current_sample_reported_at(new, now)
+        if new_at is None or measured(new, now, "power") != 0:
+            return False
+        activity_at = self.executor.ev_grid_activity_at()
+        if activity_at is not None and new_at <= activity_at:
+            return False
+        old_at = current_sample_reported_at(old, now)
+        return old_at is None or measured(old, now, "power") != 0 or (activity_at is not None and old_at <= activity_at)
+    if new.entity_id == feedback.connection_entity_id and connection(new.state) is False:
+        return connection(old.state) is not False or _stop_source_advanced(self, old, new)
+    return (
+        (new.entity_id == feedback.charging_entity_id or new.entity_id in feedback.control_entity_ids)
+        and ev_charging_state_for_stop(new.state) is False
+        and (ev_charging_state_for_stop(old.state) is not False or _stop_source_advanced(self, old, new))
+    )
+
+
+def _stop_source_advanced(self: EnergyPlannerCoordinator, old: State, new: State) -> bool:
+    now = dt_util.utcnow()
+    new_at = self.executor.native_ev_signal_reported_at(new, now)
+    if new_at is None:
+        return False
+    old_at = self.executor.native_ev_signal_reported_at(old, now)
+    activity_at = self.executor.ev_grid_activity_at()
+    if activity_at is None:
+        return old_at is None
+    return new_at > activity_at and (old_at is None or old_at <= activity_at)
+
+
+def _hvac_restore_feedback_advanced(old: State | None, new: State) -> bool:
+    if not hvac_feedback_is_observed(new):
+        return False
+    if new.domain == "timer":
+        return _scheduler_timer_usable(new) and not _scheduler_timer_usable(old)
+    if not hvac_feedback_is_observed(old):
+        return True
+    return new.domain == "climate" and (
+        old.state != new.state
+        or any(old.attributes.get(key) != new.attributes.get(key) for key in _RESTORE_CLIMATE_ATTRIBUTES)
+    )
+
+
+def _scheduler_timer_usable(state: State | None) -> bool:
+    if not hvac_feedback_is_observed(state):
+        return False
+    if state.state == "active":
+        end = dt_util.parse_datetime(str(state.attributes.get("finishes_at", "")))
+        return end is not None and end.tzinfo is not None
+    return state.state == "idle"
 
 
 @callback
@@ -152,11 +499,14 @@ async def async_cancel_startup_auto_recovery(
         try:
             # Revoke production authority and save the cancellation before
             # waiting for the startup task's cleanup.
-            await self._async_update_startup_auto_recovery(
-                "cancelled", successful_runs=_startup_auto_recovery_successful_runs(
-                    recovery.get("successful_runs") if isinstance(recovery, dict) else None,
-                ), reason=reason, completed=True, disarm_reason=disarm_reason,
-            )
+            if recovery_active or reason != "entry_unload":
+                await self._async_update_startup_auto_recovery(
+                    "cancelled", successful_runs=_startup_auto_recovery_successful_runs(
+                        recovery.get("successful_runs") if isinstance(recovery, dict) else None,
+                    ), reason=reason, completed=True, disarm_reason=disarm_reason,
+                )
+            else:
+                await self.async_disarm_production_control(disarm_reason)
         finally:
             if task is not None:
                 results: list[None | BaseException] = await asyncio.gather(task, return_exceptions=True)
@@ -213,7 +563,9 @@ async def async_cancel_startup_auto_recovery(
         if not preserve_control:
             await self.executor.async_dismiss_startup_recovery_notification()
         return
-    if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload", "operator_armed"}:
+    if preserve_control and reason in {
+        "home_assistant_shutdown", "configuration_reload", "entry_unload", "operator_armed",
+    }:
         # Persist the current grace/recovery state verbatim so the next
         # process or a rejected operator replacement can resume it.
         return
@@ -499,6 +851,7 @@ async def _async_run_startup_auto_recovery_validation(self: EnergyPlannerCoordin
         return False, "validation_refresh_failed"
     finally:
         self._startup_auto_recovery_validation_active = False
+        self._resume_ev_capacity_after_validation()
     validation = self._last_startup_auto_recovery_validation
     if not isinstance(validation, dict) or validation.get("committed") is not True:
         return False, "validation_plan_not_committed"

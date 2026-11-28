@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -33,7 +34,9 @@ from .const import (
     EV_RESERVATION_EXTERNAL_BASELINE,
     EV_RESERVATION_EXTERNAL_POWER_OPTIONS,
     EV_RESERVATION_EXTERNAL_TOPOLOGY,
+    EV_RESERVATION_HANDOFF_PENDING,
     EV_RESERVATION_RETAIN_WHEN_UNLOADED,
+    EV_SIGNAL_CLOCK_HANDOFFS,
     INTEGRATION_NAME,
     LEGACY_INTEGRATION_NAME,
     PLATFORMS,
@@ -51,6 +54,14 @@ from .const import (
 )
 from .entry_data import combined_entry_data, remove_retired_config_keys
 from .ev_policy import power_limit_options
+from .ev_runtime import (
+    EV_CAP_FEEDBACK_CLOCK_INVALID,
+    EV_RETIRED_CAP_KW,
+    MAX_EV_CAP_HISTORY,
+    check_ev_cap_feedback_clock,
+    invalidate_ev_cap_feedback_clock,
+    timestamp,
+)
 from .migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
@@ -63,6 +74,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
 
     from .coordinator import EnergyPlannerCoordinator
+    from .models import ActionOutcome
 
 def _config_schema(config: dict[str, Any]) -> dict[str, Any]:
     """Declare UI-only setup while keeping standalone planner tools importable."""
@@ -416,6 +428,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Set up Energy Planner from a config entry."""
+    from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+
     from .coordinator import EnergyPlannerCoordinator, InitialPlanSuperseded
     from .storage import PlannerStore
     from .subentry_migration import async_migrate_subentries_to_entry_data
@@ -439,22 +453,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         migrated_topology = remove_retired_config_keys(topology)
         if migrated_topology != topology:
             await store.async_save_ownership({**ownership, "ev_smart_charging_control_topology": migrated_topology})
-    _rehydrate_ev_grid_reservation(hass, entry, getattr(store, "data", {}))
+    retained_handoff = _rehydrate_ev_grid_reservation(hass, entry, getattr(store, "data", {}))
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
     coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
     forwarding_started = False
     try:
-        # Other entries can reserve shared headroom while the first refresh waits.
-        external_ev = store.data.get("ev_grid_reservation", {})
-        if (external_ev.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+        with ExitStack() as initial_feedback:
+            external_ev = store.data.get("ev_grid_reservation", {})
+            mapped_external_ev = (
+                external_ev.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
                 and isinstance(external_ev.get(EV_RESERVATION_EXTERNAL_TOPOLOGY), dict)
-                and coordinator.executor.sync_ev_grid_reservation()):
-            await coordinator.executor.async_persist_ev_grid_reservation()
-        await coordinator.async_retry_initial_hvac_handoff()
-        await coordinator.async_reconcile_production_evidence_contract()
-        await coordinator.async_config_entry_first_refresh()
-        coordinator.async_start_listeners()
+            )
+            initial_load_increased = False
+            if mapped_external_ev or "ev_power_limit_entity" in ownership.get("ev_smart_charging_state", {}):
+                initial_load_increased = coordinator.observe_initial_ev_feedback(initial_feedback)
+            if retained_handoff:
+                try:
+                    async with coordinator._command_lock:
+                        await coordinator.executor.async_persist_ev_grid_reservation()
+                except (OSError, HomeAssistantError) as error:
+                    raise ConfigEntryNotReady("Could not save the retained EV reservation") from error
+                retained_handoff = False
+            elif mapped_external_ev and initial_load_increased:
+                # Other entries can reserve shared headroom while the first refresh waits.
+                async with coordinator._command_lock:
+                    await coordinator.executor.async_persist_ev_grid_reservation()
+            await coordinator.async_retry_initial_hvac_handoff()
+            await coordinator.async_reconcile_production_evidence_contract()
+            await coordinator.async_config_entry_first_refresh()
+            coordinator.async_start_listeners()
         coordinator.async_start_startup_auto_recovery()
         forwarding_started = True
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -465,21 +493,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         # Keep cleanup alive if Home Assistant cancels setup while platforms or
         # recovery are starting. Do not cancel a transaction with external effects.
         coordinator._tearing_down = True
-        cleanup = asyncio.create_task(
-            _async_cleanup_failed_setup(
-                hass, entry, coordinator, forwarding_started,
-                preserve_control=not forwarding_started and isinstance(error.__cause__, InitialPlanSuperseded),
-            )
+        preserve_control = not forwarding_started and (
+            retained_handoff or isinstance(error.__cause__, InitialPlanSuperseded)
         )
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                continue
-        cleanup.result()
+        _retain_ev_signal_clocks_for_reload(coordinator)
+        cleanup = asyncio.create_task(
+            _async_cleanup_failed_setup(hass, entry, coordinator, forwarding_started, preserve_control=preserve_control)
+        )
+        from .task_lifecycle import async_finish_runtime_cleanup
+
+        await async_finish_runtime_cleanup(cleanup)
         raise
     async_clear_migration_issue(hass, entry.entry_id)
     return True
+
+
+def _retain_ev_signal_clocks_for_reload(coordinator: EnergyPlannerCoordinator) -> None:
+    retain = getattr(getattr(coordinator, "executor", None), "retain_ev_signal_clock_handoff", None)
+    if callable(retain):
+        try:
+            retain()
+        except (RuntimeError, ValueError):
+            _LOGGER.exception("Could not observe retained EV feedback during runtime handoff")
 
 
 async def _async_cleanup_failed_setup(
@@ -520,12 +555,18 @@ async def _async_cleanup_failed_setup(
         # A draining device transaction may defer a notification after shutdown
         # first removed callbacks. Release these final references as well.
         cancel_deferred_notifications_for_entry(hass, entry.entry_id)
+        _retain_ev_signal_clocks_for_reload(coordinator)
+        if getattr(coordinator, "_ev_capacity_flush_needed", False):
+            coordinator.executor.retain_ev_grid_handoff()
         object.__delattr__(entry, "runtime_data")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Unload a config entry."""
     from homeassistant.core import CoreState
+    from homeassistant.exceptions import HomeAssistantError
+
+    from .task_lifecycle import async_finish_runtime_cleanup
 
     coordinator = entry.runtime_data
     whole_system_shutdown = getattr(hass, "state", CoreState.running) in {
@@ -546,33 +587,65 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     # Stop new listener/timer work before waiting for any in-flight planner
     # execution. The coordinator's teardown marker also prevents an already
     # queued refresh from committing a new device command after restoration.
-    if preserve_automatic_state:
-        await coordinator.async_cancel_startup_auto_recovery(
-            "configuration_reload" if configuration_reload_handoff else "home_assistant_shutdown",
-            preserve_control=True,
-        )
-    else:
-        await coordinator.async_cancel_startup_auto_recovery("entry_unload")
-    # The base coordinator shutdown is irreversible. Home Assistant invokes
-    # the registered async_shutdown callback only after this unload succeeds.
-    coordinator._begin_shutdown()
-    await coordinator.async_wait_for_plan_execution()
-    await coordinator.async_wait_for_refresh_shutdown()
     unload_completed = False
+    listeners_stopped = False
+    disarm_started = False
+    recovery_was_authorized = getattr(coordinator, "_startup_auto_recovery_authorized", False)
+    observations = ExitStack()
+
+    async def finish_unload() -> None:
+        nonlocal unload_completed
+        for _ in range(3):
+            if not getattr(coordinator, "_ev_capacity_flush_needed", False):
+                break
+            flush = asyncio.create_task(coordinator.async_wait_for_refresh_shutdown())
+            try:
+                # The platforms have unloaded. Complete the Core lifecycle even if its caller cancels.
+                await async_finish_runtime_cleanup(flush)
+            except (OSError, HomeAssistantError) as error:
+                _LOGGER.warning("Could not save retained EV feedback at entry handoff (%s)", type(error).__name__)
+        observations.close()
+        if configuration_reload_handoff:
+            _retain_ev_signal_clocks_for_reload(coordinator)
+        if getattr(coordinator, "_ev_capacity_flush_needed", False):
+            coordinator.executor.retain_ev_grid_handoff()
+        object.__delattr__(entry, "runtime_data")
+        unload_completed = True
+
+    async def unload_platforms() -> bool:
+        platforms = asyncio.create_task(hass.config_entries.async_unload_platforms(entry, PLATFORMS))
+        await async_finish_runtime_cleanup(platforms)
+        if not platforms.result():
+            return False
+        await finish_unload()
+        return True
+
     try:
         if preserve_automatic_state:
+            await coordinator.async_cancel_startup_auto_recovery(
+                "configuration_reload" if configuration_reload_handoff else "home_assistant_shutdown",
+                preserve_control=True,
+            )
+        else:
+            await coordinator.async_cancel_startup_auto_recovery("entry_unload", preserve_control=True)
+        observe_ev_unload = getattr(getattr(coordinator, "executor", None), "observe_ev_unload", None)
+        if callable(observe_ev_unload):
+            observe_ev_unload(observations, lambda increased: coordinator._schedule_ev_capacity_feedback(
+                invalidate=increased, refresh=increased, retain_during_shutdown=True,
+            ), preserve_control=preserve_automatic_state)
+        # Core invokes the irreversible coordinator shutdown only after a successful unload.
+        coordinator._begin_shutdown()
+        listeners_stopped = True
+        await coordinator.async_wait_for_plan_execution()
+        await coordinator.async_wait_for_refresh_shutdown()
+        if preserve_automatic_state:
             handoff_pending = configuration_reload_handoff and getattr(coordinator, "hvac_handoff_unresolved", False)
-            unload_ok = False if handoff_pending else await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-            if unload_ok:
-                object.__delattr__(entry, "runtime_data")
-                unload_completed = True
-            elif configuration_reload_handoff:
-                coordinator._configuration_reload_handoff = False
-                await coordinator.async_reconcile_production_evidence_contract()
-                coordinator.async_start_startup_auto_recovery()
-            return unload_ok
-        await coordinator.async_disarm_production_control("entry_unload")
-        restore_outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
+            return False if handoff_pending else await unload_platforms()
+        disarm_started = True
+        terminal_cleanup = asyncio.create_task(_async_disarm_and_restore_for_unload(coordinator))
+        if await async_finish_runtime_cleanup(terminal_cleanup):
+            raise asyncio.CancelledError
+        restore_outcome = terminal_cleanup.result()
         store_data = getattr(getattr(coordinator, "store", None), "data", {})
         remaining_ownership = store_data.get("ownership") if isinstance(store_data, Mapping) else None
         ev_reservation = store_data.get("ev_grid_reservation") if isinstance(store_data, Mapping) else None
@@ -585,16 +658,55 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
         ):
             await coordinator.async_disarm_production_control("entry_unload_restore_failed")
             return False
-        unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-        if unload_ok:
-            object.__delattr__(entry, "runtime_data")
-            unload_completed = True
-        else:
+        unload_ok = await unload_platforms()
+        if not unload_ok:
             await coordinator.async_disarm_production_control("entry_platform_unload_failed")
         return unload_ok
     finally:
+        observations.close()
         if not unload_completed and entry.runtime_data is coordinator and not whole_system_shutdown:
-            coordinator.async_start_listeners()
+            if configuration_reload_handoff:
+                coordinator._configuration_reload_handoff = False
+            if listeners_stopped:
+                coordinator.async_start_listeners()
+            if configuration_reload_handoff or (recovery_was_authorized and not disarm_started):
+                cleanup = asyncio.create_task(_async_resume_recovery_after_failed_unload(entry, coordinator))
+                if await async_finish_runtime_cleanup(cleanup):
+                    raise asyncio.CancelledError
+
+
+async def _async_disarm_and_restore_for_unload(coordinator: EnergyPlannerCoordinator) -> ActionOutcome:
+    """Complete safe-state restoration after accepting an ordinary unload."""
+    try:
+        await coordinator.async_cancel_startup_auto_recovery("entry_unload", disarm_reason="entry_unload")
+    finally:
+        outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
+    return outcome
+
+
+async def _async_resume_recovery_after_failed_unload(
+    entry: EnergyPlannerConfigEntry, coordinator: EnergyPlannerCoordinator,
+) -> None:
+    """Recheck recovery evidence before resuming an interrupted runtime."""
+    operator_disarm = getattr(coordinator, "_operator_disarm_request", None)
+    failure: Exception | None
+    for _ in range(2):
+        try:
+            await coordinator.async_reconcile_production_evidence_contract()
+        except Exception as error:
+            failure = error
+        else:
+            failure = None
+        if (
+            entry.runtime_data is not coordinator or getattr(coordinator, "_tearing_down", False)
+            or operator_disarm is not getattr(coordinator, "_operator_disarm_request", None)
+        ):
+            return
+        if failure is None:
+            coordinator.async_start_startup_auto_recovery()
+            return
+    _LOGGER.warning("Could not resume Energy Planner recovery after failed unload (%s)", type(failure).__name__)
+    await coordinator._async_fail_startup_recovery()
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
@@ -603,6 +715,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     from .storage import PlannerStore
 
     async_clear_migration_issue(hass, entry.entry_id)
+    handoff = hass.data.get(DOMAIN, {}).get(EV_SIGNAL_CLOCK_HANDOFFS, {}).pop(entry.entry_id, None)
+    if handoff is not None:
+        handoff.close()
     if not await PlannerStore(hass, entry.entry_id).async_remove_if_safe():
         _LOGGER.warning("Energy Planner retained recovery storage for removed entry %s", entry.entry_id)
     else:
@@ -639,15 +754,27 @@ def _rehydrate_ev_grid_reservation(
     hass: HomeAssistant,
     entry: EnergyPlannerConfigEntry,
     store_data: dict[str, Any],
-) -> None:
-    """Reserve headroom for persisted planner-owned or external EV load."""
+) -> bool:
+    """Restore persisted load and report an unsaved handoff for this entry."""
+    hass_data = getattr(hass, "data", None)
+    if not isinstance(hass_data, dict):
+        return False
+    restored_at = datetime.now(UTC)
+    domain_data = hass_data.get(DOMAIN)
+    if isinstance(domain_data, dict):
+        reservations = domain_data.get("ev_grid_reservations")
+        if isinstance(reservations, dict) and isinstance(live := reservations.get(entry.entry_id), dict):
+            _, clock_changed = check_ev_cap_feedback_clock(live, restored_at)
+            if clock_changed:
+                live[EV_RESERVATION_HANDOFF_PENDING] = True
+            return live.get(EV_RESERVATION_HANDOFF_PENDING) is True
     ownership = store_data.get("ownership")
     persisted_reservation = store_data.get("ev_grid_reservation")
     if (
         isinstance(persisted_reservation, dict)
         and persisted_reservation.get("active") is False
     ):
-        return
+        return False
     has_owned_ev_state = isinstance(ownership, dict) and bool(
         ownership.get("ev_smart_charging_state")
     )
@@ -655,16 +782,13 @@ def _rehydrate_ev_grid_reservation(
         persisted_reservation.get("active") is True or bool(persisted_reservation)
     )
     if not has_owned_ev_state and not has_persisted_reservation:
-        return
-    hass_data = getattr(hass, "data", None)
-    if not isinstance(hass_data, dict):
-        return
+        return False
     domain_data = hass_data.setdefault(DOMAIN, {})
     if not isinstance(domain_data, dict):
-        return
+        return False
     reservations = domain_data.setdefault("ev_grid_reservations", {})
     if not isinstance(reservations, dict):
-        return
+        return False
     options = {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))}
     persisted_load_kw = (
         _non_negative_finite_float(persisted_reservation.get("load_kw"))
@@ -677,7 +801,7 @@ def _rehydrate_ev_grid_reservation(
             persisted_load_kw,
         ),
         "limit_kw": _non_negative_finite_float(options[CONF_GRID_IMPORT_LIMIT_KW]),
-        "reserved_at": datetime.now(UTC).isoformat(),
+        "reserved_at": restored_at.isoformat(),
         EV_RESERVATION_RETAIN_WHEN_UNLOADED: True,
     }
     if (
@@ -698,14 +822,93 @@ def _rehydrate_ev_grid_reservation(
             # the external charger that produced this reservation.
             external_load_kw = max(persisted_load_kw, observed_load_kw, observed_limit_kw)
             reservation["load_kw"] = external_load_kw or reservation["load_kw"]
-    reservations.setdefault(entry.entry_id, reservation)
+    if isinstance(persisted_reservation, dict):
+        _restore_ev_cap_dispute(reservation, persisted_reservation, restored_at)
+    current = reservations.setdefault(entry.entry_id, reservation)
+    return current.get(EV_RESERVATION_HANDOFF_PENDING) is True
+
+
+def _restore_ev_cap_dispute(reservation: dict[str, Any], persisted: dict[str, Any], restored_at: datetime) -> None:
+    """Recover the last reversible cap proof without replaying a pending command."""
+    if (settled_cap := _non_negative_finite_float(persisted.get("confirmed_cap_kw"))) > 0:
+        reservation["confirmed_cap_kw"] = settled_cap
+    if (activity_at := timestamp(persisted.get("observed_activity_at"))) is not None:
+        reservation["observed_activity_at"] = activity_at.isoformat()
+    last_report = timestamp(persisted.get("observed_load_at"))
+    report_kw = _non_negative_finite_float(persisted.get("observed_report_kw"))
+    if last_report is not None and (
+        report_kw or _non_negative_finite_float(persisted.get("observed_load_kw"))
+        or _non_negative_finite_float(persisted.get("load_kw"))
+    ):
+        reservation["observed_load_at"] = last_report.isoformat()
+        if report_kw:
+            reservation["observed_report_kw"] = report_kw
+    reduction = persisted.get("cap_reduction")
+    proof_in_future = False
+    if isinstance(reduction, dict):
+        decoded = _decode_ev_cap_proof(reduction, timestamp(persisted.get("confirmed_power_at")))
+        if decoded is None:
+            reservation["load_kw"] = max(
+                reservation["load_kw"], _non_negative_finite_float(reduction.get("prior_load_kw")),
+                _non_negative_finite_float(reduction.get("retained_load_kw")),
+            )
+        else:
+            history = reduction.get("history")
+            if isinstance(history, list):
+                decoded["history"] = [
+                    proof for item in history[:MAX_EV_CAP_HISTORY]
+                    if (proof := _decode_ev_cap_proof(item)) is not None
+                ]
+            # Keep historical evidence for disputes without reinstating a confirmed limit on startup.
+            reservation["cap_reduction"] = decoded
+            proof_in_future = any(
+                proof.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is not True
+                and (confirmed_at := timestamp(proof.get("confirmed_at"))) is not None and confirmed_at > restored_at
+                for proof in (decoded, *decoded.get("history", ()))
+            )
+    pending = persisted.get("pending_power_limit")
+    command_at = timestamp(pending.get("at")) if isinstance(pending, dict) else None
+    retired_cap = _non_negative_finite_float(persisted.get(EV_RETIRED_CAP_KW))
+    if isinstance(pending, dict):
+        retired_cap = _non_negative_finite_float(pending.get("physical_power_kw")) or retired_cap
+    if retired_cap:
+        reservation[EV_RETIRED_CAP_KW] = retired_cap
+    if proof_in_future or (command_at is not None and command_at > restored_at):
+        if isinstance(pending, dict):
+            reservation["pending_power_limit"] = dict(pending)
+        invalidate_ev_cap_feedback_clock(reservation)
+        reservation[EV_RESERVATION_HANDOFF_PENDING] = True
+
+
+def _decode_ev_cap_proof(raw: Any, fallback_time: datetime | None = None) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    cap = _non_negative_finite_float(raw.get("cap_kw"))
+    confirmed_at = timestamp(raw.get("confirmed_at")) or fallback_time
+    pending = raw.get("pending_limit")
+    if confirmed_at is None or not cap or not isinstance(pending, dict):
+        return None
+    prior_confirmation = timestamp(raw.get("prior_confirmation_at"))
+    decoded = {
+        "prior_load_kw": _non_negative_finite_float(raw.get("prior_load_kw")),
+        "retained_load_kw": _non_negative_finite_float(raw.get("retained_load_kw")),
+        "cap_kw": cap,
+        "confirmed_at": confirmed_at.isoformat(),
+        "prior_confirmation_at": prior_confirmation.isoformat() if prior_confirmation is not None else None,
+        "prior_confirmed_cap_kw": _non_negative_finite_float(raw.get("prior_confirmed_cap_kw")) or None,
+        "pending_limit": dict(pending),
+        "disputed_load_kw": _non_negative_finite_float(raw.get("disputed_load_kw")),
+    }
+    if raw.get(EV_CAP_FEEDBACK_CLOCK_INVALID) is True:
+        decoded[EV_CAP_FEEDBACK_CLOCK_INVALID] = True
+    return decoded
 
 
 def _non_negative_finite_float(value: Any) -> float:
     """Return a finite non-negative float for lifecycle reservation recovery."""
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
     return numeric if numeric >= 0 and numeric < float("inf") else 0.0
 

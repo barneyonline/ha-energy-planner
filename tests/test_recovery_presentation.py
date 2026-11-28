@@ -121,6 +121,18 @@ def test_startup_progress_and_cancellation(status):
     assert details["reason"] == "inactive"
 
 
+def test_terminal_startup_storage_failure_is_visible():
+    c = coordinator()
+    c.store.data["load_source_outage"] = None
+    c.store.data["production"] = {"startup_auto_recovery": {
+        "status": "failed", "last_reason": "startup_recovery_save_failed",
+    }}
+    details = recovery_details(c, NOW)
+    assert details["summary"] == "Could not save startup recovery"
+    assert details["reason"] == "startup_recovery_save_failed"
+    assert not details["automatic_retry"]
+
+
 def test_missing_source_and_entity_timestamp_fallback():
     c = coordinator()
     state = c.hass.states.get(SOURCE)

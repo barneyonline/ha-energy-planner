@@ -11,7 +11,7 @@ from homeassistant.core import CoreState
 from test_executor import FakeHass, FakeStore, _arm_store, _context
 
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
-from custom_components.ha_energy_planner.ev_adapter import EVCommandResult
+from custom_components.ha_energy_planner.ev_adapter import EVCommandResult, NativeEVStopEvidence
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -99,6 +99,11 @@ def test_safe_stop_with_failed_power_limit_restoration_retains_warning(manual: b
     )
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.ev_adapter.EVChargerAdapter.async_execute", fail_execute,
+    )
+    confirmed_at = datetime.now(UTC)
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.ev_adapter.EVChargerAdapter.native_restore_stop_evidence",
+        lambda _adapter: NativeEVStopEvidence(confirmed_at, None) if manual else None,
     )
 
     async def run() -> None:

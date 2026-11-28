@@ -9,12 +9,26 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
+from .const import EV_RESERVATION_EXTERNAL_BASELINE
 from .notifications import cancel_deferred_notifications_for_entry
 
 if TYPE_CHECKING:
     from .coordinator import EnergyPlannerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_finish_runtime_cleanup(cleanup: asyncio.Task[Any]) -> bool:
+    """Drain recovery writes and report cancellation of the waiting caller."""
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    return cancelled
+
 
 @callback
 def _async_create_listener_task(
@@ -46,6 +60,10 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if ev_deadline_cancel is not None:
         ev_deadline_cancel()
         self._ev_allocation_cancel = None
+    ev_capacity_work = getattr(self, "_ev_capacity_work", None)
+    if ev_capacity_work is not None and ev_capacity_work.refresh_request is not None:
+        # A debounced refresh or published EV capacity plan can still be pending.
+        ev_capacity_work.refresh_needed = True
     if self._debounce_cancel is not None:
         self._debounce_cancel()
         self._debounce_cancel = None
@@ -134,3 +152,12 @@ async def async_wait_for_refresh_shutdown(self: EnergyPlannerCoordinator) -> Non
                     _LOGGER.exception("Could not save manual HVAC supersession before unload")
             if getattr(self, "_calendar_feedback_flush_needed", False):
                 await self._async_flush_calendar_feedback()
+            if getattr(self, "_failed_startup_restore_flush_needed", False):
+                await self.store.async_flush()
+                self._failed_startup_restore_flush_needed = False
+            reservation = getattr(getattr(self, "store", None), "data", {}).get("ev_grid_reservation", {})
+            if (
+                reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+                and self.executor.release_stopped_external_ev_grid_capacity()
+            ) or getattr(self, "_ev_capacity_flush_needed", False):
+                await self._async_flush_ev_capacity_feedback()

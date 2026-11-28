@@ -86,6 +86,11 @@ def ev_charging_state_proves_safe(value: object) -> bool:
     return str(value).strip().lower() in _EV_SAFE_CONNECTED_INACTIVE_STATES
 
 
+def ev_charging_state_for_stop(value: object) -> bool | None:
+    """Interpret charger feedback for stop confirmation, including OCPP Finishing."""
+    return False if str(value).strip().lower() == "finishing" else ev_charging_state(value)
+
+
 def ev_charging_state_proves_active(value: object) -> bool:
     """Require charging feedback, excluding OCPP's stopped Finishing state."""
     return ev_charging_state(value) is True and str(value).strip().lower() != "finishing"
@@ -623,15 +628,33 @@ def _charge_cost_components(slot: Any, charge_kw: float) -> tuple[float | None, 
     """Return effective price plus solar/grid split for one charging slot."""
     if charge_kw <= 0:
         return None, 0.0, 0.0
-    import_price = _float_or_none(getattr(slot, "import_price", None))
-    if import_price is None:
-        return None, 0.0, round(charge_kw, 6)
-    surplus_kw = _solar_surplus_kw(slot)
-    solar_kw = min(charge_kw, surplus_kw)
-    grid_kw = max(charge_kw - solar_kw, 0.0)
-    export_price = _float_or_none(getattr(slot, "export_price", None)) or 0.0
-    effective_price = ((solar_kw * export_price) + (grid_kw * import_price)) / charge_kw
-    return round(effective_price, 6), round(solar_kw, 6), round(grid_kw, 6)
+    return ChargeEconomics.from_slot(slot).components(charge_kw)
+
+
+@dataclass(frozen=True, slots=True)
+class ChargeEconomics:
+    """Forecast values shared by all charging candidates for one slot."""
+
+    import_price: float | None
+    export_price: float
+    surplus_kw: float
+
+    @classmethod
+    def from_slot(cls, slot: Any) -> ChargeEconomics:
+        import_price = _float_or_none(getattr(slot, "import_price", None))
+        if import_price is None:
+            return cls(None, 0.0, 0.0)
+        return cls(import_price, _float_or_none(getattr(slot, "export_price", None)) or 0.0, _solar_surplus_kw(slot))
+
+    def components(self, charge_kw: float) -> tuple[float | None, float, float]:
+        if charge_kw <= 0:
+            return None, 0.0, 0.0
+        if self.import_price is None:
+            return None, 0.0, round(charge_kw, 6)
+        solar_kw = min(charge_kw, self.surplus_kw)
+        grid_kw = max(charge_kw - solar_kw, 0.0)
+        effective_price = ((solar_kw * self.export_price) + (grid_kw * self.import_price)) / charge_kw
+        return round(effective_price, 6), round(solar_kw, 6), round(grid_kw, 6)
 
 
 def _solar_surplus_kw(slot: Any) -> float:
