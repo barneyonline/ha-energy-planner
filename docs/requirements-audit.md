@@ -2114,6 +2114,36 @@ or live deployment was performed; live cycle acceptance remains outstanding.
   [Control behavior](planning-and-control.md#availability-and-manual-overrides) ·
   [Home Assistant 2026.12 review](ha-2026.12-compatibility.md)
 
+- `test_optimistic_user_intent_supersedes_pending_work_once` covers a fresh
+  assumed Off during an outage, immediate head or zone supersession, and a
+  single retained override through an unattributed provider recovery.
+  The same fixture covers removed state and missing setpoint feedback.
+  `test_outage_feedback_does_not_reuse_old_user_context` covers inherited and
+  already handled contexts in repeated unavailable and assumed reports.
+  `test_late_stop_feedback_starts_rest_from_the_observed_stop` covers delayed
+  reconciliation and adapter confirmation after an attribute poll, same-mode
+  recovery from assumed feedback, and preservation of the confirmed boundary
+  on repeat reports and reload. Reload of a pending stop with no observed
+  transition evidence uses the first available observed snapshot.
+  `test_hvac_listener_captures_observed_stop_before_later_attribute_poll`
+  covers the first refresh and steady-state listeners, including a poll or
+  assumed report whose previous snapshot supplies the earlier observed stop.
+  `test_first_refresh_preserves_manual_off_during_hvac_outage` covers manual
+  Off and concrete setpoint changes during configuration reload and the
+  handoff to normal listeners. `test_first_refresh_persists_all_user_hvac_edits_before_release_or_cleanup`
+  covers a queued initial plan and multiple user edits waiting for command
+  ownership through successful setup, failure and cancellation, including a
+  late edit accepted as the handoff worker exits and a transient save failure.
+  `test_shutdown_persists_queued_manual_hvac_handoff_before_restoration` covers
+  accepted head and zone edits waiting for the command lock as unload begins,
+  multiple edits queued before the first release, and an edit arriving while
+  EV restoration is in progress. It also covers safe-state, scoped, and direct
+  HVAC restoration after a failed supersession save. The first-refresh
+  fixture verifies that a replacement coordinator retries unsaved scopes.
+  `test_manual_hvac_handoff_blocks_stale_plan_after_an_await` exercises the
+  command guard after an EV safety stop, a continuation audit, and a capability
+  check. An HVAC handoff leaves evaluation and cleanup available for other assets.
+
 ## Zone feedback and adaptive thermal preparation
 
 - Zone temperature selectors preserve advanced mappings; `zone_temperature.py` applies mapped comfort and target checks in both policies.

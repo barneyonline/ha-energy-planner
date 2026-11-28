@@ -37,6 +37,7 @@ from custom_components.ha_energy_planner.const import (
     DEFAULT_OPTIONS,
     EV_RESERVATION_EXTERNAL_BASELINE,
 )
+from custom_components.ha_energy_planner.coordinator import InitialHvacHandoffFailed
 from custom_components.ha_energy_planner.models import OutcomeResult
 
 
@@ -263,6 +264,9 @@ class FakeCoordinator:
 
     last_instance: FakeCoordinator | None = None
 
+    async def async_retry_initial_hvac_handoff(self) -> None:
+        pass
+
     def __init__(self, hass: Any, entry: FakeEntry, store: FakeStore) -> None:
         self.hass = hass
         self.entry = entry
@@ -428,10 +432,12 @@ def test_configuration_reload_handoff_is_not_cancelled_during_unload() -> None:
     assert coordinator.disarm_calls == []
 
 
-def test_failed_configuration_reload_handoff_restarts_safe_recovery() -> None:
+@pytest.mark.parametrize("failed_manual_handoff", [False, True])
+def test_failed_configuration_reload_handoff_restarts_safe_recovery(failed_manual_handoff: bool) -> None:
     coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
     coordinator.automatic_control_requested = True
     coordinator._configuration_reload_handoff = True
+    coordinator.hvac_handoff_unresolved = failed_manual_handoff
     coordinator.store.data["production"] = {
         "armed": False,
         "startup_auto_recovery": {
@@ -440,7 +446,7 @@ def test_failed_configuration_reload_handoff_restarts_safe_recovery() -> None:
         },
     }
     entry = FakeEntry(runtime_data=coordinator)
-    hass = FakeHass(FakeConfigEntries(unload_ok=False))
+    hass = FakeHass(FakeConfigEntries(unload_ok=failed_manual_handoff))
 
     result = asyncio.run(async_unload_entry(hass, entry))
 
@@ -719,6 +725,26 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     assert coordinator.refresh_wait_count == 1
     assert coordinator.disarm_calls == ["setup_entry_failed"]
     assert coordinator.restore_calls == [("setup_entry_failed", False)]
+    assert not hasattr(entry, "runtime_data")
+
+
+def test_setup_handoff_save_failure_runs_device_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailedHandoffCoordinator(FakeCoordinator):
+        async def async_config_entry_first_refresh(self) -> None:
+            raise InitialHvacHandoffFailed("manual HVAC handoff failed")
+
+    monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", FakeStore)
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", FailedHandoffCoordinator,
+    )
+    entry = FakeEntry()
+    with pytest.raises(InitialHvacHandoffFailed, match="manual HVAC handoff"):
+        asyncio.run(async_setup_entry(FakeHass(FakeConfigEntries()), entry))
+    coordinator = FakeCoordinator.last_instance
+    assert coordinator is not None
+    assert coordinator.disarm_calls == ["setup_entry_failed"]
+    assert coordinator.restore_calls == [("setup_entry_failed", False)]
+    assert coordinator.shutdown_count == coordinator.execution_wait_count == coordinator.refresh_wait_count == 1
     assert not hasattr(entry, "runtime_data")
 
 

@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections import deque
+from collections.abc import Awaitable, Callable, Collection
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -19,7 +20,7 @@ from time import monotonic, perf_counter
 from typing import Any, cast
 
 from homeassistant.core import HomeAssistant, State, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_state_report_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -178,6 +179,7 @@ from .forecasts import (
     tariff_snapshot_matches,
     tariff_source_attributes,
 )
+from .hvac_control import has_hvac_ownership
 from .inputs import InputManager, _percent_float_or_none, _tariff_age_band
 from .load_forecast import normalize_power_kw
 from .models import (
@@ -378,6 +380,10 @@ class InitialPlanSuperseded(UpdateFailed):
     """Retry setup after changes invalidate the first unpublished plan."""
 
 
+class InitialHvacHandoffFailed(ConfigEntryNotReady):
+    """Setup cannot safely restore HVAC after a failed manual handoff save."""
+
+
 class _RefreshMode(Enum):
     DEBOUNCED = auto()  # Respect the local refresh floor and Core's debouncer.
     IMMEDIATE = auto()  # Enter Core's serialized refresh directly.
@@ -404,6 +410,28 @@ class _UnchangedCalendarFeedback:
     records: list[dict[str, str]]
     observed_at: datetime
     recheck_delay: timedelta
+
+
+@dataclass(slots=True)
+class _HvacOutages:
+    baselines: dict[str, tuple[State | None, set[str]]] = field(default_factory=dict)
+    prior_attributed_contexts: dict[str, deque[str]] = field(default_factory=dict)
+    unavailable_attributed_contexts: dict[str, deque[str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _HvacOutageFeedback:
+    baseline: State | None
+    excluded_context_ids: set[str]
+    manual_stage: str | None = None
+
+
+@dataclass(slots=True)
+class _HvacHandoff:
+    main: bool = False
+    zones: set[str] = field(default_factory=set)
+    release: bool = False
+    reason: str = "climate_zone_changed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +546,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         self.executor.ev_command_guard = self._ev_command_guard
         self.executor.ev_restore_guard = self._ev_restore_allowed
+        self.executor.hvac_restore_guard = lambda: not self.hvac_handoff_unresolved
         self.executor.export_write_blocked = self._export_dispatch_blocked
         self.executor.export_cooldown_options = lambda: self.options
         self.executor.log_dry_takeover_transition = self._log_dry_takeover_transition
@@ -789,24 +818,225 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entity for data in (entry_data, control_data) for key in (CONF_EV_CHARGING, CONF_DAIKIN_CLIMATE)
             if (entity := data.get(key))
         }
+        for data in (entry_data, control_data):
+            entities.update(_split_entity_values(data.get(CONF_CLIMATE_ZONES)))
         if not entities:
             await super().async_config_entry_first_refresh()
             return
         unchanged_calendar_feedback: dict[ActionAsset, _UnchangedCalendarFeedback] = {}
+        outages: _HvacOutages = self.__dict__.setdefault("_hvac_outages", _HvacOutages())
+        handoff = _HvacHandoff()
+        self._initial_hvac_handoff: _HvacHandoff | None = handoff
 
         @callback
         def capture_feedback(event: Any) -> None:
             current = owned_control_data(
                 self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}),
             )
-            self._record_calendar_feedback(event, current, dt_util.utcnow(), unchanged_calendar_feedback)
+            entity_id = event.data["entity_id"]
+            is_main = entity_id == current.get(CONF_DAIKIN_CLIMATE)
+            now = dt_util.utcnow()
+            if is_main:
+                self.executor.hvac_mode_feedback.mode_feedback_at(
+                    entity_id, event.data.get("new_state"), previous=event.data.get("old_state"),
+                )
+            if is_main or entity_id in _split_entity_values(current.get(CONF_CLIMATE_ZONES)):
+                can_supersede = (self.executor.pending_hvac_desired_state is not None
+                                 or has_hvac_ownership(self.store.data.get("ownership", {})))
+                outage = _track_hvac_outage(event, entity_id, outages, can_supersede=can_supersede)
+                if outage.manual_stage is not None:
+                    self._record_hvac_outage_feedback(event, entity_id, outage, now)
+                direct_edit = can_supersede and _is_first_refresh_hvac_edit(
+                    event, outage.excluded_context_ids,
+                )
+                if outage.manual_stage is not None or direct_edit:
+                    self._initial_hvac_manual_pending = True
+                    self._mark_explicit_hvac_change(entity_id, is_main=is_main)
+                    _remember_hvac_manual_context(event, entity_id, outages)
+                    if is_main:
+                        handoff.main = True
+                        handoff.reason = "daikin_state_changed"
+                    else:
+                        handoff.zones.add(entity_id)
+            self._record_calendar_feedback(event, current, now, unchanged_calendar_feedback)
 
         unsubscribe = async_track_state_change_event(self.hass, entities, capture_feedback)
+        refreshed = False
         try:
             await super().async_config_entry_first_refresh()
+            refreshed = True
         finally:
-            # Normal input listeners take over immediately after setup refresh.
-            unsubscribe()
+            captured_handoff = handoff.main or bool(handoff.zones)
+            try:
+                if captured_handoff:
+                    handoff.release = refreshed
+                    await self._async_finish_initial_hvac_handoff(handoff)
+            finally:
+                self._initial_hvac_manual_pending = False
+                self._initial_hvac_handoff = None
+                unsubscribe()
+        if captured_handoff:
+            self._refresh_after_initial_hvac_handoff = True
+
+    async def _async_finish_initial_hvac_handoff(self, handoff: _HvacHandoff) -> None:
+        """Keep accepted scopes alive until the setup task can safely exit."""
+        cancellation: asyncio.CancelledError | None = None
+        record_override = True
+        try:
+            while handoff.main or handoff.zones:
+                worker = asyncio.create_task(self._async_apply_initial_hvac_handoff(handoff, record_override))
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError as error:
+                        handoff.release = False
+                        cancellation = error
+                worker.result()
+                # The listener remains active until this task resumes. Drain
+                # scopes accepted after the worker's last persistence pass.
+                handoff.release = False
+                record_override = False
+        except Exception as error:
+            self._hvac_handoff_failed = True
+            handoff.release = False
+            handoffs = self.hass.data.setdefault(DOMAIN, {}).setdefault("initial_hvac_handoffs", {})
+            handoffs[self.entry.entry_id] = handoff
+            raise InitialHvacHandoffFailed("Could not complete the initial manual HVAC handoff") from error
+        if cancellation is not None:
+            raise cancellation
+
+    async def _async_apply_initial_hvac_handoff(self, handoff: _HvacHandoff, record_override: bool) -> None:
+        """Make all first-refresh supersessions durable before release or setup cleanup."""
+        reason = handoff.reason
+        duration = int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES])
+        async with self._command_lock:
+            async with self._planner_lock:
+                await self._async_persist_hvac_supersessions(handoff)
+                if record_override and not handoff.release:
+                    await self._async_store_manual_hvac_override(duration, reason, source="service", expires=True)
+                    await self.store.async_flush()
+            if handoff.release:
+                _, helper_error = await self._async_set_manual_hvac_override(duration, reason, initial_handoff=handoff)
+                if helper_error is not None:
+                    _LOGGER.warning("Could not update the manual HVAC override helper during setup")
+            async with self._planner_lock:
+                await self._async_persist_hvac_supersessions(handoff)
+
+    async def async_retry_initial_hvac_handoff(self) -> None:
+        """Save an accepted setup handoff before cleanup or a replacement setup."""
+        handoffs = getattr(self.hass, "data", {}).get(DOMAIN, {}).get("initial_hvac_handoffs", {})
+        handoff = handoffs.get(self.entry.entry_id)
+        if handoff is None:
+            return
+        self._hvac_handoff_failed = True
+        try:
+            await self._async_apply_initial_hvac_handoff(handoff, record_override=True)
+        except (OSError, HomeAssistantError) as error:
+            raise InitialHvacHandoffFailed("Could not save the initial manual HVAC handoff") from error
+        handoffs.pop(self.entry.entry_id, None)
+        self._hvac_handoff_failed = False
+
+    async def _async_persist_hvac_supersessions(self, handoff: _HvacHandoff) -> None:
+        """Drain edits that arrived while earlier supersessions were being saved."""
+        retried = False
+        while handoff.main or handoff.zones:
+            main, zones = handoff.main, handoff.zones
+            handoff.main, handoff.zones = False, set()
+            try:
+                await self.executor.async_persist_hvac_manual_supersessions(main, zones)
+            except (Exception, asyncio.CancelledError) as error:
+                handoff.main |= main
+                handoff.zones.update(zones)
+                if retried or not isinstance(error, (OSError, HomeAssistantError)):
+                    raise
+                retried = True
+
+    @callback
+    def _record_hvac_outage_feedback(
+        self, event: Any, entity_id: str, outage: _HvacOutageFeedback, now: datetime,
+    ) -> None:
+        """Audit availability transitions and attributed controls during an outage."""
+        audit = getattr(self.store, "record_climate_event", None)
+        if callable(audit):
+            new = event.data.get("new_state")
+            audit({
+                "stage": outage.manual_stage or "availability_feedback",
+                "entity_id": entity_id,
+                "override_source": "user" if outage.manual_stage else None,
+                "user_attributed": outage.manual_stage is not None,
+                "context_id": getattr(getattr(event, "context", None), "id", None),
+                "expected": {"mode": getattr(outage.baseline, "state", None)}
+                if outage.manual_stage == "manual_recovery" else None,
+                "observed": {
+                    "mode": getattr(new, "state", None),
+                    **{key: (getattr(new, "attributes", {}) or {}).get(key)
+                       for key in _HVAC_CONTROL_ATTRIBUTE_KEYS},
+                },
+            }, now=now)
+
+    @callback
+    def _mark_explicit_hvac_change(self, entity_id: str, *, is_main: bool) -> None:
+        """Invalidate command feedback and supersede any active transaction."""
+        executor = self.executor
+        getattr(executor, "hvac_feedback_commands", []).clear()
+        if getattr(executor, "pending_hvac_desired_state", None) is not None:
+            if is_main:
+                executor.mark_pending_hvac_manual_override()
+            else:
+                executor.mark_pending_hvac_zone_manual_override(entity_id)
+
+    @callback
+    def _queue_manual_hvac_change(
+        self, event: Any, entity_id: str, outages: _HvacOutages, *, is_main: bool,
+    ) -> None:
+        """Track accepted intent, restore targets and the queued handoff together."""
+        _remember_hvac_manual_context(event, entity_id, outages)
+        zone = None if is_main else entity_id
+        self._remember_runtime_hvac_supersession(main=is_main, zone=zone)
+        command = (
+            self._async_handle_manual_hvac_change("daikin_state_changed", preserve_main_state=True)
+            if is_main else self._async_handle_manual_hvac_change("climate_zone_changed", preserve_zone_entity_id=zone)
+        )
+        task = self._async_create_listener_task(command)
+        if task is not None and not task.done():
+            handoffs: set[asyncio.Task[Any]] = self.__dict__.setdefault("_manual_hvac_handoff_tasks", set())
+            handoffs.add(task)
+            task.add_done_callback(handoffs.discard)
+
+    @callback
+    def _remember_runtime_hvac_supersession(self, *, main: bool = False, zone: str | None = None) -> None:
+        """Preserve an accepted handoff while its task waits for command ownership."""
+        handoff: _HvacHandoff = self.__dict__.setdefault("_runtime_hvac_handoff", _HvacHandoff())
+        handoff.main |= main
+        if zone:
+            handoff.zones.add(zone)
+
+    def _automatic_hvac_command_allowed(self) -> bool:
+        """Gate automatic work until explicit manual handoffs have completed."""
+        return not (getattr(self, "_initial_hvac_manual_pending", False)
+                    or getattr(self, "_manual_hvac_handoff_tasks", ())
+                    or self.hvac_handoff_unresolved)
+
+    @property
+    def hvac_handoff_unresolved(self) -> bool:
+        """Return whether restoration targets superseded by a user are still outstanding."""
+        return getattr(self, "_hvac_handoff_failed", False) is True or any(
+            handoff is not None and bool(handoff.main or handoff.zones) for handoff in (
+                getattr(self, "_initial_hvac_handoff", None), getattr(self, "_runtime_hvac_handoff", None),
+            )
+        )
+
+    async def _async_persist_runtime_hvac_supersessions(self) -> None:
+        """Retire every accepted runtime restore target before a handoff release."""
+        handoff: _HvacHandoff | None = getattr(self, "_runtime_hvac_handoff", None)
+        if handoff is None or not (handoff.main or handoff.zones):
+            return
+        try:
+            await self._async_persist_hvac_supersessions(handoff)
+        except (OSError, HomeAssistantError):
+            self._hvac_handoff_failed = True
+            raise
+        self._hvac_handoff_failed = False
 
     @callback
     def _record_calendar_feedback(
@@ -901,7 +1131,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         external_ev_reservation = getattr(getattr(self, "store", None), "data", {}).get("ev_grid_reservation", {})
         if not entity_ids and external_ev_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True:
             return
-        unavailable_hvac_baselines: dict[str, tuple[State | None, set[str]]] = {}
+        outages: _HvacOutages = self.__dict__.setdefault("_hvac_outages", _HvacOutages())
         unchanged_calendar_feedback: dict[ActionAsset, _UnchangedCalendarFeedback] = {}
         external_ev_stop_pending = False
         unsubscribe_ev_reports: list[Callable[[], None]] = []
@@ -1116,96 +1346,38 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
             is_hvac = is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
             startup = not getattr(self.hass, "is_running", True)
-            manual_recovery = False
-            optimistic_user_contexts: set[str] = set()
-            recovery_baseline = None
-            inherited_recovery_context_ids: set[str] = set()
             if is_hvac:
                 old, new = event.data.get("old_state"), event.data.get("new_state")
-                observed_before = old if hvac_feedback_is_observed(old) else None
-                observed_now = hvac_feedback_is_observed(new)
-                if not observed_now and (observed_before is not None or entity_id not in unavailable_hvac_baselines):
-                    # Context attribution also needs an outage record after
-                    # reload. Only prior observed feedback can establish a
-                    # recovery comparison snapshot.
-                    excluded_ids: set[str] = set()
-                    baseline_context_id = getattr(getattr(old, "context", None), "id", None)
-                    if baseline_context_id is not None:
-                        excluded_ids.add(baseline_context_id)
-                    loss_context = getattr(event, "context", None)
-                    loss_context_id = getattr(loss_context, "id", None)
-                    if loss_context_id and not getattr(loss_context, "user_id", None):
-                        excluded_ids.add(loss_context_id)
-                    unavailable_hvac_baselines[entity_id] = (observed_before, excluded_ids)
-                recovery_baseline, outage_context_ids = unavailable_hvac_baselines.get(entity_id, (None, set()))
+                if is_main_climate:
+                    self.executor.hvac_mode_feedback.mode_feedback_at(entity_id, new, previous=old)
                 can_supersede = bool(
                     is_main_climate or startup or pending_hvac_desired_state is not None
-                    or self.store.data.get("ownership", {}).get("hvac_control")
+                    or has_hvac_ownership(self.store.data.get("ownership", {}))
                 )
-                if can_supersede and old is not None and hvac_feedback_is_assumed(new):
-                    # An optimistic state cannot confirm a write. A concrete
-                    # change tied to a fresh user context still establishes intent.
-                    concrete_mode_change = (
-                        old.state not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES
-                        and old.state != new.state
-                    )
-                    if concrete_mode_change or _has_concrete_hvac_attribute_change(old, new):
-                        optimistic_user_contexts = _fresh_hvac_user_context_ids(event, outage_context_ids)
-                        outage_context_ids.update(optimistic_user_contexts)
-                manual_recovery = _is_explicit_hvac_recovery_change(
-                    event, recovery_baseline, outage_context_ids,
-                ) and can_supersede
-                if observed_now:
-                    inherited_recovery_context_ids = outage_context_ids
-                    unavailable_hvac_baselines.pop(entity_id, None)
-                if not optimistic_user_contexts and hvac_feedback_is_assumed(old) and hvac_feedback_is_assumed(new):
+                outage = _track_hvac_outage(event, entity_id, outages, can_supersede=can_supersede)
+                if (hvac_feedback_is_observed(old) and hvac_feedback_is_observed(new)
+                        and (attributed := _hvac_attributed_context_ids(event))
+                        and attributed <= outage.excluded_context_ids):
+                    # This is still observed telemetry. Suppress a repeated
+                    # override and use the ordinary material refresh filter.
+                    if _is_material_state_change(event, self.options):
+                        self._schedule_debounced_refresh("state_change")
+                    return
+                if outage.manual_stage is None and hvac_feedback_is_assumed(old) and hvac_feedback_is_assumed(new):
                     # Consecutive optimistic polls do not change availability
                     # or provide new physical evidence for planning.
                     return
-            explicit_manual_intent = manual_recovery or bool(optimistic_user_contexts)
-            if is_hvac and (manual_recovery or _is_hvac_availability_feedback(
-                event, inherited_context_ids=inherited_recovery_context_ids,
-            )):
-                # Availability alone preserves pending work and its baselines.
-                # Audit fresh recovery controls separately before they
-                # synchronously supersede that work below.
-                audit = getattr(self.store, "record_climate_event", None)
-                if callable(audit):
-                    new = event.data.get("new_state")
-                    audit({
-                        "stage": ("manual_recovery" if manual_recovery else "manual_optimistic"
-                                  if optimistic_user_contexts else "availability_feedback"),
-                        "entity_id": entity_id,
-                        "override_source": "user" if explicit_manual_intent else None,
-                        "user_attributed": explicit_manual_intent,
-                        "context_id": getattr(getattr(event, "context", None), "id", None),
-                        "expected": {"mode": getattr(recovery_baseline, "state", None)} if manual_recovery else None,
-                        "observed": {
-                            "mode": getattr(new, "state", None),
-                            **{key: (getattr(new, "attributes", {}) or {}).get(key)
-                               for key in _HVAC_CONTROL_ATTRIBUTE_KEYS},
-                        },
-                    }, now=now)
-                if not explicit_manual_intent:
-                    self._schedule_debounced_refresh("hvac_availability", debounce_seconds=0, force=True)
+                if outage.manual_stage is not None or _is_hvac_availability_feedback(
+                    event, inherited_context_ids=outage.excluded_context_ids,
+                ):
+                    self._record_hvac_outage_feedback(event, entity_id, outage, now)
+                    if outage.manual_stage is None:
+                        self._schedule_debounced_refresh("hvac_availability", debounce_seconds=0, force=True)
+                        return
+                if outage.manual_stage is not None or (startup and _is_explicit_startup_hvac_change(event)):
+                    self._mark_explicit_hvac_change(entity_id, is_main=is_main_climate)
+                    self._queue_manual_hvac_change(event, entity_id, outages, is_main=is_main_climate)
                     return
-            if explicit_manual_intent or (startup and is_hvac and _is_explicit_startup_hvac_change(event)):
-                # Explicit control evidence takes priority even during startup
-                # or recovery, before expected/pending-command matching.
-                feedback_commands.clear()
-                if pending_hvac_desired_state is not None:
-                    if is_main_climate:
-                        self.executor.mark_pending_hvac_manual_override()
-                    else:
-                        self.executor.mark_pending_hvac_zone_manual_override(entity_id)
-                self._async_create_listener_task(
-                    self._async_handle_manual_hvac_change(
-                        "daikin_state_changed" if is_main_climate else "climate_zone_changed",
-                        preserve_main_state=is_main_climate,
-                        preserve_zone_entity_id=None if is_main_climate else entity_id,
-                    )
-                )
-                return
             if startup and is_hvac:
                 # Startup restoration alone is not evidence of manual intent.
                 if not _is_planner_owned_control_feedback(
@@ -1313,12 +1485,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     # command. The durable override/release task necessarily
                     # waits for the coordinator command lock.
                     mark_manual_override()
-                self._async_create_listener_task(
-                    self._async_handle_manual_hvac_change(
-                        "daikin_state_changed",
-                        preserve_main_state=True,
-                    )
-                )
+                self._queue_manual_hvac_change(event, entity_id, outages, is_main=True)
                 return
             pending_zone_entity_id = _pending_zone_hvac_manual_change_entity_id(
                 entry_data,
@@ -1333,12 +1500,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
                 if callable(mark_zone_manual_override):
                     mark_zone_manual_override(pending_zone_entity_id)
-                self._async_create_listener_task(
-                    self._async_handle_manual_hvac_change(
-                        "climate_zone_changed",
-                        preserve_zone_entity_id=pending_zone_entity_id,
-                    )
-                )
+                self._queue_manual_hvac_change(event, pending_zone_entity_id, outages, is_main=False)
                 return
             if _is_manual_override_helper_change(entry_data, event):
                 helper_state = str(getattr(event.data.get("new_state"), "state", "")).lower()
@@ -1351,21 +1513,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 feedback_commands.clear()
-                self._async_create_listener_task(
-                    self._async_handle_manual_hvac_change(
-                        "daikin_state_changed",
-                        preserve_main_state=True,
-                    )
-                )
+                self._queue_manual_hvac_change(event, entity_id, outages, is_main=True)
                 return
             if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
                 feedback_commands.clear()
-                self._async_create_listener_task(
-                    self._async_handle_manual_hvac_change(
-                        "climate_zone_changed",
-                        preserve_zone_entity_id=str(event.data.get("entity_id") or ""),
-                    )
-                )
+                self._queue_manual_hvac_change(event, entity_id, outages, is_main=False)
                 return
             tariff = entity_id in {entry_data.get(CONF_AMBER_IMPORT_PRICE), entry_data.get(CONF_AMBER_EXPORT_PRICE)}
             if not _is_material_state_change(event, self.options, tariff=tariff):
@@ -1467,6 +1619,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._async_create_listener_task(self._async_handle_manual_override_helper(True))
         elif helper_value == "off" and helper_override_active:
             self._async_create_listener_task(self._async_handle_manual_override_helper(False))
+        if self.__dict__.pop("_refresh_after_initial_hvac_handoff", False):
+            self._async_create_listener_task(self.async_request_refresh())
 
     async_start_startup_auto_recovery = startup_recovery.async_start_startup_auto_recovery
 
@@ -3736,6 +3890,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Clear manual climate holds without bypassing execution safety gates."""
         async with self._command_lock:
             async with self._planner_lock:
+                await self._async_persist_runtime_hvac_supersessions()
                 if not await self._async_clear_expired_manual_hvac_state():
                     raise HomeAssistantError("Could not clear the manual climate override helper.")
                 self.overrides = [override for override in self.overrides if override.kind != "manual_hvac"]
@@ -3771,6 +3926,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Serialize an operator HVAC override with automatic device execution."""
         async with self._command_lock:
             if getattr(self, "_tearing_down", False):
+                if preserve_main_state or preserve_zone_entity_id:
+                    # An accepted listener event may have waited behind a
+                    # command. Remove its stale restore targets before unload
+                    # cleans up the remaining owned equipment.
+                    self._remember_runtime_hvac_supersession(main=preserve_main_state, zone=preserve_zone_entity_id)
+                    async with self._planner_lock:
+                        try:
+                            await self._async_store_manual_hvac_override(
+                                duration_minutes, reason, source=source, expires=expires,
+                            )
+                            await self.store.async_flush()
+                            await self._async_persist_runtime_hvac_supersessions()
+                        except (OSError, HomeAssistantError):
+                            self._hvac_handoff_failed = True
+                            raise
                 return None
             outcome, helper_error = await self._async_set_manual_hvac_override(
                 duration_minutes,
@@ -3795,6 +3965,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         expires: bool = True,
         preserve_zone_entity_id: str | None = None,
         preserve_main_state: bool = False,
+        initial_handoff: _HvacHandoff | None = None,
     ) -> tuple[ActionOutcome | None, Exception | None]:
         """Set a manual HVAC override without refreshing under command ownership."""
         getattr(self.executor, "hvac_feedback_commands", []).clear()
@@ -3802,41 +3973,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         helper_error: Exception | None = None
         release_outcome = None
         async with self._planner_lock:
-            expires_at = dt_util.utcnow() + timedelta(minutes=duration_minutes) if expires else None
-            self.overrides = [
-                override
-                for override in self.overrides
-                if not (
-                    override.kind == "manual_hvac"
-                    and (
-                        (source == "helper" and getattr(override, "source", None) == "helper")
-                        or (source != "helper" and getattr(override, "source", None) != "helper")
-                    )
-                )
-            ]
-            self.overrides.append(
-                Override(
-                    kind="manual_hvac",
-                    source=source,
-                    expires_at=expires_at,
-                    reason=reason,
-                )
-            )
-            await self.store.async_save_overrides(self.overrides)
-            ownership = dict(self.store.data.get("ownership", {}))
-            ownership["manual_hvac_override_expires_at"] = (
-                None
-                if any(override.kind == "manual_hvac" and override.expires_at is None for override in self.overrides)
-                else max(
-                    (
-                        override.expires_at
-                        for override in self.overrides
-                        if override.kind == "manual_hvac" and override.expires_at is not None
-                    ),
-                    default=expires_at,
-                )
-            )
-            await self.store.async_save_ownership(ownership)
+            await self._async_store_manual_hvac_override(duration_minutes, reason, source=source, expires=expires)
             manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
             if manual_override_entity and source != "helper":
                 self._manual_override_helper_guard = ("on", dt_util.utcnow() + timedelta(minutes=2))
@@ -3851,6 +3988,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 except Exception as err:  # noqa: BLE001 - release must still run when helper feedback fails.
                     self._manual_override_helper_guard = None
                     helper_error = err
+            if initial_handoff is not None:
+                await self._async_persist_hvac_supersessions(initial_handoff)
+                if not initial_handoff.release:
+                    return None, helper_error
+            await self._async_persist_runtime_hvac_supersessions()
             release_hvac = getattr(self.executor, "async_release_hvac_control", None)
             if callable(release_hvac):
                 release_options: dict[str, Any] = {}
@@ -3860,6 +4002,53 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     release_options["preserve_main_state"] = True
                 release_outcome = await release_hvac(reason, **release_options)
         return release_outcome, helper_error
+
+    async def _async_store_manual_hvac_override(
+        self, duration_minutes: int, reason: str, *, source: str, expires: bool,
+    ) -> None:
+        """Persist the operator hold under the planner lock."""
+        expires_at = dt_util.utcnow() + timedelta(minutes=duration_minutes) if expires else None
+        self.overrides = [
+            override
+            for override in self.overrides
+            if not (
+                override.kind == "manual_hvac"
+                and (
+                    (source == "helper" and getattr(override, "source", None) == "helper")
+                    or (source != "helper" and getattr(override, "source", None) != "helper")
+                )
+            )
+        ]
+        self.overrides.append(
+            Override(
+                kind="manual_hvac",
+                source=source,
+                expires_at=expires_at,
+                reason=reason,
+            )
+        )
+        ownership_expiry = (
+            None
+            if any(override.kind == "manual_hvac" and override.expires_at is None for override in self.overrides)
+            else max(
+                (
+                    override.expires_at
+                    for override in self.overrides
+                    if override.kind == "manual_hvac" and override.expires_at is not None
+                ),
+                default=expires_at,
+            )
+        )
+        async def save_override() -> None:
+            await self.store.async_save_overrides(self.overrides)
+            ownership = dict(self.store.data.get("ownership", {}))
+            ownership["manual_hvac_override_expires_at"] = ownership_expiry
+            await self.store.async_save_ownership(ownership)
+
+        try:
+            await save_override()
+        except (OSError, HomeAssistantError):
+            await save_override()
 
     async def _async_reconcile_expired_manual_hvac_state(self, expired: bool) -> None:
         """Retry helper cleanup while retaining a fail-closed override."""
@@ -3947,7 +4136,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     ) -> ActionOutcome:
         """Restore safe state and refresh."""
         async with self._command_lock:
-            outcome = await self.executor.async_restore_safe_state(reason, preserve_export_retry=preserve_export_retry)
+            outcome = await self.executor.async_restore_safe_state(
+                reason, preserve_export_retry=preserve_export_retry,
+            )
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
@@ -4465,11 +4656,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     # Restore owned HVAC even if the disarm save fails.
                     async with self._command_lock:
                         ownership = self.store.data.get("ownership", {})
-                        if isinstance(ownership, dict) and (
-                            ownership.get("hvac_control")
-                            or ownership.get("climate_automations")
-                            or ownership.get("planner_takeover_started_at")
-                            or ownership.get("planner_hvac_action_expires_at")
+                        if (not self.hvac_handoff_unresolved
+                            and isinstance(ownership, dict) and (
+                                ownership.get("hvac_control")
+                                or ownership.get("climate_automations")
+                                or ownership.get("planner_takeover_started_at")
+                                or ownership.get("planner_hvac_action_expires_at")
+                            )
                         ):
                             await self.executor.async_release_hvac_control("production_control_disarmed")
         finally:
@@ -4885,8 +5078,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if getattr(self, "_tearing_down", False) or not is_current() or not inputs_current():
             return
         self._admit_export_after_restart(plan)
+        if not self._automatic_hvac_command_allowed():
+            # Evaluate other devices and implicit EV safety work while the
+            # first-refresh plan's Daikin actions await the manual handoff.
+            plan = replace(plan, actions=[action for action in plan.actions if action.asset != ActionAsset.DAIKIN])
         self.executor.options = options
         self.executor.entry_data = entry_data
+        self.executor.hvac_command_guard = self._automatic_hvac_command_allowed
         last_observed: list[dict[str, str]] = []
         last_history: Any = None
         observed_until: datetime | None = None
@@ -5264,16 +5462,87 @@ def _split_entity_values(value: Any) -> list[str]:
     return []
 
 
-def _has_concrete_hvac_attribute_change(old: Any, new: Any) -> bool:
+def _has_concrete_hvac_attribute_change(old: Any, new: Any, *, fallback: State | None = None) -> bool:
     """Require two known settings rather than disappearing target telemetry."""
-    old_attributes, new_attributes = old.attributes or {}, new.attributes or {}
+    old_attributes, new_attributes = getattr(old, "attributes", None) or {}, new.attributes or {}
+    fallback_attributes = getattr(fallback, "attributes", None) or {}
     for key in _HVAC_CONTROL_ATTRIBUTE_KEYS:
         before, after = old_attributes.get(key), new_attributes.get(key)
+        baseline = fallback_attributes.get(key)
         if key in {"temperature", "target_temp_low", "target_temp_high"}:
-            before, after = finite(before), finite(after)
+            before, after, baseline = finite(before), finite(after), finite(baseline)
+        if before in STATE_UNKNOWN_VALUES:
+            before = baseline
         if before not in STATE_UNKNOWN_VALUES and after not in STATE_UNKNOWN_VALUES and before != after:
             return True
     return False
+
+
+def _track_hvac_outage(
+    event: Any, entity_id: str, outages: _HvacOutages, *, can_supersede: bool,
+) -> _HvacOutageFeedback:
+    """Keep the last observed controls and attribution through an outage."""
+    old, new = event.data.get("old_state"), event.data.get("new_state")
+    baseline, inherited = outages.baselines.get(entity_id, (None, set()))
+    prior_context_ids = set(outages.prior_attributed_contexts.get(entity_id, ()))
+    context_ids = inherited | prior_context_ids
+    if hvac_feedback_is_observed(new):
+        outages.baselines.pop(entity_id, None)
+        manual = _is_explicit_hvac_recovery_change(event, baseline, context_ids) and can_supersede
+        return _HvacOutageFeedback(baseline, context_ids, "manual_recovery" if manual else None)
+
+    availability_context_ids = context_ids
+    observed_before = old if hvac_feedback_is_observed(old) else None
+    if observed_before is not None or entity_id not in outages.baselines:
+        baseline = observed_before
+        inherited = set()
+        baseline_context_id = getattr(getattr(old, "context", None), "id", None)
+        if baseline_context_id is not None:
+            inherited.add(baseline_context_id)
+            if observed_before is not None and (
+                getattr(old.context, "user_id", None) or getattr(old.context, "parent_id", None)
+            ):
+                contexts = outages.prior_attributed_contexts.setdefault(entity_id, deque(maxlen=64))
+                if baseline_context_id not in contexts:
+                    contexts.append(baseline_context_id)
+        # An attributed concrete edit on the loss event can still supersede
+        # control. Only later reports inherit this loss event's context.
+        availability_context_ids = inherited | prior_context_ids
+        loss_context = getattr(event, "context", None)
+        loss_context_id = getattr(loss_context, "id", None)
+        if loss_context_id and not getattr(loss_context, "user_id", None):
+            inherited.add(loss_context_id)
+        outages.baselines[entity_id] = (baseline, inherited)
+        context_ids = inherited | prior_context_ids
+
+    unavailable_contexts = outages.unavailable_attributed_contexts.setdefault(entity_id, deque(maxlen=64))
+    earlier_unavailable_context_ids = set(unavailable_contexts)
+    availability_context_ids |= earlier_unavailable_context_ids
+    assumed_exclusions = context_ids | earlier_unavailable_context_ids
+    if getattr(new, "state", None) in STATE_UNKNOWN_VALUES:
+        # Later assumed reports can inherit the context of any sentinel report.
+        # This event still has a chance to prove a concrete edit, and observed
+        # recovery continues to accept readback of previously unseen controls.
+        unavailable_contexts.extend(_new_hvac_attributed_context_ids(event, assumed_exclusions))
+    if can_supersede and hvac_feedback_is_assumed(new):
+        previous_mode = getattr(old, "state", None)
+        if previous_mode in STATE_UNKNOWN_VALUES and baseline is not None:
+            previous_mode = baseline.state
+        concrete_mode_change = (
+            previous_mode not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES
+            and previous_mode != new.state
+        )
+        if (concrete_mode_change or _has_concrete_hvac_attribute_change(old, new, fallback=baseline)) and (
+            _fresh_hvac_user_context_ids(event, assumed_exclusions)
+        ):
+            return _HvacOutageFeedback(baseline, availability_context_ids, "manual_optimistic")
+    return _HvacOutageFeedback(baseline, availability_context_ids)
+
+
+def _remember_hvac_manual_context(event: Any, entity_id: str, outages: _HvacOutages) -> None:
+    """Exclude recent handled user and linked contexts across feedback flaps."""
+    contexts = outages.prior_attributed_contexts.setdefault(entity_id, deque(maxlen=64))
+    contexts.extend(_new_hvac_attributed_context_ids(event, contexts))
 
 
 def _is_explicit_hvac_recovery_change(event: Any, baseline: State | None, excluded_ids: set[str]) -> bool:
@@ -5286,7 +5555,7 @@ def _is_explicit_hvac_recovery_change(event: Any, baseline: State | None, exclud
     return baseline.state != new.state or _has_concrete_hvac_attribute_change(baseline, new)
 
 
-def _fresh_hvac_user_context_ids(event: Any, excluded_ids: set[str]) -> set[str]:
+def _fresh_hvac_user_context_ids(event: Any, excluded_ids: Collection[str]) -> set[str]:
     """Attribute an intent only to a new user context, never inherited feedback."""
     return {
         context_id
@@ -5312,14 +5581,39 @@ def _is_hvac_availability_feedback(event: Any, *, inherited_context_ids: set[str
         return True
     if old.state not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES:
         return False
-    contexts = (getattr(event, "context", None), getattr(new, "context", None))
-    if not any(
-        (getattr(context, "user_id", None) or getattr(context, "parent_id", None))
-        and getattr(context, "id", None) not in (inherited_context_ids or set())
-        for context in contexts
-    ):
+    if not (_hvac_attributed_context_ids(event) - (inherited_context_ids or set())):
         return True
     return not _has_concrete_hvac_attribute_change(old, new)
+
+
+def _hvac_attributed_context_ids(event: Any) -> set[str | None]:
+    """Return the contexts carrying user or linked automation attribution."""
+    new = event.data.get("new_state")
+    return {
+        getattr(context, "id", None)
+        for context in (getattr(event, "context", None), getattr(new, "context", None))
+        if getattr(context, "user_id", None) or getattr(context, "parent_id", None)
+    }
+
+
+def _new_hvac_attributed_context_ids(event: Any, excluded_ids: Collection[str]) -> set[str]:
+    """Keep concrete IDs for deduplicating user and linked commands."""
+    return {context_id for context_id in _hvac_attributed_context_ids(event)
+            if context_id and context_id not in excluded_ids}
+
+
+def _is_first_refresh_hvac_edit(event: Any, excluded_context_ids: set[str]) -> bool:
+    """Require a fresh attributed control edit before handoff during setup."""
+    if _is_hvac_availability_feedback(event, inherited_context_ids=excluded_context_ids):
+        return False
+    old, new = event.data["old_state"], event.data["new_state"]
+    if hvac_feedback_is_observed(old):
+        old_context_id = getattr(getattr(old, "context", None), "id", None)
+        if old_context_id is not None:
+            excluded_context_ids = excluded_context_ids | {old_context_id}
+    return bool(_fresh_hvac_user_context_ids(event, excluded_context_ids)) and (
+        old.state != new.state or _has_concrete_hvac_attribute_change(old, new)
+    )
 
 
 def _is_explicit_startup_hvac_change(event: Any) -> bool:

@@ -1031,6 +1031,9 @@ rules:
 # explicit manual supersession and calendar confirmation. tests/test_hvac_cycle.py,
 # tests/test_zone_control.py and tests/test_daikin_memory.py cover persistent mode
 # readback, isolated coast and retries after an undispatched AirBase restoration.
+# The coordinator and cycle fixtures exercise assumed manual Off during an outage,
+# missing control values, duplicate contexts, setup and unload handoff, and
+# dwell boundaries across attribute polls and reload with pending and confirmed records.
 # tests/test_zone_temperature.py covers learning gaps caused by assumed HVAC controls.
 # tests/test_repairs.py uses the public Repairs accessor.
 # Compatibility evidence and the Recorder upgrade probe are documented in

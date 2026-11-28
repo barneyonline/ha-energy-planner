@@ -43,7 +43,7 @@ from .const import (
 )
 from .daikin_memory import MEMORY_KEY, OFF_START_OPTION, memory_matches, read_activation, read_memory, source_matches
 from .discovery import CapabilityDiscovery, synchronized_zone_targets_required
-from .hvac_cycle import mode_feedback_at, mode_feedback_matches, mode_intent
+from .hvac_cycle import HvacModeFeedback, mode_feedback_matches, mode_intent
 from .models import ActionKind, PlanAction
 
 _STATE_CONFIRMATION_TIMEOUT_SECONDS = 30.0
@@ -157,6 +157,7 @@ class DaikinHVACAdapter:
         self._unconfirmed_main_mode = False
         self._prior_mode_intent: dict[str, Any] | None = None
         self._async_cycle_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+        self._mode_feedback = HvacModeFeedback()
         self._command_callback: Callable[[dict[str, Any]], None] | None = None
         self._acquisition_guard: Callable[[], str | None] | None = None
         self._last_commands: dict[str, dict[str, Any]] = {}
@@ -388,10 +389,12 @@ class DaikinHVACAdapter:
         self._recovery_confirmation = record
 
     def set_cycle_callback(
-        self, callback: Callable[[dict[str, Any]], Awaitable[None]], *, unresolved_mode: bool = False,
+        self, callback: Callable[[dict[str, Any]], Awaitable[None]], *, mode_feedback: HvacModeFeedback,
+        unresolved_mode: bool = False,
     ) -> None:
         """Persist head mode timing independently of transaction ownership."""
         self._async_cycle_callback = callback
+        self._mode_feedback = mode_feedback
         self._unconfirmed_main_mode = unresolved_mode
         self._prior_mode_intent = None
 
@@ -817,10 +820,10 @@ class DaikinHVACAdapter:
             **record,
             "stage": "confirmed" if confirmed else "readback_failed",
             "observed": values,
-            "feedback_changed_at": mode_feedback_at(observed),
             "failure_category": None if confirmed else "ConfirmationTimeout",
         }
         if self._async_cycle_callback is not None and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE):
+            evidence["feedback_changed_at"] = self._mode_feedback.mode_feedback_at(entity_id, observed)
             if confirmed and mode_feedback_matches(record, values.get("hvac_mode")):
                 self._unconfirmed_main_mode = False
                 self._prior_mode_intent = None

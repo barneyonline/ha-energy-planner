@@ -88,7 +88,7 @@ from .hvac_control import (
     discard_superseded_confirmation,
     pending_hvac_confirmation,
 )
-from .hvac_cycle import cycle_active, mode_feedback_at, reconcile_cycle, record_cycle
+from .hvac_cycle import HvacModeFeedback, cycle_active, reconcile_cycle, record_cycle
 from .models import (
     ActionAsset,
     ActionKind,
@@ -199,6 +199,7 @@ class Executor:
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
         self.hvac_feedback_commands: list[dict[str, Any]] = []
+        self.hvac_mode_feedback = HvacModeFeedback()
         control = store.data.get("ownership", {}).get("hvac_control")
         recovery = control.get("command_confirmation") if isinstance(control, dict) else None
         if isinstance(recovery, dict):
@@ -209,6 +210,8 @@ class Executor:
                     "mode_commands": _restored_hvac_mode_commands(recovery.get("mode_commands")),
                 })
         self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
+        self.hvac_command_guard: Callable[[], bool] = lambda: True
+        self.hvac_restore_guard: Callable[[], bool] = lambda: True
         self.current_ev_allocation_deadline: Callable[[], datetime | None] = lambda: None
         self.ev_restore_guard: Callable[[], bool] = lambda: True
         self.export_write_blocked: Callable[[], bool] = lambda: False
@@ -861,6 +864,14 @@ class Executor:
             await self.async_evaluate(replace(plan, actions=[safety_stop]), context)
             if action is None or action.asset == ActionAsset.EV or plan_dispatch_rejection() is not None:
                 return None
+        if not self.hvac_command_guard():
+            if action is not None and action.asset == ActionAsset.DAIKIN:
+                # The coordinator will evaluate the remaining actions. Do
+                # not retarget this evaluation after its lead action changed.
+                return None
+            plan = replace(plan, actions=[
+                candidate for candidate in plan.actions if candidate.asset != ActionAsset.DAIKIN
+            ])
         now = dt_util.utcnow()
         due_hvac_releases = [
             candidate
@@ -890,10 +901,11 @@ class Executor:
                         await self._async_reject_live_dry_takeover(due_hvac_continuation, now, plan.plan_id)
                     finally:
                         with preserve_cancellation(sys.exception()):
-                            await self.async_release_hvac_control(
-                                f"hvac_continuation_blocked_{continuation_block}",
-                                plan_id=plan.plan_id,
-                            )
+                            if self.hvac_command_guard():
+                                await self.async_release_hvac_control(
+                                    f"hvac_continuation_blocked_{continuation_block}",
+                                    plan_id=plan.plan_id,
+                                )
                     return due_hvac_continuation
         if action is None:
             return None
@@ -1372,6 +1384,8 @@ class Executor:
             )
             return None
         if reason is None and action.asset == ActionAsset.DAIKIN and self.hass is not None:
+            if not self.hvac_command_guard():
+                return None
             hass = self.hass
             existing_ownership = dict(self.store.data.get("ownership", {}))
             existing_hvac_control = dict(existing_ownership.get("hvac_control", {}))
@@ -1557,7 +1571,7 @@ class Executor:
                     if main_state_superseded or superseded_zone_entity_ids:
                         # An adapter bug must not discard the synchronous user
                         # marker before it has removed stale recovery snapshots.
-                        await self._async_persist_provisional_hvac_supersessions(
+                        await self.async_persist_hvac_manual_supersessions(
                             main_state_superseded,
                             superseded_zone_entity_ids,
                         )
@@ -1602,9 +1616,9 @@ class Executor:
                         await persist_with_supersessions(write_completion)
             finally:
                 self.pending_hvac_desired_state = None
-            if not hvac_result.applied and not admission_refused and (
-                action.desired_state.get("zone_intent") or action.desired_state.get("zone_control_blocked")
-            ):
+            if (not hvac_result.applied and not admission_refused
+                    and (action.desired_state.get("zone_intent") or action.desired_state.get("zone_control_blocked"))
+                    and self.hvac_command_guard()):
                 await self.async_release_hvac_control("zone_subset_failed", plan_id=plan.plan_id)
             await self.store.async_add_outcome(
                 self._action_outcome(
@@ -1901,6 +1915,21 @@ class Executor:
             ownership["hvac_control"] = hvac_control
             await self.store.async_save_ownership(ownership)
             await self._async_flush_provisional_state()
+        if not self.hvac_restore_guard():
+            outcome = ActionOutcome(
+                action_id=getattr(action, "action_id", None) or "release_hvac_control",
+                attempted_at=now,
+                result=OutcomeResult.FAILED,
+                reason="manual_hvac_handoff_pending",
+                pre_state={},
+                post_state={},
+                plan_id=plan_id,
+                asset=str(ActionAsset.DAIKIN),
+                kind=str(ActionKind.RELEASE_HVAC),
+                service_target="hvac_release",
+            )
+            await self.store.async_add_outcome(outcome)
+            return outcome
         had_hvac_ownership = bool(
             automation_states
             or zone_states
@@ -1958,7 +1987,7 @@ class Executor:
                 # An unexpected adapter exception can bypass its normal result
                 # filtering. Preserve the listener's synchronous supersession
                 # markers before rebuilding retry ownership from local copies.
-                await self._async_persist_provisional_hvac_supersessions(
+                await self.async_persist_hvac_manual_supersessions(
                     main_state_superseded,
                     superseded_zone_entity_ids,
                 )
@@ -2074,7 +2103,8 @@ class Executor:
         hvac_main_state = dict(hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY, {}))
         enphase_owned = bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
         restore_ev = (assets is None or "ev" in assets) and command_guard() and self.ev_restore_guard()
-        restore_hvac = assets is None or "daikin" in assets
+        hvac_in_scope = assets is None or "daikin" in assets
+        restore_hvac = hvac_in_scope and self.hvac_restore_guard()
         restore_enphase = assets is None or "enphase" in assets
         if assets is None and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
             preserve_export = preserve_export_retry or reason in {
@@ -2162,6 +2192,7 @@ class Executor:
                         failed_assets.add("ev")
                         self._retain_ev_grid_reservation_when_unloaded()
 
+            restore_hvac = restore_hvac and self.hvac_restore_guard()
             if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
                 try:
                     from .daikin_memory import owned_control_data
@@ -2205,7 +2236,7 @@ class Executor:
                         # Do not let the safe-state exception path reintroduce
                         # snapshots already superseded by a user while another
                         # asset is still due to be restored.
-                        await self._async_persist_provisional_hvac_supersessions(
+                        await self.async_persist_hvac_manual_supersessions(
                             main_state_superseded,
                             superseded_zone_entity_ids,
                         )
@@ -2312,6 +2343,13 @@ class Executor:
                         restore_failed = True
                         failed_assets.add("enphase")
 
+        if hvac_in_scope and not restore_hvac:
+            attempted_assets.discard("daikin")
+            if hvac_state or hvac_control:
+                reasons.append("manual_hvac_handoff_pending")
+                failed_assets.add("daikin")
+                restore_failed = True
+
         # Ownership metadata that cannot represent a pending device restore can
         # always be released. Device baselines above are retained until their
         # corresponding adapter confirms restoration.
@@ -2370,7 +2408,7 @@ class Executor:
             action_id="restore_safe_state",
             attempted_at=now,
             result=(OutcomeResult.FAILED if restore_failed else OutcomeResult.PENDING
-                    if export_result == OutcomeResult.PENDING else OutcomeResult.RESTORED),
+                    if pending_assets else OutcomeResult.RESTORED),
             reason=":".join(reasons),
             pre_state=pre_state,
             post_state=post_state,
@@ -3692,19 +3730,19 @@ class Executor:
 
     async def _async_persist_provisional_hvac_manual_supersession(self) -> None:
         """Durably discard a main baseline superseded by a user command."""
-        await self._async_persist_provisional_hvac_supersessions(True, set())
+        await self.async_persist_hvac_manual_supersessions(True, set())
 
     async def _async_persist_provisional_hvac_zone_supersession(
         self,
         entity_ids: set[str],
     ) -> None:
         """Durably discard zone baselines superseded by user commands."""
-        await self._async_persist_provisional_hvac_supersessions(
+        await self.async_persist_hvac_manual_supersessions(
             False,
             entity_ids,
         )
 
-    async def _async_persist_provisional_hvac_supersessions(
+    async def async_persist_hvac_manual_supersessions(
         self,
         main_superseded: bool,
         zone_entity_ids: set[str],
@@ -3713,6 +3751,8 @@ class Executor:
         owned_data = self._owned_hvac_entry_data()
         zone_entity_ids = superseded_entities(owned_data, zone_entity_ids)
         ownership = deepcopy(dict(self.store.data.get("ownership", {})))
+        if not ownership.get("hvac_control"):
+            return
         hvac_control = dict(ownership.get("hvac_control", {}))
         if main_superseded:
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
@@ -3754,7 +3794,8 @@ class Executor:
         state = self.hass.states.get(entity)
         if not hvac_feedback_is_observed(state):
             return
-        updated = reconcile_cycle(cycle, dt_util.utcnow(), state.state, mode_feedback_at(state),
+        feedback_at = self.hvac_mode_feedback.mode_feedback_at(entity, state)
+        updated = reconcile_cycle(cycle, dt_util.utcnow(), state.state, feedback_at,
                                   getattr(state, "last_reported", getattr(state, "last_updated", None)))
         if updated != cycle:
             await self.store.async_save_hvac_cycle(updated)
@@ -3822,7 +3863,7 @@ class Executor:
                         self.store.data["hvac_cycle"] = updated
 
             cycle = self.store.data.get("hvac_cycle", {})
-            cycle_callback(persist_cycle, unresolved_mode=bool(
+            cycle_callback(persist_cycle, mode_feedback=self.hvac_mode_feedback, unresolved_mode=bool(
                 cycle.get("entity_id") == getattr(adapter, "entry_data", {}).get(CONF_DAIKIN_CLIMATE)
                 and isinstance(cycle.get("pending"), dict)))
         pending["deferred_zone_entities"] = adapter.deferred_zone_entities
@@ -3981,7 +4022,7 @@ class Executor:
             }
         )
         adapter.set_zone_manual_override_persistence_callback(self._async_persist_provisional_hvac_zone_supersession)
-        adapter.set_manual_supersession_persistence_callback(self._async_persist_provisional_hvac_supersessions)
+        adapter.set_manual_supersession_persistence_callback(self.async_persist_hvac_manual_supersessions)
         adapter.set_turn_on_feedback_callback(
             lambda expected: pending.__setitem__("turn_on_feedback_expected", expected)
         )
